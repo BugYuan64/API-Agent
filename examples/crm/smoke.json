@@ -1,0 +1,17 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8080",
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE"],
+  "path_templates": ["/api/user/register", "/api/user/login", "/api/customer/list", "/api/customer/{id}", "/api/customer"],
+  "max_requests": 8,
+  "requests": [
+    {"id": "register-missing-fields", "method": "POST", "path": "/api/user/register", "body": {}, "assertions": [{"kind": "status", "expected": 200}, {"kind": "json_equals", "pointer": "/code", "expected": "400"}]},
+    {"id": "login-missing-fields", "method": "POST", "path": "/api/user/login", "body": {}, "assertions": [{"kind": "status", "expected": 200}, {"kind": "json_equals", "pointer": "/code", "expected": "400"}]},
+    {"id": "login-invalid-email", "method": "POST", "path": "/api/user/login", "body": {"email": "invalid-email", "password": "synthetic-invalid-input"}, "assertions": [{"kind": "status", "expected": 200}, {"kind": "json_equals", "pointer": "/code", "expected": "400"}]},
+    {"id": "list-requires-token", "method": "GET", "path": "/api/customer/list", "query": {"keyword": "api-agent-fixture", "pageNum": "1", "pageSize": "1"}, "assertions": [{"kind": "status", "expected": 401}, {"kind": "json_equals", "pointer": "/code", "expected": "401"}]},
+    {"id": "detail-requires-token", "method": "GET", "path": "/api/customer/9223372036854775807", "assertions": [{"kind": "status", "expected": 401}, {"kind": "json_equals", "pointer": "/code", "expected": "401"}]},
+    {"id": "create-requires-token", "method": "POST", "path": "/api/customer", "body": {}, "assertions": [{"kind": "status", "expected": 401}, {"kind": "json_equals", "pointer": "/code", "expected": "401"}]},
+    {"id": "update-requires-token", "method": "PUT", "path": "/api/customer/9223372036854775807", "body": {}, "assertions": [{"kind": "status", "expected": 401}, {"kind": "json_equals", "pointer": "/code", "expected": "401"}]},
+    {"id": "delete-requires-token", "method": "DELETE", "path": "/api/customer/9223372036854775807", "assertions": [{"kind": "status", "expected": 401}, {"kind": "json_equals", "pointer": "/code", "expected": "401"}]}
+  ]
+}

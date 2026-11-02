@@ -1,0 +1,11 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8000",
+  "allowed_methods": ["GET", "POST"],
+  "path_templates": ["/health", "/ask", "/ask/stream"],
+  "requests": [
+    {"id": "rag-health", "method": "GET", "path": "/health", "assertions": [{"kind": "status", "expected": 200}, {"kind": "json_equals", "pointer": "/status", "expected": "ok"}]},
+    {"id": "rag-empty-question", "method": "POST", "path": "/ask", "body": {"question": ""}, "assertions": [{"kind": "status", "expected": 400}, {"kind": "json_exists", "pointer": "/detail"}]},
+    {"id": "rag-stream-empty-question", "method": "POST", "path": "/ask/stream", "body": {"question": ""}, "assertions": [{"kind": "status", "expected": 400}, {"kind": "json_exists", "pointer": "/detail"}]}
+  ]
+}

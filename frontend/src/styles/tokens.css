@@ -1,0 +1,126 @@
+/* 设计令牌：配色取自 magpie 的克制浅色体系，布局密度参考 apifox。
+   整体是「近白底 + 墨黑主色 + 单一紫色强调」，避免多色竞争注意力；
+   语义色只用于状态，不用于装饰。 */
+:root {
+  /* 底色与表面：从最浅到最深的四层，靠层次而不是边框来分隔区域 */
+  --bg-canvas: #f7f7f8;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f2f2f4;
+  --bg-sunken: #ebebee;
+  --bg-hover: #f4f4f6;
+  --bg-active: #ededf0;
+
+  /* 文字：主/次/弱三级，足以表达层级又不制造灰度噪音 */
+  --text-primary: #17171a;
+  --text-secondary: #5c5c66;
+  --text-tertiary: #8e8e99;
+  --text-inverse: #ffffff;
+
+  /* 描边：默认几乎不可见，只在需要界定可交互区域时加深 */
+  --border-subtle: #ebebee;
+  --border-default: #e0e0e5;
+  --border-strong: #c9c9d1;
+
+  /* 主色：墨黑用于主按钮（magpie 的下载按钮即是），紫色作强调 */
+  --accent: #4f3ff0;
+  --accent-hover: #4331e0;
+  --accent-soft: #eeeaff;
+  --accent-border: #d8d0ff;
+
+  /* 语义状态色：低饱和底色 + 高对比文字，保证在浅色主题下可读 */
+  --success: #12805c;
+  --success-soft: #e6f6f0;
+  --warning: #a15c07;
+  --warning-soft: #fdf3e2;
+  --danger: #c22b2b;
+  --danger-soft: #fdecec;
+  --info: #1f6fd0;
+  --info-soft: #e8f1fd;
+
+  /* HTTP 方法色：沿用 apifox 的语义（GET 绿、POST 橙、PUT 蓝、DELETE 红） */
+  --method-get: #12805c;
+  --method-post: #b56808;
+  --method-put: #1f6fd0;
+  --method-patch: #7a4dc4;
+  --method-delete: #c22b2b;
+  --method-head: #5c5c66;
+  --method-options: #5c5c66;
+
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 13px;
+  --radius-xl: 18px;
+
+  --shadow-sm: 0 1px 2px rgba(23, 23, 26, 0.06);
+  --shadow-md: 0 4px 14px rgba(23, 23, 26, 0.07);
+  --shadow-lg: 0 12px 34px rgba(23, 23, 26, 0.1);
+
+  --font-sans: 'Inter', 'Segoe UI Variable Display', 'Segoe UI', -apple-system,
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
+
+  --sidebar-width: 232px;
+  --topbar-height: 52px;
+  --workspace-width: 268px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
+
+code,
+pre,
+textarea.mono,
+input.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* 滚动条保持细窄，避免在数据密集页面里抢视觉重量 */
+* ::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+* ::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+* ::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+  background-clip: content-box;
+}
+
+* ::-webkit-scrollbar-track {
+  background: transparent;
+}

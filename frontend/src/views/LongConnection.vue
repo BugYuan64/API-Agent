@@ -1,0 +1,1033 @@
+<script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Cable,
+  CircleStop,
+  Loader2,
+  Play,
+  Radio,
+  Send,
+  ServerOff,
+  Zap,
+} from 'lucide-vue-next'
+import CopyButton from '@/components/CopyButton.vue'
+import EmptyState from '@/components/EmptyState.vue'
+import { describeError } from '@/api/client'
+import {
+  listStreams,
+  readStream,
+  sendStreamMessage,
+  startStream,
+  stopStream,
+} from '@/api/endpoints'
+import type { StreamEvent, StreamKind, StreamSession } from '@/api/types'
+import {
+  describeStopReason,
+  formatBytes,
+  formatDuration,
+  formatRelative,
+  looksLikeJson,
+  prettyJson,
+} from '@/lib/format'
+import { useToastStore } from '@/stores/toasts'
+
+/** 表单：SSE 与 WebSocket 共用一套字段，只有个别项按类型显示/隐藏。 */
+const form = reactive({
+  kind: 'sse' as StreamKind,
+  url: 'http://127.0.0.1:8010/api/streams',
+  headers: [{ name: 'Accept', value: 'text/event-stream' }] as { name: string; value: string }[],
+  subprotocols: '',
+  maxEvents: 200,
+  maxDurationMs: 60_000,
+  connectTimeoutMs: 10_000,
+  pingIntervalMs: 20_000,
+  scheduled: '',
+  sendIntervalMs: 500,
+})
+
+const session = ref<StreamSession | null>(null)
+const events = ref<StreamEvent[]>([])
+const cursor = ref(0)
+const connecting = ref(false)
+const stopping = ref(false)
+const outgoing = ref('')
+const sendingMessage = ref(false)
+const history = ref<{ id: string; kind: string; url: string; status: string; stop_reason: string | null; event_count: number; created_at: string }[]>([])
+const activeHistoryId = ref<string | null>(null)
+const filter = ref<'all' | 'in' | 'out'>('all')
+const autoScroll = ref(true)
+const logRef = ref<HTMLElement | null>(null)
+
+// 一个可取消的长轮询循环：同一个 Session 只允许存在一条轮询链。
+let pollAbort: AbortController | null = null
+let pollTimer: number | undefined
+
+const isWebSocket = computed(() => form.kind === 'websocket')
+const isLive = computed(
+  () => !!session.value && !session.value.finished,
+)
+const filteredEvents = computed(() =>
+  filter.value === 'all' ? events.value : events.value.filter((item) => item.direction === filter.value),
+)
+
+const statusTone = computed(() => {
+  if (!session.value) return 'neutral'
+  if (session.value.finished) {
+    return session.value.status === 'error' ? 'danger' : 'neutral'
+  }
+  return 'success'
+})
+
+const statusLabel = computed(() => {
+  if (!session.value) return '未连接'
+  const labels: Record<string, string> = {
+    connecting: '握手中',
+    open: '已连接',
+    closed: '已关闭',
+    error: '出错',
+    cancelled: '已停止',
+  }
+  return labels[session.value.status] ?? session.value.status
+})
+
+/** 切换协议时给出对应的默认头，省掉“为什么 SSE 连不上”的一半问题。 */
+watch(
+  () => form.kind,
+  (kind) => {
+    if (kind === 'sse') {
+      form.headers = [{ name: 'Accept', value: 'text/event-stream' }]
+      form.pingIntervalMs = 20_000
+    } else {
+      form.headers = [{ name: '', value: '' }]
+      form.pingIntervalMs = 15_000
+    }
+  },
+)
+
+/** 新事件到达时滚动到底部，但只在用户没有手动上滚时执行。 */
+watch(
+  () => events.value.length,
+  async () => {
+    if (!autoScroll.value) return
+    await nextTick()
+    const element = logRef.value
+    if (element) element.scrollTop = element.scrollHeight
+  },
+)
+
+const activeHeaders = computed(() =>
+  form.headers
+    .filter((row) => row.name.trim())
+    .reduce<Record<string, string>>((acc, row) => {
+      acc[row.name.trim()] = row.value
+      return acc
+    }, {}),
+)
+
+/** 把多行文本框拆成待发消息列表：空行忽略，但保留行内空格。 */
+const scheduledMessages = computed(() =>
+  form.scheduled.split('\n').filter((line) => line.trim().length > 0),
+)
+
+async function start() {
+  if (!form.url.trim()) {
+    useToastStore().push('warning', '请先填写长连接地址')
+    return
+  }
+  stopPolling()
+  connecting.value = true
+  events.value = []
+  cursor.value = 0
+  activeHistoryId.value = null
+  try {
+    const created = await startStream({
+      kind: form.kind,
+      url: form.url.trim(),
+      headers: activeHeaders.value,
+      subprotocols: form.subprotocols
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
+      max_events: form.maxEvents,
+      max_duration_ms: form.maxDurationMs,
+      connect_timeout_ms: form.connectTimeoutMs,
+      ping_interval_ms: form.pingIntervalMs,
+      send: isWebSocket.value ? scheduledMessages.value : [],
+      send_interval_ms: form.sendIntervalMs,
+      project_id: null,
+    })
+    session.value = created
+    startPolling(created.id)
+    await loadHistory()
+  } catch (error) {
+    useToastStore().push('danger', '长连接未启动', describeError(error))
+  } finally {
+    connecting.value = false
+  }
+}
+
+/** 轮询循环：用 wait_ms 长轮询，服务端有事件就立刻返回。
+ *  这样界面接近实时，又不必维持第二条浏览器长连接。 */
+function startPolling(sessionId: string) {
+  const step = async () => {
+    if (!session.value || session.value.id !== sessionId || session.value.finished) return
+    pollAbort = new AbortController()
+    try {
+      const page = await readStream(sessionId, cursor.value, 1200, pollAbort.signal)
+      session.value = page.session
+      if (page.events.length) {
+        events.value.push(...page.events)
+        cursor.value = page.next_cursor
+      }
+      if (page.finished) {
+        await loadHistory()
+        return
+      }
+    } catch (error) {
+      // 主动中止（停止/重连）不算错误，静默退出循环。
+      if (pollAbort?.signal.aborted) return
+      useToastStore().push('warning', '读取会话失败', describeError(error))
+      return
+    }
+    pollTimer = window.setTimeout(step, 60)
+  }
+  void step()
+}
+
+function stopPolling() {
+  pollAbort?.abort()
+  pollAbort = null
+  window.clearTimeout(pollTimer)
+}
+
+async function stop() {
+  if (!session.value) return
+  stopping.value = true
+  try {
+    const stopped = await stopStream(session.value.id)
+    session.value = stopped
+    stopPolling()
+    await loadHistory()
+    useToastStore().push('info', '已停止会话', `结束原因：${describeStopReason(stopped.stop_reason)}`)
+  } catch (error) {
+    useToastStore().push('danger', '停止失败', describeError(error))
+  } finally {
+    stopping.value = false
+  }
+}
+
+async function sendMessage() {
+  if (!session.value || !outgoing.value.trim()) return
+  sendingMessage.value = true
+  try {
+    session.value = await sendStreamMessage(session.value.id, outgoing.value)
+    outgoing.value = ''
+  } catch (error) {
+    useToastStore().push('danger', '发送失败', describeError(error))
+  } finally {
+    sendingMessage.value = false
+  }
+}
+
+/** 历史会话回放：会话结束与事件读尽是两个独立状态。 */
+async function replay(record: (typeof history.value)[number]) {
+  stopPolling()
+  activeHistoryId.value = record.id
+  events.value = []
+  cursor.value = 0
+  try {
+    let hasMore = true
+    let guard = 0
+    while (hasMore && guard < 40) {
+      const page = await readStream(record.id, cursor.value, 0)
+      session.value = page.session
+      if (page.events.length) {
+        events.value.push(...page.events)
+        cursor.value = page.next_cursor
+      }
+      hasMore = page.has_more
+      guard += 1
+      if (!page.events.length) break
+    }
+    useToastStore().push('info', '已回放历史会话', '数据来自数据库，含当时落库的全部事件')
+  } catch (error) {
+    useToastStore().push('danger', '回放失败', describeError(error))
+  }
+}
+
+async function loadHistory() {
+  try {
+    const page = await listStreams(20)
+    history.value = page.items
+  } catch {
+    history.value = []
+  }
+}
+
+function eventLabel(event: StreamEvent): string {
+  if (event.direction === 'out') return '发送'
+  const labels: Record<string, string> = {
+    open: '已连接',
+    close: '已关闭',
+    comment: '注释',
+    message: event.event_name ? `事件 ${event.event_name}` : '消息',
+    text: '文本帧',
+    binary: '二进制帧',
+    error: '错误',
+    raw: '原始行',
+  }
+  return labels[event.kind] ?? event.kind
+}
+
+function eventBody(event: StreamEvent): string {
+  const data = event.data ?? ''
+  if (event.kind === 'binary') return `base64: ${data.slice(0, 600)}`
+  return looksLikeJson(data) ? prettyJson(data) : data
+}
+
+onMounted(loadHistory)
+onBeforeUnmount(stopPolling)
+</script>
+
+<template>
+  <div class="lc">
+    <!-- 左：配置面板 -->
+    <aside class="lc-config scroll-y">
+      <div class="config-head">
+        <h2 class="config-title">长连接测试</h2>
+        <p class="config-sub">SSE 与 WebSocket 共用一套观测视图</p>
+      </div>
+
+      <div class="segmented">
+        <button
+          class="segment"
+          :class="{ 'segment-active': form.kind === 'sse' }"
+          @click="form.kind = 'sse'"
+        >
+          <Radio :size="13" />
+          SSE
+        </button>
+        <button
+          class="segment"
+          :class="{ 'segment-active': form.kind === 'websocket' }"
+          @click="form.kind = 'websocket'"
+        >
+          <Zap :size="13" />
+          WebSocket
+        </button>
+      </div>
+
+      <label class="field">
+        <span class="field-label">地址</span>
+        <input
+          v-model="form.url"
+          class="input mono"
+          spellcheck="false"
+          :placeholder="isWebSocket ? 'ws://127.0.0.1:9001/ws' : 'http://127.0.0.1:8080/events'"
+          @keydown.enter.exact.prevent="start"
+        />
+        <span class="hint">
+          {{
+            isWebSocket
+              ? 'ws:// 与 http:// 都可填，后端会按协议归一'
+              : 'http(s):// 或 ws(s):// 均可，SSE 会走 HTTP 流'
+          }}
+        </span>
+      </label>
+
+      <div class="field">
+        <span class="field-label">请求头</span>
+        <div class="header-list">
+          <div v-for="(row, index) in form.headers" :key="index" class="header-row">
+            <input v-model="row.name" class="input mono" placeholder="名称" spellcheck="false" />
+            <input v-model="row.value" class="input mono" placeholder="值" spellcheck="false" />
+            <button
+              class="btn btn-ghost btn-icon btn-sm"
+              title="删除"
+              @click="form.headers.splice(index, 1)"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+        <button class="btn btn-sm" @click="form.headers.push({ name: '', value: '' })">
+          + 添加
+        </button>
+      </div>
+
+      <label v-if="isWebSocket" class="field">
+        <span class="field-label">子协议（逗号分隔）</span>
+        <input v-model="form.subprotocols" class="input mono" placeholder="graphql-ws" />
+      </label>
+
+      <label v-if="isWebSocket" class="field">
+        <span class="field-label">连接后自动发送（每行一条）</span>
+        <textarea
+          v-model="form.scheduled"
+          class="textarea mono"
+          rows="3"
+          spellcheck="false"
+          placeholder='{"type":"subscribe"}'
+        />
+      </label>
+
+      <label v-if="isWebSocket" class="field">
+        <span class="field-label">发送间隔（毫秒）</span>
+        <input v-model.number="form.sendIntervalMs" class="input" type="number" min="0" max="60000" step="50" />
+      </label>
+
+      <div class="grid-2">
+        <label class="field">
+          <span class="field-label">最多事件</span>
+          <input v-model.number="form.maxEvents" class="input" type="number" min="1" max="2000" />
+        </label>
+        <label class="field">
+          <span class="field-label">最长时长（ms）</span>
+          <input v-model.number="form.maxDurationMs" class="input" type="number" min="1000" max="900000" step="1000" />
+        </label>
+      </div>
+
+      <div class="grid-2">
+        <label class="field">
+          <span class="field-label">连接超时（ms）</span>
+          <input v-model.number="form.connectTimeoutMs" class="input" type="number" min="100" max="60000" step="100" />
+        </label>
+        <label class="field">
+          <span class="field-label">心跳间隔（ms）</span>
+          <input v-model.number="form.pingIntervalMs" class="input" type="number" min="0" max="300000" step="1000" />
+        </label>
+      </div>
+
+      <div class="actions">
+        <button v-if="!isLive" class="btn btn-accent start-button" :disabled="connecting" @click="start">
+          <Loader2 v-if="connecting" :size="14" class="spinning" />
+          <Play v-else :size="14" />
+          {{ connecting ? '连接中' : '开始连接' }}
+        </button>
+        <button v-else class="btn btn-danger start-button" :disabled="stopping" @click="stop">
+          <CircleStop :size="14" />
+          {{ stopping ? '停止中' : '停止会话' }}
+        </button>
+      </div>
+
+      <div class="scope-note">
+        <ServerOff :size="13" />
+        <p>
+          只允许本机回环地址。<strong>上限</strong>是硬约束：达到事件数、字节数或时长后由本服务主动断开，
+          结束原因会记为 <code>limits_exceeded</code> / <code>deadline_exceeded</code>，与目标主动关闭区分开。
+        </p>
+      </div>
+
+      <div class="history-block">
+        <div class="history-head">
+          <span>最近会话</span>
+          <button class="btn btn-ghost btn-sm" @click="loadHistory">刷新</button>
+        </div>
+        <button
+          v-for="record in history"
+          :key="record.id"
+          class="history-item"
+          :class="{ 'history-item-active': activeHistoryId === record.id }"
+          @click="replay(record)"
+        >
+          <div class="history-top">
+            <span class="tag tag-accent">{{ record.kind === 'sse' ? 'SSE' : 'WS' }}</span>
+            <span class="history-count">{{ record.event_count }} 条</span>
+            <span class="history-time">{{ formatRelative(record.created_at) }}</span>
+          </div>
+          <div class="history-url truncate" :title="record.url">{{ record.url }}</div>
+          <div class="history-reason">{{ describeStopReason(record.stop_reason) }}</div>
+        </button>
+        <p v-if="!history.length" class="hint">还没有会话记录。</p>
+      </div>
+    </aside>
+
+    <!-- 右：会话与时间线 -->
+    <section class="lc-stage">
+      <div class="stage-head">
+        <div class="stage-title">
+          <span class="stage-dot" :class="`dot-${statusTone}`" />
+          <span>{{ statusLabel }}</span>
+          <span v-if="session" class="tag">{{ session.kind === 'sse' ? 'SSE' : 'WebSocket' }}</span>
+          <span v-if="session?.subprotocol" class="tag tag-info">子协议 {{ session.subprotocol }}</span>
+        </div>
+        <div class="stage-stats" v-if="session">
+          <span class="stat"><ArrowDownToLine :size="12" />{{ session.event_count }} 事件</span>
+          <span class="stat"><ArrowUpFromLine :size="12" />{{ session.sent_count }} 发送</span>
+          <span class="stat">{{ formatBytes(session.byte_count) }}</span>
+          <span v-if="session.truncated_count" class="stat stat-warn">
+            {{ session.truncated_count }} 条截断
+          </span>
+          <span class="stat">{{ describeStopReason(session.stop_reason) }}</span>
+          <CopyButton v-if="session" :text="session.url" label="复制地址" />
+        </div>
+      </div>
+
+      <div v-if="session?.error_message" class="stage-error">
+        <strong>{{ session.error_kind }}</strong>
+        <span>{{ session.error_message }}</span>
+      </div>
+
+      <div v-if="session && isWebSocket && !session.finished" class="send-bar">
+        <input
+          v-model="outgoing"
+          class="input mono"
+          placeholder="向目标发送一条文本消息…"
+          spellcheck="false"
+          @keydown.enter.exact.prevent="sendMessage"
+        />
+        <button class="btn" :disabled="sendingMessage || !outgoing.trim()" @click="sendMessage">
+          <Send :size="13" />
+          发送
+        </button>
+      </div>
+
+      <div class="timeline-toolbar">
+        <div class="filter-group">
+          <button
+            v-for="item in [
+              { key: 'all', label: '全部' },
+              { key: 'in', label: '接收' },
+              { key: 'out', label: '发送' },
+            ]"
+            :key="item.key"
+            class="filter-chip"
+            :class="{ 'filter-chip-active': filter === item.key }"
+            @click="filter = item.key as typeof filter"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+        <div class="toolbar-fill" />
+        <label class="auto-scroll">
+          <input v-model="autoScroll" type="checkbox" class="switch" />
+          自动滚动
+        </label>
+        <CopyButton
+          :text="events.map((event) => `[${event.sequence}] ${event.direction} ${eventLabel(event)}: ${event.data ?? ''}`).join('\n')"
+          label="导出时间线"
+        />
+      </div>
+
+      <div ref="logRef" class="timeline scroll-y">
+        <div v-if="!session" class="timeline-empty">
+          <EmptyState
+            :icon="Cable"
+            title="选择协议后开始连接"
+            description="SSE 会逐条记录 data/event 字段与注释行；WebSocket 记录每一帧、关闭码与协商到的子协议。收尾原因会区分「目标关闭」和「本服务按上限停止」。"
+          />
+        </div>
+        <div v-else-if="!filteredEvents.length" class="timeline-empty">
+          <EmptyState
+            :icon="Radio"
+            :title="isLive ? '等待目标推送…' : '没有符合筛选的事件'"
+            :description="isLive ? '连接已建立，目标还没有发来数据。' : '可以切换筛选条件，或检查结束原因。'"
+          />
+        </div>
+        <article
+          v-for="event in filteredEvents"
+          :key="event.sequence"
+          class="event"
+          :class="[`event-${event.direction}`, { 'event-lifecycle': ['open', 'close', 'error', 'comment'].includes(event.kind) }]"
+        >
+          <header class="event-head">
+            <span class="event-seq">#{{ event.sequence }}</span>
+            <span class="event-dir" :class="`dir-${event.direction}`">
+              <ArrowDownToLine v-if="event.direction === 'in'" :size="11" />
+              <ArrowUpFromLine v-else :size="11" />
+              {{ event.direction === 'in' ? '收' : '发' }}
+            </span>
+            <span class="event-kind">{{ eventLabel(event) }}</span>
+            <span class="event-fill" />
+            <span class="event-size">{{ formatBytes(event.data_bytes) }}</span>
+            <span class="event-time">+{{ formatDuration(event.elapsed_ms) }}</span>
+          </header>
+          <pre v-if="event.data" class="event-body">{{ eventBody(event) }}</pre>
+          <div v-if="event.truncated" class="event-truncated">该条事件已截断（保留前 64KiB）</div>
+        </article>
+      </div>
+
+      <footer v-if="session" class="stage-foot">
+        <span>会话 {{ session.id.slice(0, 8) }}</span>
+        <span v-if="session.http_status">HTTP {{ session.http_status }}</span>
+        <span v-if="session.content_type" class="truncate">{{ session.content_type }}</span>
+        <span v-if="session.close_code != null">关闭码 {{ session.close_code }}</span>
+        <span v-if="session.opened_at">建立于 {{ formatRelative(session.opened_at) }}</span>
+        <span class="foot-fill" />
+        <span>{{ cursor }} / {{ session.event_count }} 已加载</span>
+      </footer>
+    </section>
+  </div>
+</template>
+
+<style scoped>
+.lc {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---------- 配置栏 ---------- */
+.lc-config {
+  width: 320px;
+  flex: none;
+  padding: 16px 16px 24px;
+  border-right: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.config-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.config-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.config-sub {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+}
+
+.segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 27px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.segment-active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.header-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 5px;
+}
+
+.header-row {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr 26px;
+  gap: 5px;
+}
+
+.header-row .input {
+  height: 29px;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+}
+
+.actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 2px;
+}
+
+.start-button {
+  flex: 1;
+  height: 34px;
+}
+
+.scope-note {
+  display: flex;
+  gap: 8px;
+  padding: 10px 11px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  color: var(--text-tertiary);
+}
+
+.scope-note p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.scope-note strong {
+  color: var(--text-secondary);
+}
+
+.history-block {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.history-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  text-align: left;
+}
+
+.history-item:hover {
+  background: var(--bg-hover);
+}
+
+.history-item-active {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+}
+
+.history-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-count {
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+}
+
+.history-time {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+}
+
+.history-url {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.history-reason {
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+}
+
+/* ---------- 舞台 ---------- */
+.lc-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-canvas);
+}
+
+.stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  flex: none;
+  flex-wrap: wrap;
+}
+
+.stage-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.stage-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.dot-success {
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-soft);
+  animation: pulse 1.8s ease-in-out infinite;
+}
+
+.dot-danger {
+  background: var(--danger);
+}
+
+.dot-neutral {
+  background: var(--border-strong);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.stage-stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.stat-warn {
+  color: var(--warning);
+}
+
+.stage-error {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 11.5px;
+  flex: none;
+}
+
+.stage-error strong {
+  font-family: var(--font-mono);
+}
+
+.send-bar {
+  display: flex;
+  gap: 7px;
+  padding: 9px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  flex: none;
+}
+
+.send-bar .btn {
+  height: 32px;
+}
+
+.timeline-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 16px;
+  flex: none;
+}
+
+.filter-group {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.filter-chip {
+  height: 22px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.filter-chip-active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+
+.toolbar-fill {
+  flex: 1;
+}
+
+.auto-scroll {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.switch {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+}
+
+.timeline {
+  flex: 1;
+  min-height: 0;
+  padding: 0 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.timeline-empty {
+  display: grid;
+  place-items: center;
+  flex: 1;
+}
+
+.event {
+  border: 1px solid var(--border-subtle);
+  border-left: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.event-out {
+  border-left-color: var(--accent);
+}
+
+.event-lifecycle {
+  background: var(--bg-subtle);
+  border-left-color: var(--text-tertiary);
+}
+
+.event-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.event-seq {
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+}
+
+.event-dir {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-weight: 600;
+}
+
+.dir-in { color: var(--success); }
+.dir-out { color: var(--accent); }
+
+.event-kind {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.event-fill {
+  flex: 1;
+}
+
+.event-size,
+.event-time {
+  font-family: var(--font-mono);
+}
+
+.event-body {
+  margin: 0;
+  padding: 0 9px 8px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-primary);
+}
+
+.event-truncated {
+  padding: 4px 9px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 10.5px;
+}
+
+.stage-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  height: 30px;
+  padding: 0 16px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  font-size: 10.5px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.foot-fill {
+  flex: 1;
+}
+
+.spinning {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 1120px) {
+  .lc {
+    flex-direction: column;
+  }
+
+  .lc-config {
+    width: 100%;
+    max-height: 46%;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+}
+</style>

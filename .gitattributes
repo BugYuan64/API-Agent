@@ -1,0 +1,4 @@
+# Two trailing spaces are intentional Markdown line breaks.
+*.md whitespace=-blank-at-eol
+# Preserve upstream license notices byte-for-byte.
+backend/src/api_agent/static/*.LICENSE.txt whitespace=-blank-at-eol

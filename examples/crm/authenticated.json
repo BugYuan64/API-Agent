@@ -1,0 +1,10 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8080",
+  "allowed_methods": ["GET"],
+  "path_templates": ["/api/customer/list"],
+  "auth_ref": {"kind": "header", "header_name": "token", "env_var": "CRM_TEST_TOKEN"},
+  "requests": [
+    {"id": "authenticated-pagination", "method": "GET", "path": "/api/customer/list", "query": {"pageNum": "1", "pageSize": "1", "keyword": "api-agent-fixture"}, "assertions": [{"kind": "status", "expected": 200}, {"kind": "json_equals", "pointer": "/code", "expected": "200"}, {"kind": "json_exists", "pointer": "/data/list"}]}
+  ]
+}

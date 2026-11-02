@@ -1,0 +1,16 @@
+import json
+from pathlib import Path
+
+from api_agent.execution.schemas import ExecutionPlan
+
+
+def test_crm_examples_match_the_executable_schema():
+    directory = Path(__file__).resolve().parents[3] / "examples/crm"
+    plans = {
+        path.stem: ExecutionPlan.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        for path in directory.glob("*.json")
+    }
+    assert set(plans) == {"smoke", "authenticated", "rag"}
+    assert len(plans["smoke"].requests) == 8
+    assert plans["authenticated"].auth_ref.header_name == "token"
+    assert all(case.body == {"question": ""} for case in plans["rag"].requests[1:])
