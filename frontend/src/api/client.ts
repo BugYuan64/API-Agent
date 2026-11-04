@@ -46,21 +46,38 @@ async function readBody(response: Response): Promise<unknown> {
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, signal, timeoutMs = 30_000 } = options
+  if (signal?.aborted) throw new ApiError(0, 'network_aborted', '请求已取消或超时')
   const controller = new AbortController()
   // 外层 timeout 与调用方传入的 signal 合并：任一触发都中止请求。
   const timer = window.setTimeout(() => controller.abort(), timeoutMs)
   const onAbort = () => controller.abort()
   signal?.addEventListener('abort', onAbort)
 
-  let response: Response
   try {
-    response = await fetch(path, {
+    const response = await fetch(path, {
       method,
       headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: controller.signal,
     })
+    // Headers alone do not complete a request: cancellation and the deadline
+    // also cover streaming the body and parsing the response.
+    const payload = await readBody(response)
+    if (controller.signal.aborted) throw new ApiError(0, 'network_aborted', '请求已取消或超时')
+    if (!response.ok) {
+      const shaped = payload as { error?: { code: string; message: string; details?: []; request_id?: string } } | null
+      const detail = shaped?.error
+      throw new ApiError(
+        response.status,
+        detail?.code ?? `http_${response.status}`,
+        detail?.message ?? `请求失败（HTTP ${response.status}）`,
+        detail?.details ?? [],
+        detail?.request_id ?? '',
+      )
+    }
+    return payload as T
   } catch (error) {
+    if (error instanceof ApiError) throw error
     if (controller.signal.aborted) {
       throw new ApiError(0, 'network_aborted', '请求已取消或超时')
     }
@@ -70,19 +87,6 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     signal?.removeEventListener('abort', onAbort)
   }
 
-  const payload = await readBody(response)
-  if (!response.ok) {
-    const shaped = payload as { error?: { code: string; message: string; details?: []; request_id?: string } } | null
-    const detail = shaped?.error
-    throw new ApiError(
-      response.status,
-      detail?.code ?? `http_${response.status}`,
-      detail?.message ?? `请求失败（HTTP ${response.status}）`,
-      detail?.details ?? [],
-      detail?.request_id ?? '',
-    )
-  }
-  return payload as T
 }
 
 /** 把任意异常转成一句可展示的中文说明，避免页面各自判断类型。 */

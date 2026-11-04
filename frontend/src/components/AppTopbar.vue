@@ -1,21 +1,30 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { Activity, RefreshCw, ServerCog } from 'lucide-vue-next'
+import { Activity, RefreshCw, ServerCog, Settings as SettingsIcon } from 'lucide-vue-next'
 import { engineStatus, getHealth } from '@/api/endpoints'
-import type { EngineStatus, Health } from '@/api/types'
+import type { EngineStatus } from '@/api/types'
+import { engineMeta } from '@/lib/engines'
+import { useEngineSelection } from '@/lib/engines'
 
 /** 顶栏展示两个真实状态：管理后端是否存活、执行引擎是否可用。
  *  两者都失败时界面仍可用（页面会各自提示），但用户能立刻知道问题出在哪一层。 */
-const health = ref<Health | null>(null)
 const healthError = ref(false)
 const engine = ref<EngineStatus | null>(null)
 const loading = ref(false)
 
+/** 顶栏显示“当前选中的引擎”及其状态，而不是写死某一个引擎名称。 */
+const { selected: selectedEngine, refresh: refreshEngineList } = useEngineSelection()
+
 async function refresh() {
   loading.value = true
   try {
-    const [healthResult, engineResult] = await Promise.allSettled([getHealth(), engineStatus()])
-    health.value = healthResult.status === 'fulfilled' ? healthResult.value : null
+    // 首次显示时先确保引擎列表（含服务端默认值）已就绪，再按选中项探活，
+    // 否则顶栏会一直停在本地默认值上。
+    if (!engine.value) await refreshEngineList()
+    const [healthResult, engineResult] = await Promise.allSettled([
+      getHealth(),
+      engineStatus(selectedEngine.value),
+    ])
     healthError.value = healthResult.status === 'rejected'
     engine.value = engineResult.status === 'fulfilled' ? engineResult.value : null
   } finally {
@@ -24,9 +33,10 @@ async function refresh() {
 }
 
 const engineLabel = computed(() => {
-  if (!engine.value) return '引擎状态未知'
-  if (engine.value.available) return `Postman CLI ${engine.value.version ?? ''}`.trim()
-  return 'Postman CLI 不可用'
+  const name = engineMeta(selectedEngine.value).name
+  if (!engine.value) return `${name} 状态未知`
+  if (!engine.value.available) return `${name} 不可用`
+  return engine.value.version ? `${name} v${engine.value.version}` : name
 })
 
 const engineTone = computed(() => {
@@ -57,6 +67,9 @@ onMounted(refresh)
       <button class="btn btn-ghost btn-icon" title="刷新状态" :disabled="loading" @click="refresh">
         <RefreshCw :size="14" :class="{ spinning: loading }" />
       </button>
+      <RouterLink to="/settings" class="btn btn-ghost btn-icon" title="系统设置与大模型配置">
+        <SettingsIcon :size="14" />
+      </RouterLink>
     </div>
   </header>
 </template>

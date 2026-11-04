@@ -6,7 +6,14 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api_agent.infrastructure.api import ApiError, Page, PageInfo, not_found
+from api_agent.infrastructure.api import (
+    ApiError,
+    LimitParam,
+    OffsetParam,
+    Page,
+    not_found,
+    paginate,
+)
 from api_agent.infrastructure.database import session_for
 from api_agent.infrastructure.targets import TargetError
 from api_agent.streams.models import StreamEventRecord, StreamSessionRecord
@@ -16,8 +23,9 @@ from api_agent.streams.schemas import (
     StreamHistoryResponse,
     StreamSendRequest,
     StreamSessionResponse,
+    StreamStart,
 )
-from api_agent.streams.service import StreamStart, serialize_event, serialize_stream
+from api_agent.streams.state import serialize_event, serialize_stream
 
 router = APIRouter(prefix="/api/streams", tags=["streams"])
 Session = Annotated[AsyncSession, Depends(session_for)]
@@ -55,8 +63,8 @@ async def start_stream(payload: StreamStart, request: Request, response: Respons
 @router.get("", response_model=Page[StreamHistoryResponse])
 async def list_sessions(
     session: Session,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: LimitParam = 50,
+    offset: OffsetParam = 0,
 ):
     """分页列出历史长连接会话（进程重启后依然可用）。
 
@@ -74,10 +82,7 @@ async def list_sessions(
         )
     ).all()
     total = await session.scalar(select(func.count()).select_from(StreamSessionRecord)) or 0
-    return Page[StreamHistoryResponse](
-        items=[StreamHistoryResponse.model_validate(item) for item in items],
-        page=PageInfo(limit=limit, offset=offset, total=total),
-    )
+    return paginate(StreamHistoryResponse, items, limit, offset, total)
 
 
 @router.get("/{session_id}", response_model=StreamEventPage)
@@ -164,7 +169,7 @@ async def send_message(session_id: str, payload: StreamSendRequest, request: Req
 
 
 @router.post("/{session_id}/stop", response_model=StreamSessionResponse)
-async def stop_session(session_id: str, request: Request):
+async def stop_session(session_id: str, request: Request, session: Session):
     """请求结束一个会话。
 
     实现：``stop`` 只设置停止意图并取消任务；真正的状态落库在任务的
@@ -173,7 +178,10 @@ async def stop_session(session_id: str, request: Request):
     manager = _manager(request)
     stream = await manager.stop(session_id)
     if stream is None:
-        raise not_found("Stream session")
+        record = await session.get(StreamSessionRecord, session_id)
+        if record is None:
+            raise not_found("Stream session")
+        return StreamSessionResponse.model_validate(_stored_state(record))
     return StreamSessionResponse.model_validate(serialize_stream(stream))
 
 

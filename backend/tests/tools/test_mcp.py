@@ -42,8 +42,12 @@ async def test_real_stdio_initialization_tools_validation_and_safe_errors(tmp_pa
         result = await client.call_tool("validate_plan", {"payload": bad})
         assert result.structured_content == {"valid": False, "error_kind": "invalid_plan"}
         assert "PRIVATE" not in json.dumps(result.model_dump())
-        result = await client.call_tool("run_plan", {"payload": payload()})
+        # 显式选择 Postman CLI 驱动时，本机缺 CLI 应得到稳定错误码而不是崩溃。
+        result = await client.call_tool("run_plan", {"payload": payload(), "engine": "postman"})
         assert result.structured_content["error_kind"] == "cli_unavailable"
+        # 未知驱动名在解析阶段即被拒绝，不会发请求。
+        result = await client.call_tool("run_plan", {"payload": payload(), "engine": "nope"})
+        assert result.structured_content["error_kind"] == "unknown_engine"
 
 
 async def test_independent_client_denies_unconfigured_origin(tmp_path):

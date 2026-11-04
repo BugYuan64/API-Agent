@@ -13,11 +13,14 @@ export const router = createRouter({
       meta: { title: '接口调试' },
     },
     {
-      path: '/plan',
-      name: 'plan',
-      component: () => import('@/views/PlanRunner.vue'),
-      meta: { title: '用例计划' },
+      path: '/testcases',
+      name: 'testcases',
+      component: () => import('@/views/TestCasesView.vue'),
+      meta: { title: '用例测试' },
     },
+    // 旧路径保兼容：/plan → 手动模式，/agent → 自动模式
+    { path: '/plan', redirect: { name: 'testcases', query: { mode: 'manual' } } },
+    { path: '/agent', redirect: { name: 'testcases', query: { mode: 'auto' } } },
     {
       path: '/long-connection',
       name: 'long-connection',
@@ -53,6 +56,12 @@ export const router = createRouter({
       name: 'executions',
       component: () => import('@/views/ExecutionsView.vue'),
       meta: { title: '执行结果' },
+    },
+    {
+      path: '/settings',
+      name: 'settings',
+      component: () => import('@/views/SettingsView.vue'),
+      meta: { title: '系统设置' },
     },
     {
       path: '/:pathMatch(.*)*',

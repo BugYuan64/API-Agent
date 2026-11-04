@@ -10,6 +10,10 @@ import {
   Trash2,
 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
+import HistoryList, { type HistoryEntry } from '@/components/HistoryList.vue'
+import ResizableSplit from '@/components/ResizableSplit.vue'
+import TestWorkspace from '@/components/TestWorkspace.vue'
+import { useHeaderRows } from '@/composables/useHeaderRows'
 import EmptyState from '@/components/EmptyState.vue'
 import { describeError } from '@/api/client'
 import {
@@ -64,9 +68,14 @@ const form = reactive({
   followRedirects: false,
 })
 
-/** 头以「行」的形式编辑——这是 Postman/Apifox 用户最熟悉的心智模型，
- *  提交前再折叠成对象。空行自动忽略，值允许留空（有些头确实只需要名字）。 */
-const headerRows = ref<{ name: string; value: string }[]>([{ name: '', value: '' }])
+/** 头以「行」的形式编辑（Postman/Apifox 的心智模型），折叠规则与长连接页共用一份。 */
+const {
+  rows: headerRows,
+  headers: activeHeaders,
+  count: headerCount,
+  add: addHeaderRow,
+  remove: removeHeaderRow,
+} = useHeaderRows()
 
 const tab = ref<'params' | 'headers' | 'body' | 'meta'>('body')
 const sending = ref(false)
@@ -91,17 +100,6 @@ watch(
   },
 )
 
-const activeHeaders = computed(() =>
-  headerRows.value
-    .filter((row) => row.name.trim())
-    .reduce<Record<string, string>>((acc, row) => {
-      acc[row.name.trim()] = row.value
-      return acc
-    }, {}),
-)
-
-const headerCount = computed(() => Object.keys(activeHeaders.value).length)
-
 /** 响应体展示：JSON 自动美化，其它类型原样展示。 */
 const responseBodyText = computed(() => {
   const body = result.value?.response?.body
@@ -110,15 +108,6 @@ const responseBodyText = computed(() => {
 })
 
 const responseTone = computed(() => statusTone(result.value?.response?.status))
-
-function addHeaderRow() {
-  headerRows.value.push({ name: '', value: '' })
-}
-
-function removeHeaderRow(index: number) {
-  headerRows.value.splice(index, 1)
-  if (headerRows.value.length === 0) addHeaderRow()
-}
 
 function applySample(sample: (typeof SAMPLES)[number]) {
   form.method = sample.method
@@ -249,66 +238,95 @@ async function clearAll() {
   }
 }
 
+/** 响应区高度：上下分栏的受控尺寸，持久化到本页专属 key。 */
+const responseHeight = ref(320)
+
+function restoreResponseHeight(): number {
+  try {
+    const saved = Number(window.localStorage.getItem('api-agent.layout.console.response'))
+    return Number.isFinite(saved) && saved > 0 ? saved : 320
+  } catch {
+    return 320
+  }
+}
+
+responseHeight.value = restoreResponseHeight()
+
+/** 把请求记录映射成共享历史列的条目（方法名留给 prefix 插槽渲染）。 */
+const historyEntries = computed<HistoryEntry[]>(() =>
+  history.value.map((record) => ({
+    id: record.id,
+    label: record.url,
+    status: record.ok ? String(record.status_code) : record.error_kind ?? 'error',
+    tone: statusTone(record.status_code),
+    meta: `${formatRelative(record.created_at)} · ${formatDuration(record.elapsed_ms)}`,
+    raw: record,
+  })),
+)
+
+function restoreById(id: string): void {
+  const target = history.value.find((item) => item.id === id)
+  if (target) restore(target)
+}
+
+function removeHistoryById(id: string): void {
+  const target = history.value.find((item) => item.id === id)
+  if (target) removeHistory(target)
+}
+
 onMounted(loadHistory)
 </script>
 
 <template>
-  <div class="console">
+  <TestWorkspace persist-key="api-agent.layout.console.history" class="console">
     <!-- 左栏：历史请求，与 apifox 的「快捷请求」列表同位 -->
-    <aside class="history-pane">
-      <div class="pane-head">
-        <span class="pane-title">请求历史</span>
-        <button
-          class="btn btn-ghost btn-sm"
-          :disabled="history.length === 0"
-          title="清空全部历史"
-          @click="clearAll"
-        >
-          <Trash2 :size="13" />
-        </button>
-      </div>
-      <div class="pane-body scroll-y">
-        <div
-          v-for="record in history"
-          :key="record.id"
-          class="history-item"
-          :class="{ 'history-item-active': activeHistoryId === record.id }"
-          @click="restore(record)"
-        >
-          <div class="history-row">
-            <span class="method" :class="`method-${record.method.toLowerCase()}`">
-              {{ record.method }}
-            </span>
-            <span
-              class="history-status"
-              :class="`tone-${statusTone(record.status_code)}`"
-            >
-              {{ record.ok ? record.status_code : record.error_kind }}
-            </span>
-          </div>
-          <div class="history-url truncate" :title="record.url">{{ record.url }}</div>
-          <div class="history-meta">
-            <span>{{ formatRelative(record.created_at) }}</span>
-            <span>·</span>
-            <span>{{ formatDuration(record.elapsed_ms) }}</span>
-          </div>
+    <template #history>
+      <HistoryList
+        title="请求历史"
+        :items="historyEntries"
+        :active-id="activeHistoryId"
+        empty-text="还没有请求记录。发送一次请求后，这里会保留脱敏摘要。"
+        @select="restoreById"
+      >
+        <template #head-actions>
           <button
+            type="button"
+            class="btn btn-ghost btn-sm"
+            :disabled="history.length === 0"
+            title="清空全部历史"
+            @click="clearAll"
+          >
+            <Trash2 :size="13" />
+          </button>
+        </template>
+        <template #prefix="{ item }">
+          <span class="method" :class="`method-${String((item.raw as ConsoleHistory | undefined)?.method ?? '').toLowerCase()}`">
+            {{ (item.raw as ConsoleHistory | undefined)?.method }}
+          </span>
+        </template>
+        <template #actions="{ item }">
+          <span
             class="history-delete"
             title="删除这条记录"
-            @click.stop="removeHistory(record)"
+            @click.stop="removeHistoryById(item.id)"
           >
             <Trash2 :size="12" />
-          </button>
-        </div>
+          </span>
+        </template>
+      </HistoryList>
+    </template>
 
-        <div v-if="!history.length && !historyLoading" class="history-empty">
-          还没有请求记录。<br />发送一次请求后，这里会保留脱敏摘要。
-        </div>
-      </div>
-    </aside>
-
-    <!-- 右栏：请求编辑 + 响应 -->
-    <section class="workbench">
+    <!-- 右栏：请求编辑 + 响应（上下可拖动，各自有最小阈值） -->
+    <ResizableSplit
+      v-model:size="responseHeight"
+      direction="vertical"
+      persist-key="api-agent.layout.console.response"
+      :min="240"
+      :min-other="220"
+      label="拖动调整请求区与响应区高度"
+    >
+      <template #first>
+        <section class="workbench scroll-y">
       <div class="url-bar">
         <select v-model="form.method" class="method-select" aria-label="HTTP 方法">
           <option v-for="method in METHODS" :key="method" :value="method">{{ method }}</option>
@@ -441,8 +459,10 @@ onMounted(loadHistory)
         </div>
       </div>
 
-      <!-- 响应区 -->
-      <div class="response">
+        </section>
+      </template>
+      <template #second>
+        <div class="response">
         <div class="response-head">
           <div class="response-title">返回响应</div>
           <div v-if="result" class="response-stats">
@@ -501,137 +521,33 @@ onMounted(loadHistory)
           </div>
         </div>
       </div>
-    </section>
-  </div>
+      </template>
+    </ResizableSplit>
+  </TestWorkspace>
 </template>
 
 <style scoped>
 .console {
-  display: flex;
   height: 100%;
   min-height: 0;
 }
 
 /* ---------- 左：历史 ---------- */
-.history-pane {
-  display: flex;
-  flex-direction: column;
-  width: var(--workspace-width);
-  flex: none;
-  border-right: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
-  min-height: 0;
-}
-
-.pane-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 11px 12px 9px 14px;
-  flex: none;
-}
-
-.pane-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.pane-body {
-  flex: 1;
-  padding: 0 8px 12px;
-}
-
-.history-item {
-  position: relative;
-  padding: 8px 9px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  border: 1px solid transparent;
-}
-
-.history-item:hover {
-  background: var(--bg-hover);
-}
-
-.history-item-active {
-  background: var(--accent-soft);
-  border-color: var(--accent-border);
-}
-
-.history-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
-}
-
-.history-status {
-  font-size: 11px;
-  font-weight: 600;
-  font-family: var(--font-mono);
-}
-
 .tone-success { color: var(--success); }
 .tone-info { color: var(--info); }
 .tone-warning { color: var(--warning); }
 .tone-danger { color: var(--danger); }
 .tone-neutral { color: var(--text-tertiary); }
 
-.history-url {
-  margin-top: 3px;
-  font-size: 11.5px;
-  color: var(--text-secondary);
-  font-family: var(--font-mono);
-}
-
-.history-meta {
-  display: flex;
-  gap: 4px;
-  margin-top: 2px;
-  font-size: 10.5px;
-  color: var(--text-tertiary);
-}
-
-.history-delete {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  display: none;
-  place-items: center;
-  width: 20px;
-  height: 20px;
-  border: 0;
-  border-radius: 5px;
-  background: var(--bg-surface);
-  color: var(--text-tertiary);
-  box-shadow: var(--shadow-sm);
-}
-
-.history-item:hover .history-delete {
-  display: grid;
-}
-
-.history-delete:hover {
-  color: var(--danger);
-}
-
-.history-empty {
-  padding: 26px 14px;
-  font-size: 11.5px;
-  line-height: 1.8;
-  color: var(--text-tertiary);
-  text-align: center;
-}
-
 /* ---------- 右：工作台 ---------- */
 .workbench {
   display: flex;
   flex-direction: column;
-  flex: 1;
+  height: 100%;
   min-width: 0;
   min-height: 0;
-  background: var(--bg-canvas);
+  /* 与手动用例的编辑区同底色：整块工作台是一个连续白面，不出现色差缝隙。 */
+  background: var(--bg-surface);
 }
 
 .url-bar {
@@ -741,8 +657,11 @@ onMounted(loadHistory)
 }
 
 .tab-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
   padding: 12px 16px;
-  flex: none;
 }
 
 .body-modes {
@@ -778,8 +697,8 @@ onMounted(loadHistory)
 }
 
 .body-editor {
+  flex: 1;
   min-height: 132px;
-  max-height: 260px;
 }
 
 .body-hint {
@@ -859,9 +778,9 @@ onMounted(loadHistory)
 .response {
   display: flex;
   flex-direction: column;
-  flex: 1;
+  height: 100%;
   min-height: 0;
-  border-top: 1px solid var(--border-subtle);
+  /* 不再画上边框：与请求区同底色，靠分隔条的手柄提示可调，避免双层浅灰线。 */
   background: var(--bg-surface);
 }
 

@@ -289,15 +289,31 @@ class RunRepository:
 
         作用：把“预算检查 + 预留 + 记事件”放在同一事务里，
         避免检查与预留之间被其他路径插队。
-        实现：先用 ``budget_summary`` 算出已用量
+        实现：先以状态和动作游标为条件取得数据库写锁，取消先提交时拒绝派发；
+        写锁保持到预算与尝试一起提交。用 ``budget_summary`` 算出已用量
         （consumed + reserved - released），达到 ``limit`` 直接返回 None 表示预算耗尽；
         否则插入 ``dispatching`` 状态的尝试行（序号 = current_action + 1）、
         追加一条 ``reserved`` 账本（``related_id`` 指向该尝试），
         再记一条 ``started`` 事件，最后统一 commit。
         """
+        eligible = await self.session.execute(
+            update(Run)
+            .where(
+                Run.id == run.id,
+                Run.status == RUNNING,
+                Run.current_action == run.current_action,
+            )
+            .values(status=RUNNING)
+            .execution_options(synchronize_session=False)
+        )
+        if eligible.rowcount != 1:
+            await self.session.commit()
+            await self.session.refresh(run)
+            return None
         budget = await self.budget_summary(run.id, "simulation_action")
         used = budget["consumed"] + budget["reserved"] - budget["released"]
         if used >= limit:
+            await self.session.commit()
             return None
         attempt = DispatchAttempt(
             run_id=run.id,

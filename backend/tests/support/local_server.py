@@ -43,6 +43,8 @@ def build_app() -> FastAPI:
         }
 
     @app.get("/slow")
+    @app.post("/slow")
+    @app.post("/slow/chat/completions")
     async def slow():
         """故意迟到，用于验证客户端超时分类。"""
         await asyncio.sleep(3)
@@ -110,6 +112,92 @@ def build_app() -> FastAPI:
     async def ws_reject(websocket: WebSocket):
         """握手阶段直接关闭（1008），用于验证拒绝分类。"""
         await websocket.close(code=1008, reason="nope")
+
+    @app.get("/models")
+    @app.get("/v1/models")
+    async def openai_models(request: Request):
+        """模拟 OpenAI 兼容的模型列表端点，支持鉴权失败分支。"""
+        auth = request.headers.get("authorization", "")
+        if "bad-key" in auth:
+            return JSONResponse(
+                {"error": {"message": "Incorrect API key provided"}},
+                status_code=401,
+            )
+        return {
+            "object": "list",
+            "data": [
+                {"id": "gpt-4o", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-4o-mini", "object": "model", "owned_by": "openai"},
+                {"id": "deepseek-chat", "object": "model", "owned_by": "deepseek"},
+            ],
+        }
+
+    @app.post("/v1/chat/completions")
+    @app.post("/chat/completions")
+    async def openai_chat_completions(request: Request):
+        """模拟 OpenAI 兼容接口，支持鉴权、文本响应与函数/工具调用。"""
+        auth = request.headers.get("authorization", "")
+        if "bad-key" in auth:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Incorrect API key provided",
+                        "type": "invalid_request_error",
+                    }
+                },
+                status_code=401,
+            )
+        body = await request.json()
+        model = body.get("model", "gpt-4o")
+        tools = body.get("tools")
+        # 如果声明了 tools，模拟模型发起结构化工具调用
+        if tools and isinstance(tools, list) and len(tools) > 0:
+            target_fn = tools[0].get("function", {}).get("name", "test_tool")
+            return {
+                "id": "chatcmpl-mock-tool-call",
+                "object": "chat.completion",
+                "created": 1700000000,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_mock_123456",
+                                    "type": "function",
+                                    "function": {
+                                        "name": target_fn,
+                                        "arguments": '{"query": "mock test value", "limit": 10}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 35, "completion_tokens": 20, "total_tokens": 55},
+            }
+        # 未声明 tools 或普通对话，返回标准文本回复
+        return {
+            "id": "chatcmpl-mock-text-response",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Mock OpenAI-compatible response from LocalServer.",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 12, "total_tokens": 27},
+        }
 
     return app
 

@@ -66,18 +66,6 @@ class ProjectRepository:
             )
         )
 
-    async def get_named_environment(self, project_id: str, name: str) -> Environment | None:
-        """按（项目, 环境名）查重命名的环境。
-
-        实现：条件命中 ``UniqueConstraint("project_id", "name")``；
-        主要用于“同名环境是否已存在”的显式判断（唯一约束兜底在数据库层）。
-        """
-        return await self.session.scalar(
-            select(Environment).where(
-                Environment.project_id == project_id, Environment.name == name
-            )
-        )
-
     async def list_environments(self, project_id: str, limit: int, offset: int):
         """分页列出某项目的环境，并一次性取回各自当前版本配置。
 

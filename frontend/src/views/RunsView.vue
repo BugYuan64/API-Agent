@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { CircleStop, Loader2, Play, RefreshCw, Waypoints } from 'lucide-vue-next'
 import EmptyState from '@/components/EmptyState.vue'
 import { describeError } from '@/api/client'
@@ -7,6 +7,7 @@ import { cancelRun, createRun, listProjects, listRuns } from '@/api/endpoints'
 import type { Project, Run } from '@/api/types'
 import { describeRunStatus, formatRelative } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
+import { usePolling } from '@/composables/usePolling'
 
 /** 模拟任务：阶段 1 的本地确定性执行器。
  *  它不访问目标也不调用模型，界面上明确说明这一点，避免被误读为真实测试结果。 */
@@ -23,9 +24,6 @@ const form = reactive({
   seed: 7,
 })
 
-// 轮询：有在跑的任务时每 1.5 秒刷新一次，全部结束后自动停。
-let timer: number | undefined
-
 const activeCount = computed(
   () => runs.value.filter((run) => ['queued', 'running', 'cancelling'].includes(run.status)).length,
 )
@@ -38,24 +36,24 @@ const toneOf = (status: string) => {
   return 'neutral'
 }
 
-async function load() {
-  loading.value = true
-  try {
-    const page = await listRuns(50)
+const polling = usePolling({
+  fetch: signal => listRuns(50, 0, signal),
+  onResult: page => {
     runs.value = page.items
-  } catch (error) {
-    useToastStore().push('danger', '加载任务失败', describeError(error))
-  } finally {
     loading.value = false
-  }
-  schedule()
-}
+  },
+  onError: error => {
+    loading.value = false
+    useToastStore().push('danger', '加载任务失败', describeError(error))
+    polling.stop()
+  },
+  isTerminal: page => !page.items.some(run => ['queued', 'running', 'cancelling'].includes(run.status)),
+  intervalMs: 1500,
+})
 
-function schedule() {
-  window.clearTimeout(timer)
-  if (activeCount.value > 0) {
-    timer = window.setTimeout(load, 1500)
-  }
+function load() {
+  loading.value = true
+  polling.start()
 }
 
 async function loadProjects() {
@@ -108,7 +106,6 @@ onMounted(async () => {
   await Promise.all([loadProjects(), load()])
 })
 
-onBeforeUnmount(() => window.clearTimeout(timer))
 </script>
 
 <template>

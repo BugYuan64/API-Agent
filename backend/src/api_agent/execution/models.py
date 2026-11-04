@@ -30,3 +30,7 @@ class ExecutionRecord(IdMixin, CreatedAtMixin, Base):
     observed_attempts: Mapped[int] = mapped_column(Integer, default=0)
     unknown_requests: Mapped[int] = mapped_column(Integer, default=0)
     executions: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    # 执行时冻结的脱敏原计划与指纹：诊断必须依据“跑的那份计划”，
+    # 而不是编辑器里可能已被改动的当前内容。旧记录这两列为 NULL。
+    plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    plan_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)

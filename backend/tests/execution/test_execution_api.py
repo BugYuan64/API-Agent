@@ -127,12 +127,13 @@ async def test_execution_persists_case_and_assertion_results(cli_client, target)
     """
     response = await cli_client.post(
         "/api/executions",
-        json={"plan": plan_for(target.base_url), "label": "fixture-json"},
+        json={"plan": plan_for(target.base_url), "label": "fixture-json", "engine": "postman"},
     )
     assert response.status_code == 201, response.text
     payload = response.json()
     assert payload["status"] == "passed", payload
     assert payload["label"] == "fixture-json"
+    assert payload["engine"] == "postman-cli"
     assert payload["reserved_requests"] == 1
     assert payload["observed_attempts"] == 1
     case = payload["executions"][0]
@@ -159,12 +160,60 @@ async def test_execution_records_assertion_failure(cli_client, target):
     """
     plan = plan_for(target.base_url)
     plan["requests"][0]["assertions"] = [{"kind": "status", "expected": 201}]
-    response = await cli_client.post("/api/executions", json={"plan": plan})
+    response = await cli_client.post("/api/executions", json={"plan": plan, "engine": "postman"})
     assert response.status_code == 201
     payload = response.json()
     assert payload["status"] == "failed"
     assert payload["executions"][0]["assertions"][0]["passed"] is False
     assert isinstance(payload["executions"][0]["assertions"][0]["message"], str)
+
+
+async def test_native_engine_executes_plan_without_external_cli(tmp_path, target):
+    """原生驱动不需要任何外部 CLI，开箱即可执行并落库。
+
+    实现：这里刻意不配置 ``postman_cli_path``，证明 native 引擎完全自给自足；
+    同时验证 ``engine/list`` 报告两个驱动、默认选原生。
+    """
+    import httpx
+
+    from api_agent.infrastructure.config import load_settings
+    from api_agent.main import create_app
+
+    settings = load_settings(
+        env_file=None,
+        project_root=tmp_path,
+        target_allowed_origins=[target.base_url],
+    )
+    application = create_app(settings)
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            listing = await client.get("/api/executions/engine/list")
+            assert listing.status_code == 200
+            engines = {item["id"]: item for item in listing.json()["items"]}
+            assert set(engines) == {"native", "postman"}
+            assert engines["native"]["available"] is True
+            assert listing.json()["default"] == "native"
+
+            response = await client.post(
+                "/api/executions",
+                json={"plan": plan_for(target.base_url), "engine": "native"},
+            )
+            assert response.status_code == 201, response.text
+            payload = response.json()
+            assert payload["status"] == "passed"
+            assert payload["engine"] == "native"
+            assert payload["observed_attempts"] == 1
+            assert payload["unknown_requests"] == 0
+            assert payload["executions"][0]["response"]["body_bytes"] > 0
+
+            unknown = await client.post(
+                "/api/executions",
+                json={"plan": plan_for(target.base_url), "engine": "does-not-exist"},
+            )
+            assert unknown.status_code == 400
+            assert unknown.json()["error"]["code"] == "unknown_engine"
+            assert (await client.get("/api/executions")).json()["page"]["total"] == 1
 
 
 async def test_execution_history_is_paginated_and_ordered(client):

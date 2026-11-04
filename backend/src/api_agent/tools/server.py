@@ -23,41 +23,43 @@ def create_server(settings: Settings) -> MCPServer:
     service = ExecutionService(settings)
     server = MCPServer(
         "API-Agent Postman",
-        version="0.1.0",
+        version="0.2.0",
         log_level="ERROR",
         instructions="Execute only data-only API test plans within local configured scope.",
     )
 
     @server.tool()
-    async def postman_status() -> dict[str, Any]:
-        """检查原生 Postman CLI 是否可用（不登录、不访问目标）。
+    async def postman_status(engine: str | None = None) -> dict[str, Any]:
+        """检查执行驱动是否可用（不登录、不访问目标）。
 
-        实现：委托 ``runner.status()`` 执行 ``--version`` 探测；
+        实现：委托 ``service.engine_status``；``engine`` 缺省返回原生驱动状态，
+        传 ``postman`` 则探测 CLI ``--version``。
         捕获所有异常并返回 ``cli_unavailable``，保证工具调用永不抛错。
         """
         try:
-            return await service.runner.status()
+            return await service.engine_status(engine)
         except Exception:
             return {"available": False, "error_kind": "cli_unavailable"}
 
     @server.tool()
-    def validate_plan(payload: Any) -> dict[str, Any]:
+    def validate_plan(payload: Any, engine: str | None = None) -> dict[str, Any]:
         """校验一份 v1 ExecutionPlan 及本地范围，不发送任何请求。
 
         实现：直接委托 ``service.validate``；它是同步的，
         因为整个流程只做 pydantic 校验和集合比较，没有 IO。
         """
-        return service.validate(payload)
+        return service.validate(payload, engine)
 
     @server.tool()
-    async def run_plan(payload: Any) -> dict[str, Any]:
+    async def run_plan(payload: Any, engine: str | None = None) -> dict[str, Any]:
         """执行一份受限的 v1 ExecutionPlan，只返回断言元信息。
 
         实现：委托 ``service.run``（内部已做解析、范围校验、凭据解析与超时控制）；
+        ``engine`` 可选 ``native``（原生极速）或 ``postman``（沙箱）；
         异常兜底返回 ``internal_execution_error``，避免把堆栈经 MCP 透出给调用方。
         """
         try:
-            return await service.run(payload)
+            return await service.run(payload, engine)
         except Exception:
             return {"status": "error", "error_kind": "internal_execution_error"}
 

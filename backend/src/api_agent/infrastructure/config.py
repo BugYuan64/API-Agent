@@ -26,12 +26,16 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     database_url: str = "sqlite:///data/api_agent.db"
     artifact_dir: Path = Path("data/artifacts")
-    llm_mode: Literal["disabled", "mock"] = "disabled"
+    llm_mode: Literal["disabled", "mock", "openai"] = "disabled"
     llm_api_key: SecretStr | None = None
+    llm_base_url: str | None = None
+    llm_model: str = Field(default="gpt-4o", min_length=1, max_length=120)
+    llm_timeout_seconds: float = Field(default=60.0, ge=0.05, le=600.0)
     target_allowed_origins: list[str] = Field(default_factory=list)
     target_auth_env_vars: list[str] = Field(default_factory=list)
     postman_cli_path: Path | None = None
     omit_response_payload: bool = False
+    response_max_bytes: int = Field(default=2_097_152, ge=1, le=16_777_216)
     stream_max_sessions: int = Field(default=4, ge=1, le=16)
     stream_max_bytes: int = Field(default=8_388_608, ge=1024, le=268_435_456)
     frontend_dist: Path | None = Path("frontend/dist")
@@ -69,6 +73,28 @@ class Settings(BaseSettings):
         导致日志脱敏和降级判定都得出错误结论。
         """
         return None if value == "" else value
+
+    @field_validator("llm_base_url", mode="before")
+    @classmethod
+    def normalize_base_url(cls, value):
+        """校验并归一化 OpenAI 兼容的 Base URL。
+
+        实现：允许任何兼容 OpenAI 协议的 HTTP/HTTPS 服务端点（包含第三方供应商如
+        DeepSeek/OpenAI/智谱，自建网关如 OneAPI/NewAPI，以及本地服务如 Ollama/vLLM/LocalAI）。
+        空字符串归一为 None；统一去除尾部斜杠，便于下游按规范拼接 `/chat/completions`。
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if not isinstance(value, str):
+            raise ValueError("must be a URL string")
+        stripped = value.strip().rstrip("/")
+        try:
+            parsed = urlsplit(stripped)
+        except ValueError:
+            raise ValueError("must be a valid URL") from None
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("must be a valid HTTP(S) base URL (e.g. https://api.openai.com/v1)")
+        return stripped
 
     @field_validator("artifact_dir", mode="before")
     @classmethod

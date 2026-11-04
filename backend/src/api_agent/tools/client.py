@@ -50,22 +50,31 @@ async def open_client(settings: Settings):
         yield client
 
 
-async def call_tool(settings: Settings, name: ToolName, payload: Any = None) -> dict:
+async def call_tool(
+    settings: Settings, name: ToolName, payload: Any = None, engine: str | None = None
+) -> dict:
     """通过 MCP 调用一个工具并返回其结构化结果。
 
     作用：CLI 与 MCP 之间的唯一通道，保证“工具执行”始终发生在独立进程里。
     实现：先用白名单再校验一次工具名（防止调用方传入任意方法名），
     然后每次调用都新建客户端会话——用完即关，不长期持有子进程；
-    ``postman_status`` 不接受参数，其余工具统一把 ``payload`` 包进 ``{"payload": ...}``；
+    ``postman_status`` 只接收可选的 ``engine``，其余工具统一把 ``payload``
+    包进 ``{"payload": ...}`` 并按需附带 ``engine``；
     若工具返回错误标志或结构化内容不是 dict，统一折叠成 ``mcp_tool_error``，
     避免把非结构化文本透传给上层。
     """
     if name not in {"postman_status", "validate_plan", "run_plan"}:
         return {"status": "error", "error_kind": "unknown_tool"}
+    arguments: dict[str, Any] = {}
+    if name == "postman_status":
+        if engine:
+            arguments["engine"] = engine
+    else:
+        arguments["payload"] = payload
+        if engine:
+            arguments["engine"] = engine
     async with open_client(settings) as client:
-        result = await client.call_tool(
-            name, {} if name == "postman_status" else {"payload": payload}
-        )
+        result = await client.call_tool(name, arguments)
         if result.is_error or not isinstance(result.structured_content, dict):
             return {"status": "error", "error_kind": "mcp_tool_error"}
         return result.structured_content

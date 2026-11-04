@@ -1,28 +1,37 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   Braces,
-  ChevronDown,
   CircleCheck,
   CircleX,
+  Cpu,
   FileJson2,
   Loader2,
   Play,
   RotateCcw,
+  Sparkles,
+  Terminal,
   TriangleAlert,
 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
+import ExecutionCases from '@/components/ExecutionCases.vue'
+import type { HistoryEntry } from '@/components/HistoryList.vue'
+import ResizableSplit from '@/components/ResizableSplit.vue'
 import EmptyState from '@/components/EmptyState.vue'
 import { describeError } from '@/api/client'
-import { engineStatus, listExecutions, listProjects, runExecution } from '@/api/endpoints'
-import type { EngineStatus, Execution, Project } from '@/api/types'
 import {
-  describeAssertionKind,
+  diagnoseExecution,
+  listExecutions,
+  listProjects,
+  runExecution,
+} from '@/api/endpoints'
+import type { AgentDiagnosis, Execution, Project } from '@/api/types'
+import { engineLabel, useEngineSelection } from '@/lib/engines'
+import {
   describeExecutionStatus,
   formatDuration,
   formatRelative,
   prettyJson,
-  statusTone,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
 
@@ -49,10 +58,34 @@ const label = ref('health check')
 const projectId = ref<string>('')
 const projects = ref<Project[]>([])
 const running = ref(false)
-const engine = ref<EngineStatus | null>(null)
+/** 引擎列表与当前选择来自共享 composable，与设置页共用同一份存储。 */
+const {
+  engines,
+  selected: selectedEngine,
+  activeEngine,
+  refresh: refreshEngines,
+  select: selectEngine,
+} = useEngineSelection()
 const result = ref<Execution | null>(null)
 const history = ref<Execution[]>([])
 const expanded = ref<string | null>(null)
+
+/** 把执行记录映射成共享历史列的条目形状（只做展示映射，不改变业务数据）。 */
+const historyEntries = computed<HistoryEntry[]>(() =>
+  history.value.map((item) => ({
+    id: item.id,
+    label: item.label || '(未命名)',
+    status: describeExecutionStatus(item.status),
+    tone:
+      item.status === 'passed' ? 'success' : item.status === 'failed' ? 'warning' : 'danger',
+    meta: formatRelative(item.created_at),
+    // 外壳据此把多条来源合并排序，并在点击时分派回本面板。
+    at: item.created_at,
+    source: 'manual',
+  })),
+)
+
+
 
 /** 实时解析计划文本，用于给用户即时反馈（不替代后端校验）。 */
 const parsed = computed(() => {
@@ -67,9 +100,10 @@ const parsed = computed(() => {
 const planSummary = computed(() => {
   if (!parsed.value.ok) return null
   const value = parsed.value.value as Record<string, unknown>
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const requests = Array.isArray(value.requests) ? (value.requests as Record<string, unknown>[]) : []
   const assertions = requests.reduce<number>(
-    (total, request) => total + (Array.isArray(request.assertions) ? request.assertions.length : 0),
+    (total, request) => total + (Array.isArray(request?.assertions) ? request.assertions.length : 0),
     0,
   )
   return {
@@ -94,13 +128,67 @@ function assertionStats(execution: Execution) {
   return { passed, failed, unknown }
 }
 
-async function refreshEngine() {
+/* ---------- AI 分析（显式触发，不改变已有执行记录） ---------- */
+const diagnosing = ref(false)
+const diagnosis = ref<AgentDiagnosis | null>(null)
+const contractRef = ref('')
+let diagnosisGeneration = 0
+const canAnalyze = computed(() => !!result.value?.plan && !diagnosing.value)
+
+function clearDiagnosis() {
+  diagnosisGeneration += 1
+  diagnosis.value = null
+  diagnosing.value = false
+}
+
+watch([() => result.value?.id, planText, contractRef], clearDiagnosis, { flush: 'sync' })
+onBeforeUnmount(clearDiagnosis)
+
+/* ---------- 对外接口：历史条目由外壳统一渲染 ---------- */
+const emit = defineEmits<{
+  (event: 'history', entries: HistoryEntry[]): void
+  (event: 'active', id: string | null): void
+}>()
+
+/** 供外壳的历史列点击时调用（按 id 选择一条执行）。 */
+function openHistory(id: string): void {
+  const target = history.value.find((item) => item.id === id)
+  if (target) selectExecution(target)
+}
+
+defineExpose({ openHistory })
+
+watch(historyEntries, (entries) => emit('history', entries), { immediate: true })
+watch(result, (value) => emit('active', value?.id ?? null), { immediate: true })
+
+function selectExecution(execution: Execution) {
+  clearDiagnosis()
+  result.value = execution
+  planText.value = execution.plan ? JSON.stringify(execution.plan, null, 2) : ''
+  expanded.value = execution.executions[0]?.id ?? null
+}
+
+/** 服务端从 execution_id 恢复原计划与结果，编辑器内容不参与证据配对。
+ *  约束：仅当用户点击时发生；失败不影响已落库的执行记录。 */
+async function analyzeWithAI() {
+  if (!result.value || !canAnalyze.value) return
+  const executionId = result.value.id
+  const generation = ++diagnosisGeneration
+  diagnosing.value = true
+  diagnosis.value = null
   try {
-    engine.value = await engineStatus()
-  } catch {
-    engine.value = { available: false, error_kind: 'unreachable' }
+    const response = await diagnoseExecution(executionId, {
+      contract: contractRef.value.trim() || '（未提供契约；仅就断言差异作观察）',
+    })
+    if (generation === diagnosisGeneration && result.value?.id === executionId) diagnosis.value = response
+  } catch (error) {
+    if (generation === diagnosisGeneration) useToastStore().push('danger', 'AI 分析失败', describeError(error))
+  } finally {
+    if (generation === diagnosisGeneration) diagnosing.value = false
   }
 }
+
+
 
 async function loadProjects() {
   try {
@@ -133,6 +221,7 @@ function resetPlan() {
   planText.value = DEFAULT_PLAN
   label.value = 'health check'
   result.value = null
+  diagnosis.value = null
 }
 
 async function run() {
@@ -147,8 +236,10 @@ async function run() {
       plan: parsed.value.value,
       label: label.value.trim() || 'untitled',
       project_id: projectId.value || null,
+      engine: selectedEngine.value,
     })
     result.value = execution
+    diagnosis.value = null
     expanded.value = execution.executions[0]?.id ?? null
     const tone =
       execution.status === 'passed' ? 'success' : execution.status === 'failed' ? 'warning' : 'danger'
@@ -165,31 +256,67 @@ async function run() {
   }
 }
 
+/** 计划编辑区宽度：内层分栏（编辑|结果）的受控尺寸，默认约为半宽。 */
+const editorWidth = ref(460)
+try {
+  const saved = Number(window.localStorage.getItem('api-agent.layout.manual.editor'))
+  if (Number.isFinite(saved) && saved > 0) editorWidth.value = saved
+} catch {
+  // 存储不可用时保持默认宽度。
+}
+
 onMounted(async () => {
-  await Promise.all([refreshEngine(), loadProjects(), loadHistory()])
+  await Promise.all([refreshEngines(), loadProjects(), loadHistory()])
 })
 </script>
 
 <template>
   <div class="plan">
-    <!-- 左：计划编辑 -->
-    <section class="editor scroll-y">
-      <div class="editor-head">
-        <div>
-          <h2 class="title">用例计划</h2>
-          <p class="subtitle">
-            结构化计划 → Postman Collection → 逐条断言结果。计划只描述数据，不含可执行脚本。
-          </p>
-        </div>
-        <div v-if="engine" class="engine-chip" :class="engine.available ? 'chip-ok' : 'chip-warn'">
-          {{ engine.available ? `CLI ${engine.version}` : 'CLI 不可用' }}
-        </div>
-      </div>
+    <div class="plan-right">
+      <slot name="mode-switch" />
+      <ResizableSplit
+        v-model:size="editorWidth"
+        class="plan-main"
+        persist-key="api-agent.layout.manual.editor"
+        :min="320"
+        :min-other="300"
+        label="拖动调整计划编辑区与执行结果区宽度"
+      >
+        <template #first>
+        <section class="editor scroll-y">
+          <div class="editor-head">
+            <div>
+              <p class="subtitle">
+                结构化计划 → 可插拔执行引擎（原生 HTTPX / Postman CLI）→ 逐条断言结果。计划只描述数据，不含可执行脚本。
+              </p>
+            </div>
+            <div
+              v-if="activeEngine"
+              class="engine-chip"
+              :class="activeEngine.available ? 'chip-ok' : 'chip-warn'"
+            >
+              <component :is="selectedEngine === 'native' ? Cpu : Terminal" :size="12" />
+              {{ activeEngine.available ? `${activeEngine.id} 就绪` : `${activeEngine.id} 不可用` }}
+            </div>
+          </div>
 
       <div class="meta-row">
         <label class="field label-field">
           <span class="field-label">标签</span>
           <input v-model="label" class="input" placeholder="例如 crm-smoke" maxlength="80" />
+        </label>
+        <label class="field label-field">
+          <span class="field-label">执行引擎</span>
+          <select
+            :value="selectedEngine"
+            class="select"
+            @change="selectEngine(($event.target as HTMLSelectElement).value)"
+          >
+            <option v-for="item in engines" :key="item.id" :value="item.id">
+              {{ engineLabel(item.id) }}
+              {{ item.available ? '' : '· 不可用' }}
+            </option>
+          </select>
         </label>
         <label class="field label-field">
           <span class="field-label">关联项目（可选）</span>
@@ -216,6 +343,16 @@ onMounted(async () => {
       </div>
 
       <textarea v-model="planText" class="textarea mono plan-editor" spellcheck="false" />
+
+      <label class="field contract-field">
+        <span class="field-label">契约摘要（可选，仅用于 AI 分析）</span>
+        <textarea
+          v-model="contractRef"
+          class="textarea mono contract-input"
+          rows="2"
+          placeholder="例如：POST /api/user/register 缺少必填字段时应返回 code=400。留空则 AI 只就断言差异作观察。"
+        />
+      </label>
 
       <div class="editor-foot">
         <div v-if="parsed.ok && planSummary" class="plan-summary">
@@ -247,15 +384,30 @@ onMounted(async () => {
         </div>
       </div>
     </section>
-
+        </template>
+        <template #second>
     <!-- 右：结果 + 历史 -->
     <section class="results">
       <div class="results-head">
         <span class="results-title">{{ result ? '本次执行' : '执行结果' }}</span>
-        <CopyButton v-if="result" :text="JSON.stringify(result, null, 2)" label="复制结果 JSON" />
+        <div class="head-actions">
+          <button
+            v-if="result"
+            class="btn-ai"
+            :disabled="!canAnalyze"
+            :title="result.plan ? '分析本次执行保存的原计划和结果' : '旧记录未保存原计划，请重新执行后分析'"
+            @click="analyzeWithAI"
+          >
+            <Loader2 v-if="diagnosing" :size="13" class="spin" />
+            <Sparkles v-else :size="13" />
+            {{ diagnosing ? '分析中…' : 'AI 分析' }}
+          </button>
+          <CopyButton v-if="result" :text="JSON.stringify(result, null, 2)" label="复制结果 JSON" />
+        </div>
       </div>
 
       <div class="results-body scroll-y">
+        <p v-if="result && !result.plan" class="subtitle">此旧记录未保存原计划，无法可靠配对 AI 分析；请重新执行计划。</p>
         <template v-if="result">
           <div class="summary-card" :class="`summary-${result.status}`">
             <div class="summary-main">
@@ -282,55 +434,31 @@ onMounted(async () => {
             </div>
           </div>
 
-          <div class="cases">
-            <article
-              v-for="item in result.executions"
-              :key="item.id"
-              class="case"
-              :class="`case-${item.status}`"
-            >
-              <button class="case-head" @click="expanded = expanded === item.id ? null : item.id">
-                <CircleCheck v-if="item.status === 'passed'" :size="14" class="case-icon ok" />
-                <CircleX v-else-if="item.status === 'failed'" :size="14" class="case-icon bad" />
-                <TriangleAlert v-else :size="14" class="case-icon unknown" />
-                <span class="case-id mono">{{ item.id }}</span>
-                <span
-                  v-if="item.http_status"
-                  class="tag"
-                  :class="`tag-${statusTone(item.http_status) === 'neutral' ? '' : statusTone(item.http_status)}`"
-                >
-                  {{ item.http_status }}
-                </span>
-                <span v-if="item.response_time_ms != null" class="case-time">
-                  {{ formatDuration(item.response_time_ms) }}
-                </span>
-                <span v-if="item.error_kind" class="case-error">{{ item.error_kind }}</span>
-                <span class="toolbar-fill" />
-                <span class="case-count">
-                  {{ item.assertions.filter((a) => a.passed).length }}/{{ item.assertions.length }}
-                </span>
-                <ChevronDown
-                  :size="14"
-                  class="chevron"
-                  :class="{ 'chevron-open': expanded === item.id }"
-                />
-              </button>
-              <div v-if="expanded === item.id" class="assertions">
-                <div v-for="assertion in item.assertions" :key="assertion.index" class="assertion">
-                  <span class="assertion-icon" :class="assertion.passed ? 'ok' : 'bad'">
-                    {{ assertion.passed ? '✓' : '✕' }}
-                  </span>
-                  <span class="assertion-kind">{{ describeAssertionKind(assertion.kind) }}</span>
-                  <span class="assertion-idx">#{{ assertion.index + 1 }}</span>
-                  <span v-if="assertion.message" class="assertion-msg">
-                    {{ assertion.message }}
-                  </span>
+          <ExecutionCases v-model:expanded="expanded" :executions="result.executions" />
+
+          <!-- AI 诊断：evidence 是代码算出的观测事实，hypotheses 是模型假设 -->
+          <div v-if="diagnosis" class="diag">
+            <div class="diag-head">
+              <Sparkles :size="14" />
+              <span>AI 诊断</span>
+              <span class="diag-note">模型假设，未证实；请对照契约核对</span>
+            </div>
+            <p class="diag-summary">{{ diagnosis.analysis.summary }}</p>
+            <div v-if="diagnosis.analysis.hypotheses.length" class="diag-hypos">
+              <div v-for="h in diagnosis.analysis.hypotheses" :key="h.id" class="diag-hypo">
+                <div class="diag-hypo-head">
+                  <span class="diag-tag">假设</span>
+                  <span class="mono">{{ h.id }}</span>
                 </div>
-                <div v-if="!item.assertions.length" class="hint">
-                  该用例没有回收到断言结果（可能请求未发出）。
-                </div>
+                <p>{{ h.cause }}</p>
+                <p class="diag-next">下一步：{{ h.next_check }}</p>
+                <p class="diag-ref mono">引用证据：{{ h.evidence_ids.join(', ') }}</p>
               </div>
-            </article>
+            </div>
+            <p v-else class="diag-empty">模型未给出待验证假设。</p>
+            <p v-if="diagnosis.analysis.coverage_gaps.length" class="diag-gaps">
+              覆盖盲区：{{ diagnosis.analysis.coverage_gaps.join('；') }}
+            </p>
           </div>
         </template>
 
@@ -341,35 +469,43 @@ onMounted(async () => {
           description="左侧计划通过后端校验后会交给 Postman CLI 执行；每条断言的通过与否都会落库，可在下方历史里回看。"
         />
 
-        <div v-if="history.length" class="history-block">
-          <div class="mini-label">历史执行</div>
-          <button
-            v-for="item in history"
-            :key="item.id"
-            class="history-item"
-            @click="result = item"
-          >
-            <span class="history-label truncate">{{ item.label || '(未命名)' }}</span>
-            <span class="tag" :class="`tag-${item.status === 'passed' ? 'success' : item.status === 'failed' ? 'warning' : 'danger'}`">
-              {{ describeExecutionStatus(item.status) }}
-            </span>
-            <span class="history-meta">{{ formatRelative(item.created_at) }}</span>
-          </button>
-        </div>
       </div>
     </section>
+        </template>
+      </ResizableSplit>
+    </div>
   </div>
 </template>
 
 <style scoped>
 .plan {
-  display: flex;
   height: 100%;
   min-height: 0;
 }
 
+/* 历史列：填满左侧插槽，自身滚动 */
+/* 右半：模式栏（固定高）+ 计划编辑与结果（左右并排） */
+.plan-right {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.plan-main {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 内层分栏必须撑满父级；否则按内容塌缩会让可用宽度和拖动上限都算错。 */
+.plan-main > .resizable-split {
+  width: 100%;
+  min-width: 0;
+}
+
 .editor {
-  width: 56%;
+  height: 100%;
   min-width: 0;
   padding: 18px 18px 26px;
   border-right: 1px solid var(--border-subtle);
@@ -451,6 +587,16 @@ onMounted(async () => {
   background: var(--bg-sunken);
 }
 
+.contract-field {
+  margin-top: 10px;
+}
+.contract-input {
+  min-height: 54px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  background: var(--bg-subtle);
+}
+
 .editor-foot {
   display: flex;
   align-items: center;
@@ -522,6 +668,114 @@ onMounted(async () => {
   font-weight: 600;
 }
 
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* AI 分析按钮：紫色强调，与主色的墨黑按钮区分，表明它是一次模型调用 */
+.btn-ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 560;
+  font-family: inherit;
+  cursor: pointer;
+}
+.btn-ai:not(:disabled):hover {
+  background: var(--accent);
+  color: var(--text-inverse);
+}
+.btn-ai:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* AI 诊断块：与确定性结果视觉分离，避免模型文字被当成已证实结论 */
+.diag {
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+.diag-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 620;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.diag-note {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-tertiary);
+}
+.diag-summary {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--text-primary);
+}
+.diag-hypos {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.diag-hypo {
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+}
+.diag-hypo-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.diag-tag {
+  font-size: 10px;
+  font-weight: 640;
+  color: var(--warning);
+  background: var(--bg-surface);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.diag-hypo p {
+  margin: 0 0 3px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+.diag-next,
+.diag-ref {
+  font-size: 11.5px !important;
+  color: var(--text-secondary) !important;
+}
+.diag-empty,
+.diag-gaps {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
 .results-body {
   flex: 1;
   min-height: 0;
@@ -584,126 +838,6 @@ onMounted(async () => {
 .assert-count.bad { color: var(--danger); }
 .assert-count.unknown { color: var(--text-tertiary); }
 
-.cases {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 12px;
-}
-
-.case {
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--bg-surface);
-  overflow: hidden;
-}
-
-.case-failed {
-  border-left: 2px solid var(--warning);
-}
-
-.case-error,
-.case-unknown {
-  border-left: 2px solid var(--danger);
-}
-
-.case-passed {
-  border-left: 2px solid var(--success);
-}
-
-.case-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 8px 11px;
-  border: 0;
-  background: transparent;
-  text-align: left;
-}
-
-.case-head:hover {
-  background: var(--bg-hover);
-}
-
-.case-icon.ok { color: var(--success); }
-.case-icon.bad { color: var(--danger); }
-.case-icon.unknown { color: var(--warning); }
-
-.case-id {
-  font-weight: 600;
-  font-size: 12px;
-}
-
-.case-time {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-}
-
-.case-error {
-  font-size: 11px;
-  color: var(--danger);
-  font-family: var(--font-mono);
-}
-
-.case-count {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-}
-
-.chevron {
-  color: var(--text-tertiary);
-  transition: transform 0.15s;
-}
-
-.chevron-open {
-  transform: rotate(180deg);
-}
-
-.assertions {
-  padding: 4px 11px 9px 33px;
-  border-top: 1px solid var(--border-subtle);
-  background: var(--bg-subtle);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.assertion {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  font-size: 11.5px;
-}
-
-.assertion-icon {
-  font-weight: 700;
-  font-family: var(--font-mono);
-}
-
-.assertion-icon.ok { color: var(--success); }
-.assertion-icon.bad { color: var(--danger); }
-
-.assertion-kind {
-  color: var(--text-primary);
-  font-weight: 500;
-}
-
-.assertion-idx {
-  color: var(--text-tertiary);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-}
-
-.assertion-msg {
-  color: var(--danger);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  word-break: break-word;
-}
-
 .history-block {
   margin-top: 16px;
   padding-top: 12px;
@@ -711,42 +845,6 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 4px;
-}
-
-.mini-label {
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
-}
-
-.history-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 7px 9px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  text-align: left;
-}
-
-.history-item:hover {
-  background: var(--bg-hover);
-}
-
-.history-label {
-  flex: 1;
-  min-width: 0;
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.history-meta {
-  font-size: 10.5px;
-  color: var(--text-tertiary);
 }
 
 .spinning {

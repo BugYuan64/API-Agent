@@ -2,12 +2,6 @@
  *  都保持纯函数，方便在模板里直接用，也便于单测。 */
 
 /** 把后端的 UTC ISO 字符串格式化成 HH:MM:SS（本地时区）。 */
-export function formatTime(value: string | null | undefined): string {
-  if (!value) return '—'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return '—'
-  return date.toLocaleTimeString('zh-CN', { hour12: false })
-}
 
 /** 带日期的完整时间，用于历史列表。 */
 export function formatDateTime(value: string | null | undefined): string {
@@ -82,18 +76,6 @@ export function looksLikeJson(text: string | null | undefined): boolean {
 }
 
 /** Content-Type 是否可当文本展示。 */
-export function isTextualContentType(contentType: string | null | undefined): boolean {
-  if (!contentType) return true
-  const lower = contentType.toLowerCase()
-  return (
-    lower.includes('json') ||
-    lower.includes('text') ||
-    lower.includes('xml') ||
-    lower.includes('javascript') ||
-    lower.includes('x-www-form-urlencoded') ||
-    lower.includes('event-stream')
-  )
-}
 
 /** 长连接结束原因 → 中文说明。保留原始值作为回退，避免新原因被隐藏。 */
 export function describeStopReason(reason: string | null | undefined): string {
@@ -168,6 +150,3 @@ export function describeAssertionKind(kind: string): string {
 }
 
 /** 深拷贝一个普通对象，用于给表单重置默认值。 */
-export function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T
-}

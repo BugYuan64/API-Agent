@@ -2,21 +2,27 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api_agent.console.models import ConsoleRequestRecord
 from api_agent.console.schemas import ConsoleHistoryResponse
 from api_agent.console.service import ConsoleRequest, ConsoleResult, send
-from api_agent.infrastructure.api import ApiError, Page, PageInfo, not_found
+from api_agent.infrastructure.api import (
+    ApiError,
+    LimitParam,
+    OffsetParam,
+    Page,
+    not_found,
+    paginate,
+)
 from api_agent.infrastructure.database import session_for
+from api_agent.infrastructure.history import PREVIEW_LIMIT, sanitize_console
 from api_agent.infrastructure.targets import TargetError, redact_headers
 
 router = APIRouter(prefix="/api/console", tags=["console"])
 Session = Annotated[AsyncSession, Depends(session_for)]
-
-PREVIEW_LIMIT = 8 * 1024
 
 
 @router.post("/requests", response_model=ConsoleResult)
@@ -48,6 +54,14 @@ async def send_request(payload: ConsoleRequest, session: Session, request: Reque
         response_preview=(result.response.body or "")[:PREVIEW_LIMIT] if result.response else None,
         response_bytes=result.response.body_bytes if result.response else 0,
     )
+    # 统一清洗入口：先用**完整**正文学习密码/JWT（截断可能切掉命名敏感字段），
+    # 再抹掉同记录内的兄弟回显并截成预览。
+    # 即时响应对用户仍然原样返回（上面 result 未被修改），只有持久化副本被清洗。
+    sanitize_console(
+        record,
+        full_body=payload.body,
+        full_response=result.response.body if result.response else None,
+    )
     session.add(record)
     await session.commit()
     return result
@@ -56,13 +70,15 @@ async def send_request(payload: ConsoleRequest, session: Session, request: Reque
 @router.get("/history", response_model=Page[ConsoleHistoryResponse])
 async def list_history(
     session: Session,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: LimitParam = 50,
+    offset: OffsetParam = 0,
 ):
     """分页列出历史请求，最新的在前。
 
     实现：按 ``(created_at, id)`` 倒序并计数，
     这样界面打开就能看到刚发的那条，翻页顺序也稳定。
+    读取时再清洗一次：旧版本写入的行、或迁移尚未跑到的行，
+    也不会把凭据原样吐出到接口响应里。
     """
     from sqlalchemy import func
 
@@ -74,11 +90,10 @@ async def list_history(
             .offset(offset)
         )
     ).all()
+    for item in items:
+        sanitize_console(item)
     total = await session.scalar(select(func.count()).select_from(ConsoleRequestRecord)) or 0
-    return Page[ConsoleHistoryResponse](
-        items=[ConsoleHistoryResponse.model_validate(item) for item in items],
-        page=PageInfo(limit=limit, offset=offset, total=total),
-    )
+    return paginate(ConsoleHistoryResponse, items, limit, offset, total)
 
 
 @router.delete("/history/{record_id}", status_code=204)

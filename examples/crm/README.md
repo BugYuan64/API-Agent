@@ -5,6 +5,8 @@
 - `smoke.json`：8 次请求、16 条断言；注册/登录参数验证以及 GET/POST/PUT/DELETE 的 token 鉴权前置检查。没有有效身份，不创建账号或客户，不执行成功的修改/删除。
 - `authenticated.json`：自定义 `token` Header 引用 `CRM_TEST_TOKEN`，只读分页。需要用户提供可用的专用测试身份；不自动登录，不输出客户明细。
 - `rag.json`：FastAPI 健康检查及空问题的 JSON 错误响应；不调用有效问题，不验证 SSE 事件流。RAG 本身初始化依赖需由目标环境准备。
+- `docker-smoke.json`：WSL Docker 统一入口 `http://127.0.0.1:8088`，6 请求 / 17 断言，验证容器初始化样例身份登录、错误密码/参数与无 token 拦截。仅适用于该本地测试数据；正式凭据不得写入计划。
+- `docker-authenticated.json`：同一入口，3 请求 / 15 断言，自定义 `token` 头通过 `CRM_TEST_TOKEN` 环境引用，验证分页、中文关键词搜索和客户详情；固定预期依赖容器初始化数据。
 
 ## 运行
 
@@ -17,6 +19,8 @@ uv run --project backend --locked api-agent --allow-origin http://127.0.0.1:8080
 ```
 
 `--allow-origin` 是本机操作者给予本次进程的授权；MCP payload 内的 origin 不能替代此授权。也可用根目录 `.env` 的 `TARGET_ALLOWED_ORIGINS` 配置。仅支持数字回环地址，`localhost` 不会自动解析放行。
+
+Docker 实测入口：`uv run --project backend --locked --offline api-agent --allow-origin http://127.0.0.1:8088 --engine native run examples/crm/docker-smoke.json`。将 `--engine` 改为 `postman` 可用同一计划复核；两种引擎于 2026-11-03 经正式 CLI→MCP 路径分别通过上述 9 请求 / 32 断言。鉴权计划需安全设置环境 token，结果只汇总判定，未输出客户明细。
 
 使用鉴权样例时，另将 `TARGET_AUTH_ENV_VARS` 配为 `["CRM_TEST_TOKEN"]`，并在本机进程环境安全设置实际 token；不要写入样例、命令行参数或提交文件。服务端只解析许可列表中的变量名。token 必须是 CRM 签发的测试身份，不是模型或 Postman API key。
 

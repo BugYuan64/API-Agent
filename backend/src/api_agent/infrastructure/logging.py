@@ -18,6 +18,7 @@ SENSITIVE_KEYS = {
     "apikey",
     "xapikey",
     "password",
+    "confirmpassword",
     "passwd",
     "secret",
     "token",
@@ -25,13 +26,47 @@ SENSITIVE_KEYS = {
     "refreshtoken",
     "llmapikey",
 }
+
+
+def normalize_key(name) -> str:
+    """把头名/字段名归一化成“只含小写字母数字”的形式用于敏感判定。
+
+    作用：``Authorization``、``x-api-key``、``X-Auth-Token`` 等写法各异，
+    但语义都是凭据；归一化后统一比对 ``SENSITIVE_KEYS``，
+    避免每个调用点各写一遍 ``re.sub``。
+    """
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def is_sensitive_key(name) -> bool:
+    """判断键名是否承载凭据。
+
+    实现：归一化后先做精确匹配；再做「词尾匹配长度 ≥5 的敏感键」，
+    使 ``X-Auth-Token``→``xauthtoken``、``X-Access-Token``→``xaccesstoken``
+    也能命中，同时不误伤 ``X-Trace``、``X-Request-Id`` 这类排障头。
+    """
+    normalized = normalize_key(name)
+    if normalized in SENSITIVE_KEYS:
+        return True
+    return any(normalized.endswith(key) for key in SENSITIVE_KEYS if len(key) >= 5)
+
+
 HEADER_CREDENTIAL = re.compile(
     r"(?im)\b(authorization|proxy-authorization|cookie|set-cookie)[\"']?\s*[:=]\s*[^\r\n]+"
 )
+# 形如 “password=xxx”“token: xxx” 的赋值式凭据。
+# 两处约束缺一不可，否则会误伤结构化证据 ID：
+#   ① 敏感词前面必须是词边界（不能是更长标识符的尾部）；
+#   ② 值部分不允许再出现 `=`，且敏感词后面必须紧跟分隔符。
+# 反例（旧正则的缺陷）：``r0:login-wrong-password:a0=500`` 中 ``password``
+# 后面是 ``:a0=500``，旧写法把整段替换成 ``[REDACTED]``，使模型引用的
+# 正确证据 ID 永远匹配不上（诊断为 invalid_model_output）。
 ASSIGNED_CREDENTIAL = re.compile(
-    r"(?i)\b(api[_-]?key|x-api-key|password|passwd|secret|access[_-]?token|"
-    r"refresh[_-]?token|token)[\"']?\s*[:=]\s*"
-    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;&]+)"
+    r"(?i)(?<![A-Za-z0-9_-])"
+    r"(api[_-]?key|x-api-key|confirm[_-]?password|password|passwd|secret|access[_-]?token|"
+    r"refresh[_-]?token|token)"
+    r"(?P<q>[\"']?)(?P<pre>\s*)(?P<sep>[:=])(?P<post>\s*)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;&=]+)"
 )
 URL_CREDENTIAL = re.compile(r"(https?://)[^\s/@]+(?::[^\s/@]*)?@", re.IGNORECASE)
 BEARER_CREDENTIAL = re.compile(r"\bBearer\s+[^\s,;\"']+", re.IGNORECASE)
@@ -72,7 +107,14 @@ class RedactingJsonFormatter(logging.Formatter):
         for secret in self.secrets:
             value = value.replace(secret, REDACTED)
         value = HEADER_CREDENTIAL.sub(lambda match: f"{match[1]}: {REDACTED}", value)
-        value = ASSIGNED_CREDENTIAL.sub(lambda match: f"{match[1]}={REDACTED}", value)
+        # 保留原引号与分隔符，只替换值：JSON 形式的 “"password": "x"” 才不会变形。
+        value = ASSIGNED_CREDENTIAL.sub(
+            lambda match: (
+                f"{match[1]}{match.group('q')}{match.group('pre')}"
+                f"{match.group('sep')}{match.group('post')}{REDACTED}"
+            ),
+            value,
+        )
         value = URL_CREDENTIAL.sub(lambda match: f"{match[1]}{REDACTED}@", value)
         return BEARER_CREDENTIAL.sub(f"Bearer {REDACTED}", value)
 
@@ -87,9 +129,8 @@ class RedactingJsonFormatter(logging.Formatter):
             result = {}
             for key, item in value.items():
                 name = str(key)
-                normalized = re.sub(r"[^a-z0-9]", "", name.lower())
                 result[self.redact_text(name)] = (
-                    REDACTED if normalized in SENSITIVE_KEYS else self.redact(item)
+                    REDACTED if normalize_key(name) in SENSITIVE_KEYS else self.redact(item)
                 )
             return result
         if isinstance(value, (list, tuple)):

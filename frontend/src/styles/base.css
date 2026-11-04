@@ -191,27 +191,6 @@
 .method-options { color: var(--method-head); }
 
 /* ---------- 面板与分区 ---------- */
-.panel {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-lg);
-}
-
-.panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--border-subtle);
-}
-
-.panel-title {
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
 /* ---------- 表格 ---------- */
 .table {
   width: 100%;
@@ -273,14 +252,108 @@
   white-space: nowrap;
 }
 
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
+/* ---------- 共享原子样式 ----------
+   以下样式此前在 5~7 个视图里各自复制一遍（.mono 甚至只在 AutoPane 里定义，
+   却在 8 个文件的 60+ 处被使用却不生效）。集中在此，视图只需引用类名。 */
+
+/* 等宽文本：代码、ID、路径、头值 */
+.mono,
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+/* 加载中旋转图标：所有视图共用同一动画，避免每处重复 @keyframes */
+.spinning {
+  animation: app-spin 0.9s linear infinite;
+}
+
+@keyframes app-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 中性徽标（此前 SettingsView 用了未定义的 tag-neutral，退化成默认样式） */
+.tag-neutral {
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+}
+
+/* ---------- 标签页 ---------- */
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 34px;
+  padding: 0 10px;
   border: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: color 0.12s;
+}
+
+.tab:hover {
+  color: var(--text-primary);
+}
+
+.tab-active {
+  color: var(--text-primary);
+}
+
+.tab-active::after {
+  content: '';
+  position: absolute;
+  inset: auto 6px -1px 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* ---------- 页面头部 ---------- */
+.page-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.page-title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+}
+
+.page-sub {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-tertiary);
+}
+
+/* ---------- 代码块 ---------- */
+.code-block {
+  margin: 0;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  line-height: 1.55;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

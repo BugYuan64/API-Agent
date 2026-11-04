@@ -1,0 +1,73 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8088",
+  "allowed_methods": ["GET", "POST"],
+  "path_templates": ["/api/user/login", "/api/user/register", "/api/customer/list", "/api/customer/{id}"],
+  "max_requests": 6,
+  "requests": [
+    {
+      "id": "login-ok",
+      "method": "POST",
+      "path": "/api/user/login",
+      "body": {"email": "admin@elcrms.com", "password": "123456"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "content_type", "expected": "application/json"},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_exists", "pointer": "/data/token"},
+        {"kind": "json_equals", "pointer": "/data/name", "expected": "系统管理员"}
+      ]
+    },
+    {
+      "id": "login-wrong-password",
+      "method": "POST",
+      "path": "/api/user/login",
+      "body": {"email": "admin@elcrms.com", "password": "wrong-password"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "500"},
+        {"kind": "json_equals", "pointer": "/msg", "expected": "邮箱或密码错误"}
+      ]
+    },
+    {
+      "id": "login-missing-fields",
+      "method": "POST",
+      "path": "/api/user/login",
+      "body": {},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "400"}
+      ]
+    },
+    {
+      "id": "login-invalid-email",
+      "method": "POST",
+      "path": "/api/user/login",
+      "body": {"email": "not-an-email", "password": "123456"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "400"}
+      ]
+    },
+    {
+      "id": "list-requires-token",
+      "method": "GET",
+      "path": "/api/customer/list",
+      "query": {"pageNum": "1", "pageSize": "1"},
+      "assertions": [
+        {"kind": "status", "expected": 401},
+        {"kind": "json_equals", "pointer": "/code", "expected": "401"},
+        {"kind": "json_equals", "pointer": "/msg", "expected": "未登录，请先登录"}
+      ]
+    },
+    {
+      "id": "detail-requires-token",
+      "method": "GET",
+      "path": "/api/customer/1",
+      "assertions": [
+        {"kind": "status", "expected": 401},
+        {"kind": "json_equals", "pointer": "/code", "expected": "401"}
+      ]
+    }
+  ]
+}

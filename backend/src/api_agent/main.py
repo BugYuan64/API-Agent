@@ -1,6 +1,6 @@
 """Application assembly for the local, single-process management backend."""
 
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -10,12 +10,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from api_agent import __version__
+from api_agent.agent.manager import AgentManager
+from api_agent.agent.routes import router as agent_router
+from api_agent.agent.store import AgentStore
 from api_agent.console.routes import router as console_router
 from api_agent.execution.routes import router as executions_router
 from api_agent.infrastructure.api import error_response, install_api_handlers
 from api_agent.infrastructure.config import Settings, load_settings
 from api_agent.infrastructure.database import Database
+from api_agent.infrastructure.history import sanitize_history
 from api_agent.infrastructure.logging import configure_logging
+from api_agent.llm.routes import router as llm_router
 from api_agent.projects.routes import router as projects_router
 from api_agent.runs.routes import router as runs_router
 from api_agent.runs.worker import RunWorker
@@ -41,9 +46,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ① 未显式传 settings 时按标准优先级装载；随后配置应用专属 logger；
     ② 建立 FastAPI 实例，并把 settings 挂到 ``app.state`` 供依赖读取；
     ③ 安装统一错误处理（含 request_id 中间件）；
-    ④ 用 ``lifespan`` 管理启动/关闭资源：启动时迁移建库、恢复上次中断的运行、
-       再启动 worker；关闭时先停 worker 再释放引擎（顺序保证不再有任务写库）；
-    ⑤ 注册 projects 与 runs 两组路由，最后声明 ``/health``；
+    ④ 用 ``lifespan`` 管理启动/关闭资源：迁移、恢复运行与流会话，
+       用退出栈保证启动失败或关闭异常时也释放所有已取得资源；
+    ⑤ 注册各领域路由，最后声明 ``/health``；
     ⑥ 用本地静态资源提供 Swagger UI（``/docs``），不依赖外网 CDN。
     """
     settings = settings if settings is not None else load_settings()
@@ -72,28 +77,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        """管理应用生命周期内的数据库与后台 worker。
+        """Register ownership as resources are acquired; unwind every acquired resource.
 
-        实现：进入时先迁移（保证表结构就绪），再 ``worker.recover()``
-        把上次进程留下的在途工作标记为中断，随后把两者挂到 ``app.state``
-        并启动轮询任务；``yield`` 后进入关闭阶段，
-        用 ``finally`` 确保 worker 先停、引擎后释放，避免关闭顺序错乱导致写库失败。
+        Exit callbacks run in reverse order, even if startup or another callback
+        fails. All background work therefore stops before the database is disposed.
         """
-        database = Database(settings)
-        await database.migrate_async()
-        worker = RunWorker(database)
-        await worker.recover()
-        app.state.database = database
-        app.state.worker = worker
-        app.state.streams = StreamManager(database, settings)
-        worker.start()
-        try:
+        async with AsyncExitStack() as resources:
+            database = Database(settings)
+            resources.push_async_callback(database.dispose)
+            await database.migrate_async()
+            await sanitize_history(database)
+            app.state.database = database
+
+            worker = RunWorker(database)
+            app.state.worker = worker
+            resources.push_async_callback(worker.stop)
+            await worker.recover()
+
+            streams = StreamManager(database, settings)
+            app.state.streams = streams
+            resources.push_async_callback(streams.shutdown)
+            await streams.recover()
+
+            agents = AgentManager(AgentStore(settings.artifact_dir / "agent"))
+            app.state.agents = agents
+            resources.push_async_callback(agents.shutdown)
+            agents.store.recover()
+            worker.start()
             yield
-        finally:
-            # 先停长连接会话：它们持有外部 socket，必须在本进程关库前收尾。
-            await app.state.streams.shutdown()
-            await worker.stop()
-            await database.dispose()
 
     app.router.lifespan_context = lifespan
     app.include_router(projects_router)
@@ -101,6 +112,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(console_router)
     app.include_router(streams_router)
     app.include_router(executions_router)
+    app.include_router(llm_router)
+    app.include_router(agent_router)
 
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health() -> HealthResponse:

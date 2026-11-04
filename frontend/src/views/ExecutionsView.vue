@@ -1,16 +1,15 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { ChevronDown, CircleCheck, CircleX, Terminal, TriangleAlert } from 'lucide-vue-next'
+import { onMounted, reactive, ref } from 'vue'
+import { ChevronDown, Terminal } from 'lucide-vue-next'
 import EmptyState from '@/components/EmptyState.vue'
+import ExecutionCases from '@/components/ExecutionCases.vue'
 import { describeError } from '@/api/client'
 import { listExecutions } from '@/api/endpoints'
 import type { Execution } from '@/api/types'
 import {
-  describeAssertionKind,
   describeExecutionStatus,
   formatDateTime,
   formatDuration,
-  statusTone,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
 
@@ -19,14 +18,8 @@ import { useToastStore } from '@/stores/toasts'
 const items = ref<Execution[]>([])
 const loading = ref(false)
 const expanded = ref<string | null>(null)
-const openCases = ref<Set<string>>(new Set())
-
-function toggleCase(key: string) {
-  const next = new Set(openCases.value)
-  if (next.has(key)) next.delete(key)
-  else next.add(key)
-  openCases.value = next
-}
+/** 每条执行记录内展开的用例 id；由 ExecutionCases 受控维护。 */
+const caseExpanded = reactive<Record<string, string | null>>({})
 
 async function load() {
   loading.value = true
@@ -82,40 +75,7 @@ onMounted(load)
         </button>
 
         <div v-if="expanded === item.id" class="execution-body">
-          <div v-for="caseItem in item.executions" :key="caseItem.id" class="case">
-            <button class="case-head" @click="toggleCase(`${item.id}:${caseItem.id}`)">
-              <CircleCheck v-if="caseItem.status === 'passed'" :size="13" class="icon ok" />
-              <CircleX v-else-if="caseItem.status === 'failed'" :size="13" class="icon bad" />
-              <TriangleAlert v-else :size="13" class="icon unknown" />
-              <span class="mono case-id">{{ caseItem.id }}</span>
-              <span
-                v-if="caseItem.http_status"
-                class="tag"
-                :class="`tag-${statusTone(caseItem.http_status) === 'neutral' ? '' : statusTone(caseItem.http_status)}`"
-              >
-                {{ caseItem.http_status }}
-              </span>
-              <span v-if="caseItem.response_time_ms != null" class="hint mono">
-                {{ formatDuration(caseItem.response_time_ms) }}
-              </span>
-              <span v-if="caseItem.error_kind" class="case-error mono">{{ caseItem.error_kind }}</span>
-              <span class="head-fill" />
-              <span class="hint">
-                {{ caseItem.assertions.filter((a) => a.passed).length }}/{{ caseItem.assertions.length }}
-                断言通过
-              </span>
-            </button>
-            <div v-if="openCases.has(`${item.id}:${caseItem.id}`) || item.executions.length === 1" class="assertions">
-              <div v-for="assertion in caseItem.assertions" :key="assertion.index" class="assertion">
-                <span class="assertion-mark" :class="assertion.passed ? 'ok' : 'bad'">
-                  {{ assertion.passed ? '✓' : '✕' }}
-                </span>
-                <span class="assertion-kind">{{ describeAssertionKind(assertion.kind) }}</span>
-                <span class="hint mono">#{{ assertion.index + 1 }}</span>
-                <span v-if="assertion.message" class="assertion-msg">{{ assertion.message }}</span>
-              </div>
-            </div>
-          </div>
+          <ExecutionCases v-model:expanded="caseExpanded[item.id]" :executions="item.executions" />
         </div>
       </article>
 
@@ -220,72 +180,5 @@ onMounted(load)
   gap: 4px;
 }
 
-.case {
-  border-radius: var(--radius-sm);
-  background: var(--bg-surface);
-  border: 1px solid var(--border-subtle);
-  overflow: hidden;
-}
 
-.case-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 6px 9px;
-  border: 0;
-  background: transparent;
-  text-align: left;
-  font-size: 11.5px;
-}
-
-.case-head:hover {
-  background: var(--bg-hover);
-}
-
-.icon.ok { color: var(--success); }
-.icon.bad { color: var(--danger); }
-.icon.unknown { color: var(--warning); }
-
-.case-id {
-  font-weight: 600;
-}
-
-.case-error {
-  color: var(--danger);
-}
-
-.assertions {
-  padding: 4px 9px 8px 28px;
-  border-top: 1px solid var(--border-subtle);
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.assertion {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  font-size: 11.5px;
-}
-
-.assertion-mark {
-  font-family: var(--font-mono);
-  font-weight: 700;
-}
-
-.assertion-mark.ok { color: var(--success); }
-.assertion-mark.bad { color: var(--danger); }
-
-.assertion-kind {
-  color: var(--text-primary);
-}
-
-.assertion-msg {
-  color: var(--danger);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  word-break: break-word;
-}
 </style>

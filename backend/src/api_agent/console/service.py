@@ -9,9 +9,15 @@ from pydantic import Field, field_validator, model_validator
 
 from api_agent.infrastructure.api import ApiInput
 from api_agent.infrastructure.config import Settings
+from api_agent.infrastructure.http import (
+    MAX_BODY_CHARS,
+    ResponseEncodingError,
+    ResponseLimitError,
+    bounded_send,
+    decode_text,
+    group_headers,
+)
 from api_agent.infrastructure.targets import validate_headers, validate_target
-
-MAX_BODY_CHARS = 1_000_000
 
 
 class ConsoleRequest(ApiInput):
@@ -129,6 +135,7 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
     parsed, _origin = validate_target(payload.url, settings.target_allowed_origins)
     url = build_url(parsed)
     headers = dict(payload.headers)
+    headers["Accept-Encoding"] = "identity"
     content: bytes | None = None
     if payload.body_mode != "none":
         content = (payload.body or "").encode("utf-8")
@@ -148,7 +155,8 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
             follow_redirects=False,
             trust_env=False,
         ) as client:
-            response = await client.request(payload.method, url, headers=headers, content=content)
+            request = client.build_request(payload.method, url, headers=headers, content=content)
+            response = await bounded_send(client, request, settings.response_max_bytes)
             history = []
             while payload.follow_redirects and response.next_request is not None:
                 if len(history) >= client.max_redirects:
@@ -170,9 +178,18 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
                         next_request.headers.pop(name, None)
                     client.cookies.clear()
                 history.append(response)
-                response = await client.send(next_request, follow_redirects=False)
+                next_request.headers["Accept-Encoding"] = "identity"
+                response = await bounded_send(client, next_request, settings.response_max_bytes)
                 _origin = next_origin
             response.history = history
+    except (ResponseLimitError, ResponseEncodingError) as error:
+        return ConsoleResult(
+            ok=False,
+            request=request_summary,
+            error_kind=str(error),
+            error_message="Response exceeded the supported transport limits",
+            elapsed_ms=round((time.monotonic() - started) * 1000, 2),
+        )
     except httpx.TimeoutException:
         return ConsoleResult(
             ok=False,
@@ -192,7 +209,7 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
 
     elapsed = round((time.monotonic() - started) * 1000, 2)
     raw = response.content
-    text = decode_body(raw)
+    text, truncated = decode_text(raw, MAX_BODY_CHARS)
     return ConsoleResult(
         ok=True,
         request=request_summary,
@@ -203,38 +220,13 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
             headers=group_headers(response.headers.multi_items()),
             body=text,
             body_bytes=len(raw),
-            body_truncated=len(text or "") >= MAX_BODY_CHARS,
+            body_truncated=truncated,
             body_encoding=response.encoding,
             elapsed_ms=elapsed,
             redirects=[str(item.url) for item in response.history],
         ),
         elapsed_ms=elapsed,
     )
-
-
-def group_headers(items) -> dict[str, list[str]]:
-    """把 ``multi_items()`` 聚合成“头名 → 值列表”。
-
-    实现：同名头按出现顺序追加，保留目标真实写法与全部值；
-    键名保持原样，便于用户核对目标到底发了哪些头。
-    """
-    grouped: dict[str, list[str]] = {}
-    for name, value in items:
-        grouped.setdefault(name, []).append(value)
-    return grouped
-
-
-def decode_body(raw: bytes) -> str | None:
-    """把响应字节解码成文本，超过上限时截断。
-
-    实现：优先严格 UTF-8；失败退回替换模式（二进制响应用占到 ``�`` 表示），
-    以保证界面不会因为一个非文本响应而整块失效。
-    """
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("utf-8", "replace")
-    return text[:MAX_BODY_CHARS]
 
 
 def safe_message(error: Exception) -> str:

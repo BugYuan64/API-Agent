@@ -107,11 +107,6 @@ export type RunStatus =
   | 'cancelled'
   | 'interrupted'
 
-export interface SimulationAction {
-  name: string
-  duration_ms: number
-  outcome: 'completed' | 'failed'
-}
 
 export interface Run {
   id: string
@@ -329,6 +324,9 @@ export interface CaseResult {
 
 export interface Execution {
   id: string
+  /** 执行时保存的计划；旧记录可能缺失，不能从当前编辑器补造。 */
+  plan: Record<string, unknown> | null
+  plan_sha256: string | null
   project_id: string | null
   label: string
   engine: string
@@ -346,5 +344,205 @@ export interface EngineStatus {
   available: boolean
   version?: string
   format?: string
+  engine?: string
   error_kind?: string
+}
+
+/** 单个执行驱动（原生 Python / Postman CLI）的探测结果。 */
+export interface EngineInfo extends EngineStatus {
+  id: string
+}
+
+/* ---------- 大模型动态配置 ---------- */
+
+export interface LLMConfig {
+  enabled: boolean
+  provider: string
+  base_url: string | null
+  model: string
+  timeout_seconds: number
+  has_api_key: boolean
+}
+
+export interface LLMConfigUpdate {
+  enabled: boolean
+  provider?: string
+  base_url: string | null
+  api_key?: string | null
+  model: string
+  timeout_seconds?: number
+}
+
+export interface LLMPingResult {
+  ok: boolean
+  latency_ms: number
+  message: string | null
+}
+
+export interface LLMModelListResult {
+  ok: boolean
+  models: string[]
+  count: number
+  message: string | null
+}
+
+
+
+/* ---------- AI 编排（/api/agent） ---------- */
+
+/** 一轮中单个请求/断言构成的确定性证据。ID 形如 `r0:case-id:a1`。 */
+export interface AgentEvidence {
+  id: string
+  case_id: string
+  status: string
+  http_status: number | null
+  error_kind: string | null
+  assertion_index: number | null
+  kind: string | null
+  expected: unknown
+  passed: boolean | null
+  message: string | null
+}
+
+/** 模型输出的未证实假设，evidence_ids 必须引用已有证据。 */
+export interface AgentHypothesis {
+  id: string
+  cause: string
+  evidence_ids: string[]
+  next_check: string
+}
+
+export interface AgentAnalysis {
+  summary: string
+  hypotheses: AgentHypothesis[]
+  coverage_gaps: string[]
+}
+
+export interface AgentDiagnosis {
+  evidence: AgentEvidence[]
+  analysis: AgentAnalysis
+}
+
+export interface AgentMutation {
+  parent_id: string
+  hypothesis_id: string
+  location: 'body' | 'query' | 'path'
+  pointer: string
+  action: 'set' | 'remove'
+  value: unknown
+  assertions: unknown[]
+  reason: string
+}
+
+export interface AgentAdaptation {
+  continue_testing: boolean
+  reason: string
+  plan: AgentPlan | null
+  mutations: AgentMutation[]
+  rejected: string[]
+}
+
+/** Agent 产物里的执行计划（与 ExecutionPlan 同构，此处只声明页面用到的字段）。 */
+export interface AgentPlan {
+  origin: string
+  allowed_methods: string[]
+  path_templates: string[]
+  requests: AgentRequestCase[]
+  max_requests: number
+}
+
+export interface AgentRequestCase {
+  id: string
+  method: string
+  path: string
+  query?: Record<string, string>
+  body?: unknown
+  assertions: { kind: string; pointer?: string; expected?: unknown }[]
+}
+
+export interface AgentCaseIntent {
+  case_id: string
+  category: 'positive' | 'boundary' | 'negative' | 'auth'
+  basis: 'contract' | 'inferred'
+  rationale: string
+  source_quote: string | null
+}
+
+export interface AgentRound {
+  index: number
+  plan: AgentPlan
+  intents: AgentCaseIntent[]
+  notes: string[]
+  result: unknown
+  evidence: AgentEvidence[]
+  diagnosis: AgentDiagnosis | null
+  adaptation: AgentAdaptation | null
+}
+
+export interface AgentEvent {
+  sequence: number
+  timestamp: string
+  node: string
+  status: string
+  reason: string
+}
+
+export interface AgentModelCall {
+  stage: string
+  status: string
+  model: string
+  error_kind: string | null
+  prompt_tokens: number
+  completion_tokens: number
+  usage_reported: boolean
+  duration_ms: number
+}
+
+export interface AgentBudgetLine {
+  limit: number
+  reserved: number
+  consumed: number
+  released?: number
+  observed_attempts?: number
+  unknown_requests?: number
+}
+
+export interface AgentRun {
+  schema_version: string
+  id: string
+  created_at: string
+  status: string
+  report_status: 'partial' | 'complete'
+  stop_reason: string | null
+  snapshot: Record<string, unknown>
+  snapshot_sha256: string
+  actual_llm_status: string
+  degradation_reasons: string[]
+  rounds: AgentRound[]
+  events: AgentEvent[]
+  model_calls: AgentModelCall[]
+  commentary: { overview: string; recommendations: string[] } | null
+  budget: { target_http: AgentBudgetLine; model_call: AgentBudgetLine }
+  started_at?: string
+  ended_at?: string
+  duration_ms?: number
+}
+
+export interface AgentRunInput {
+  contract: string | Record<string, unknown>
+  scope: {
+    origin: string
+    allowed_methods: string[]
+    path_templates: string[]
+    auth_ref?: unknown
+  }
+  max_cases?: number
+  limits?: {
+    target_requests?: number
+    model_calls?: number
+    max_rounds?: number
+    wall_time_seconds?: number
+  }
+  engine?: string
+  allow_mutating_followups?: boolean
 }

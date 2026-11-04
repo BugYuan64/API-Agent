@@ -1,20 +1,44 @@
 """Endpoints that run plans through the existing Postman execution engine."""
 
+import hashlib
+import json
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api_agent.execution.api_schemas import ExecutionHistoryResponse, ExecutionRunRequest
 from api_agent.execution.models import ExecutionRecord
+from api_agent.execution.schemas import ExecutionPlan
 from api_agent.execution.service import ExecutionService, PlanError
-from api_agent.infrastructure.api import ApiError, Page, PageInfo, not_found
+from api_agent.infrastructure.api import (
+    ApiError,
+    LimitParam,
+    OffsetParam,
+    Page,
+    not_found,
+    paginate,
+)
 from api_agent.infrastructure.database import session_for
+from api_agent.infrastructure.privacy import Context
 from api_agent.projects.models import Project
 
 router = APIRouter(prefix="/api/executions", tags=["executions"])
 Session = Annotated[AsyncSession, Depends(session_for)]
+
+
+def freeze_plan(plan: ExecutionPlan) -> tuple[dict, str]:
+    """把计划固化成（脱敏副本, SHA-256 指纹）。
+
+    作用：诊断必须依据“实际执行的那份计划”。计划里可能带 ``auth_ref``
+    引用的变量名与负向用例的样例值，因此先过一遍统一脱敏再入库。
+    实现：脱敏后按 ``sort_keys`` 规范化序列化再取哈希——
+    相同内容得到相同指纹，且不受键顺序影响。
+    """
+    clean = Context().clean(plan.model_dump(mode="json"))
+    encoded = json.dumps(clean, sort_keys=True, ensure_ascii=True).encode()
+    return clean, hashlib.sha256(encoded).hexdigest()
 
 
 def _service(request: Request) -> ExecutionService:
@@ -43,16 +67,21 @@ async def run_plan(
     """
     service = _service(request)
     try:
-        service.parse(payload.plan)
+        plan = service.parse(payload.plan)
+        driver = service.resolve_engine(payload.engine)
     except PlanError as error:
         raise ApiError(400, str(error), "Execution plan was rejected") from None
     if payload.project_id is not None and await session.get(Project, payload.project_id) is None:
         raise not_found("Project")
-    result = await service.run(payload.plan)
+    # 复用已校验的计划，避免对同一载荷二次序列化与全量扫描。
+    result = await service.run_plan(plan, driver)
+    # 冻结本次真正执行的那份脱敏计划：后续诊断只能依据它，
+    # 避免“编辑器已改、历史未动”造成证据错配。
+    frozen_plan, plan_digest = freeze_plan(plan)
     record = ExecutionRecord(
         project_id=payload.project_id,
         label=payload.label,
-        engine=result.get("engine", "postman-cli"),
+        engine=result.get("engine", "native"),
         status=result["status"],
         error_kind=result.get("error_kind"),
         duration_ms=float(result.get("duration_ms", 0)),
@@ -60,6 +89,8 @@ async def run_plan(
         observed_attempts=int(result.get("observed_attempts", 0)),
         unknown_requests=int(result.get("unknown_requests", 0)),
         executions=result.get("executions", []),
+        plan=frozen_plan,
+        plan_sha256=plan_digest,
     )
     session.add(record)
     await session.commit()
@@ -70,8 +101,8 @@ async def run_plan(
 @router.get("", response_model=Page[ExecutionHistoryResponse])
 async def list_executions(
     session: Session,
-    limit: Annotated[int, Query(ge=1, le=200)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: LimitParam = 50,
+    offset: OffsetParam = 0,
 ):
     """分页列出历史执行（最新的在前）。
 
@@ -87,20 +118,37 @@ async def list_executions(
         )
     ).all()
     total = await session.scalar(select(func.count()).select_from(ExecutionRecord)) or 0
-    return Page[ExecutionHistoryResponse](
-        items=[ExecutionHistoryResponse.model_validate(item) for item in items],
-        page=PageInfo(limit=limit, offset=offset, total=total),
-    )
+    return paginate(ExecutionHistoryResponse, items, limit, offset, total)
 
 
 @router.get("/engine/status")
-async def engine_status(request: Request):
-    """探测 Postman CLI 是否可用（不登录、不发目标请求）。
+async def engine_status(request: Request, engine: str | None = None):
+    """探测指定执行驱动的就绪状态（不登录、不发目标请求）。
 
     作用：让界面在“发送”之前就能提示环境问题，
     而不是等用户点完才报一个 ``cli_unavailable``。
+    实现：``engine`` 缺省时探测原生驱动；传 ``postman`` 则实际拉起 CLI 执行
+    ``--version``。任何驱动都只在本地探测，不访问被测目标。
     """
-    return await _service(request).runner.status()
+    return await _service(request).engine_status(engine)
+
+
+@router.get("/engine/list")
+async def list_engines(request: Request):
+    """列出全部可用执行驱动及其当前就绪状态。
+
+    作用：界面据此渲染“执行引擎”选择器，并标出哪个驱动在本机不可用。
+    实现：逐个调用驱动的 ``status()``；单个驱动内部异常不影响其他驱动的报告。
+    """
+    service = _service(request)
+    items = []
+    for name, driver in service.engines.items():
+        try:
+            status = await driver.status()
+        except Exception:  # noqa: BLE001 - 单个驱动异常不能拖垮整个列表
+            status = {"available": False, "error_kind": "status_check_failed"}
+        items.append({"id": name, **status, "engine": name})
+    return {"items": items, "default": "native"}
 
 
 @router.get("/{execution_id}", response_model=ExecutionHistoryResponse)

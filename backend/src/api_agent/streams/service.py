@@ -1,192 +1,24 @@
-"""SSE and WebSocket long-connection probes with bounded, replayable evidence."""
+"""Own bounded SSE/WebSocket probes and coordinate their lifecycle and evidence."""
 
 import asyncio
 import base64
-import time
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
-
-from api_agent.infrastructure.api import ApiInput
-from api_agent.infrastructure.orm import as_utc, new_id, utc_now
+from api_agent.infrastructure.orm import new_id, utc_now
+from api_agent.streams.repository import StreamRepository
+from api_agent.streams.schemas import StreamStart
+from api_agent.streams.state import (
+    MAX_EVENT_CHARS,
+    ActiveStream,
+    Kind,
+    StreamEvent,
+    serialize_event,
+    serialize_stream,
+)
 from api_agent.streams.transport import (
     NoRedirectConnect,
     StreamLimitExceeded,
     bounded_sse_lines,
 )
-
-MAX_EVENT_CHARS = 64 * 1024
-PREVIEW_CHARS = 8 * 1024
-
-Kind = Literal["sse", "websocket"]
-Status = Literal["connecting", "open", "closed", "error", "cancelled"]
-
-
-class StreamStart(ApiInput):
-    """启动一次长连接测试的输入契约。
-
-    作用：把 SSE 与 WebSocket 的差异收敛到 ``kind`` 一个开关上——
-    两者共享 URL、头、超时与上限，只在 ``kind`` 上分流，
-    界面因此可以用一套表单覆盖两种协议。
-    实现：``send`` 只在 WebSocket 下有效（SSE 是单向流，服务端不接受客户端消息），
-    由 ``valid_kind`` 拒绝在 SSE 上携带待发消息，避免“发了但被忽略”的错觉。
-    """
-
-    kind: Kind
-    url: str = Field(min_length=1, max_length=2000)
-    headers: dict[str, str] = Field(default_factory=dict, max_length=20)
-    subprotocols: list[str] = Field(default_factory=list, max_length=5)
-    max_events: int = Field(default=200, ge=1, le=2000)
-    max_duration_ms: int = Field(default=60_000, ge=1000, le=900_000)
-    connect_timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
-    ping_interval_ms: int = Field(default=20_000, ge=0, le=300_000)
-    send: list[str] = Field(default_factory=list, max_length=20)
-    send_interval_ms: int = Field(default=500, ge=0, le=60_000)
-    project_id: str | None = None
-
-    @field_validator("subprotocols")
-    @classmethod
-    def valid_subprotocols(cls, values: list[str]) -> list[str]:
-        """校验子协议是 RFC 6455 允许的 token 且不重复。
-
-        实现：逐项使用 token 字符集匹配（与头名规则一致），
-        重复会让握手产生歧义，直接拒绝。
-        """
-        import re
-
-        token = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-        if len(set(values)) != len(values) or any(not token.fullmatch(v) for v in values):
-            raise ValueError("subprotocols must be unique HTTP tokens")
-        return values
-
-    @model_validator(mode="after")
-    def valid_kind(self):
-        """拒绝“SSE 上携带待发消息”这类不可能生效的组合。
-
-        实现：SSE 是服务器到客户端的单向流，没有客户端写入通道，
-        因此带了 ``send`` 就说明用户预期与实际行为不符，应在提交前就报错。
-        """
-        if self.kind == "sse" and self.send:
-            raise ValueError("SSE streams cannot send messages; use the websocket kind")
-        return self
-
-
-@dataclass
-class StreamEvent:
-    """内存时间线中的一条事件（与持久化行一一对应）。
-
-    实现：``data`` 只保留前 64KiB，``data_bytes`` 记录真实长度，
-    ``truncated`` 标记是否被截断，避免一条巨型事件占满前端与数据库。
-    """
-
-    sequence: int
-    direction: str
-    kind: str
-    event_name: str | None
-    data: str | None
-    data_bytes: int
-    truncated: bool
-    elapsed_ms: int
-
-
-@dataclass
-class ActiveStream:
-    """一个在跑的长连接会话的内存状态。
-
-    作用：把“时间线缓冲 + 等待通知 + 结束原因”打包，供轮询接口增量读取。
-    实现：``events`` 用 ``deque(maxlen=...)`` 做环形缓冲，超限自动丢弃最旧的，
-    因此内存占用与已收事件数无关；``notify`` 是 ``asyncio.Event``，
-    有新事件或状态变化时置位，长轮询据此立即返回。
-    """
-
-    id: str
-    kind: Kind
-    url: str
-    status: Status = "connecting"
-    events: deque[StreamEvent] = field(default_factory=lambda: deque(maxlen=4000))
-    notify: asyncio.Event = field(default_factory=asyncio.Event)
-    task: asyncio.Task | None = None
-    stop_reason: str | None = None
-    error_kind: str | None = None
-    error_message: str | None = None
-    http_status: int | None = None
-    content_type: str | None = None
-    subprotocol: str | None = None
-    close_code: int | None = None
-    close_reason: str | None = None
-    event_count: int = 0
-    byte_count: int = 0
-    sent_count: int = 0
-    truncated_count: int = 0
-    started_at: float = field(default_factory=time.monotonic)
-    opened_at: datetime | None = None
-    closed_at: datetime | None = None
-    websocket: Any = None
-    pending: list[StreamEvent] = field(default_factory=list)
-    send_task: asyncio.Task | None = None
-
-    @property
-    def finished(self) -> bool:
-        """会话是否已经结束（用于前端判断是否继续轮询）。
-
-        实现：``closed``/``error``/``cancelled`` 三种状态都算结束，
-        ``open``/``connecting`` 表示仍在观察中。
-        """
-        return self.status in {"closed", "error", "cancelled"}
-
-    def append(
-        self,
-        kind: str,
-        data: str | None,
-        *,
-        direction: str = "in",
-        event_name: str | None = None,
-        raw_bytes: int | None = None,
-    ) -> StreamEvent:
-        """追加一条事件到内存时间线与待落库队列。
-
-        作用：把“序号分配、大小记账、截断判定”集中在一处，
-        保证内存视图与数据库行完全一致。
-        实现：``sequence`` 自增；正文超过 ``MAX_EVENT_CHARS`` 时截断并计数；
-        ``raw_bytes`` 用于 WebSocket 二进制帧（真实字节数可能大于可解码文本长度）。
-        """
-        sequence = self.event_count + 1
-        self.event_count = sequence
-        size = raw_bytes if raw_bytes is not None else len((data or "").encode())
-        truncated = len(data or "") > MAX_EVENT_CHARS
-        event = StreamEvent(
-            sequence=sequence,
-            direction=direction,
-            kind=kind,
-            event_name=event_name,
-            data=(data or "")[:MAX_EVENT_CHARS] if data is not None else None,
-            data_bytes=size,
-            truncated=truncated,
-            elapsed_ms=int((time.monotonic() - self.started_at) * 1000),
-        )
-        if truncated:
-            self.truncated_count += 1
-        # Receive bytes are accounted by the transport, including partial input.
-        self.events.append(event)
-        self.pending.append(event)
-        self.notify.set()
-        return event
-
-    def finish(self, status: Status, reason: str, *, error_kind: str | None = None):
-        """把会话标记为终态并唤醒所有等待者。
-
-        实现：``status`` 与 ``stop_reason`` 分开记录——前者是生命周期，
-        后者是结束原因，二者组合才能表达“目标关闭 / 本服务主动断开 / 连接失败”。
-        """
-        self.status = status
-        self.stop_reason = reason
-        if error_kind:
-            self.error_kind = error_kind
-        self.closed_at = utc_now()
-        self.notify.set()
 
 
 class StreamManager:
@@ -204,6 +36,7 @@ class StreamManager:
         实现：启动名额在第一次 await 前预留；上限与时长来自配置。
         """
         self.database = database
+        self.repository = StreamRepository(database)
         self.settings = settings
         self.active: dict[str, ActiveStream] = {}
         self.history: dict[str, ActiveStream] = {}
@@ -224,7 +57,9 @@ class StreamManager:
         schemes = frozenset({"http", "https", "ws", "wss"})
         parsed, origin = validate_target(payload.url, allowed_origins, schemes)
         url = _canonical_stream_url(parsed, payload.kind)
-        stream = ActiveStream(id=new_id(), kind=payload.kind, url=url)
+        stream = ActiveStream(
+            id=new_id(), kind=payload.kind, url=url, max_events=payload.max_events
+        )
         self.active[stream.id] = stream
         try:
             await self._persist_new(stream, payload, origin)
@@ -248,12 +83,17 @@ class StreamManager:
         stream = self.active.get(session_id) or self.history.get(session_id)
         if stream is None:
             return None
-        if stream.finished:
+        if stream.finished and stream.id not in self.active:
             return stream
-        stream.stop_reason = reason
+        was_finished = stream.finished
+        if not was_finished:
+            stream.stop_reason = reason
         task = stream.task
         if task is not None and not task.done():
-            task.cancel()
+            # A terminal task may already be committing its last evidence.
+            # Cancelling that finally block would interrupt the owned teardown.
+            if not was_finished:
+                task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5)
             except (TimeoutError, asyncio.CancelledError):
@@ -283,6 +123,16 @@ class StreamManager:
                 for stream in list(self.active.values())
             )
         )
+        # stop() bounds an HTTP caller's wait. Application shutdown must also
+        # join tasks still finalizing after that grace period, before DB disposal.
+        await asyncio.gather(
+            *(stream.task for stream in list(self.active.values()) if stream.task is not None),
+            return_exceptions=True,
+        )
+
+    async def recover(self) -> int:
+        """Close persisted connections lost with the previous process."""
+        return await self.repository.recover()
 
     def find(self, session_id: str) -> ActiveStream | None:
         """按 ID 在活跃与近期历史中查找会话。
@@ -305,16 +155,62 @@ class StreamManager:
             raise ValueError("stream_not_found")
         if stream.kind != "websocket":
             raise ValueError("stream_not_sendable")
-        if stream.status != "open" or stream.websocket is None:
-            # 会话仍在但已不在 open 状态：这是冲突（409），不是“不存在”。
-            raise ValueError("stream_not_open")
         if len(message) > MAX_EVENT_CHARS:
             raise ValueError("stream_message_too_large")
-        await stream.websocket.send(message)
-        stream.sent_count += 1
-        stream.append("text", message, direction="out")
-        await self._flush(stream)
+        await self._send_text(stream, message)
         return stream.event_count
+
+    async def _send_text(self, stream: ActiveStream, message: str) -> None:
+        """发送一条文本消息，并在发送前与接收侧共享同一份事件预算。
+
+        实现：先取锁、检查状态与剩余额度，再 ``send`` 并本地记账，
+        这样“发送”与“收到回显”不会各自越过上限。
+        ``connection.close()`` 必须在**释放锁之后**执行——关闭握手需要
+        等待接收协程退出，而接收协程可能正等这把锁，持锁关闭会互相卡死。
+        """
+        connection = None
+        limit_hit = False
+        async with stream.event_lock:
+            if stream.status != "open" or stream.websocket is None:
+                raise ValueError("stream_not_open")
+            if stream.event_count >= stream.max_events:
+                # 已在终态或额度耗尽：不再排队等待传输层，直接判冲突。
+                stream.finish("closed", "limits_exceeded")
+                raise ValueError("stream_event_limit")
+            # 持锁跨越 send，先占用本条目名额并记录出站证据，
+            # 避免回显抢在同一窗口内把接收事件插到前面。
+            connection = stream.websocket
+            if getattr(getattr(connection, "protocol", None), "state", None) is not None:
+                # websockets 15 的 Protocol.state 在关闭流程开始后即为 CLOSING；
+                # 此时 send() 会挂在写队列上长期不返回（Windows 上尤其明显），
+                # 因此必须先判状态，再决定是否发送。
+                try:
+                    from websockets.protocol import State
+
+                    if connection.protocol.state is not State.OPEN:
+                        raise ValueError("stream_not_open")
+                except ImportError:  # pragma: no cover - 旧版本无 State 枚举
+                    pass
+            try:
+                await connection.send(message)
+            except Exception as error:  # noqa: BLE001
+                from websockets.exceptions import ConnectionClosed
+
+                if isinstance(error, (ConnectionClosed, OSError)):
+                    # 发送失败不占用事件额度，交给读循环记录真实关闭原因。
+                    raise ValueError("stream_not_open") from None
+                raise
+            stream.sent_count += 1
+            stream.append("text", message, direction="out")
+            limit_hit = stream.event_count >= stream.max_events
+            if limit_hit:
+                stream.finish("closed", "limits_exceeded")
+        await self._flush(stream)
+        if limit_hit and connection is not None:
+            # 锁已释放：此时关闭不会与接收协程争锁。
+            # 关闭握手可能等对端回应，因此不阻塞调用方——发送路径只负责
+            # 发起断开；真正的收尾与落库由读循环的 finally 完成。
+            self._close_connection_soon(stream, connection)
 
     async def read(
         self, session_id: str, after: int, wait_ms: int = 0
@@ -562,17 +458,20 @@ class StreamManager:
                 if binary is None:
                     continue
                 message = bytes(buffer) if binary else buffer.decode()
-                if isinstance(message, bytes):
-                    stream.append(
-                        "binary",
-                        base64.b64encode(message).decode("ascii"),
-                        raw_bytes=len(message),
-                    )
-                else:
-                    stream.append("text", message)
-                if self._limits_hit(stream, payload):
-                    stream.finish("closed", "limits_exceeded")
-                    return
+                async with stream.event_lock:
+                    if stream.finished:
+                        return
+                    if isinstance(message, bytes):
+                        stream.append(
+                            "binary",
+                            base64.b64encode(message).decode("ascii"),
+                            raw_bytes=len(message),
+                        )
+                    else:
+                        stream.append("text", message)
+                    if self._limits_hit(stream, payload):
+                        stream.finish("closed", "limits_exceeded")
+                        return
                 await self._flush(stream)
                 connection.protocol.max_size = self.settings.stream_max_bytes - stream.byte_count
         except ConnectionClosed as error:
@@ -591,8 +490,10 @@ class StreamManager:
                 label = "normal"
             else:
                 label = f"code {stream.close_code}"
-            stream.append("close", f"Target closed the connection ({label})")
-            stream.finish("closed", "target_closed")
+            async with stream.event_lock:
+                if not stream.finished:
+                    stream.append("close", f"Target closed the connection ({label})")
+                    stream.finish("closed", "target_closed")
         finally:
             if stream.send_task is not None and not stream.send_task.done():
                 stream.send_task.cancel()
@@ -618,18 +519,20 @@ class StreamManager:
                 if stream.status != "open" or stream.websocket is None:
                     return
                 try:
-                    await stream.websocket.send(message)
+                    await self._send_text(stream, message)
                 except Exception as error:
                     # 连接已关闭（ConnectionClosed 及其子类）：静默退出，收尾由读循环记录。
                     from websockets.exceptions import ConnectionClosed
 
                     if isinstance(error, ConnectionClosed):
                         return
+                    if isinstance(error, ValueError) and str(error) in {
+                        "stream_not_open",
+                        "stream_event_limit",
+                    }:
+                        return
                     stream.append("error", f"Send failed: {str(error)[:200]}")
                     return
-                stream.sent_count += 1
-                stream.append("text", message, direction="out")
-                await self._flush(stream)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - 其余异常只记录，不掩盖读循环
@@ -654,6 +557,24 @@ class StreamManager:
         """
         stream.notify.set()
 
+    def _close_connection_soon(self, stream: ActiveStream, connection) -> None:
+        """在不阻塞调用方的前提下发起关闭。
+
+        作用：额度耗尽时要主动断开，但关闭握手可能等待对端回应；
+        让发送 API 为一次关闭挂起数秒会拖慢界面并放大并发争用。
+        实现：起一个短生命周期任务去关闭，异常吞掉——
+        会话终态与证据已经由 ``finish`` 记录，关闭失败不改写结论。
+        """
+
+        async def close() -> None:
+            try:
+                await asyncio.wait_for(connection.close(), timeout=5)
+            except (TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+        task = asyncio.create_task(close(), name=f"stream-close-{stream.id[:8]}")
+        stream.send_task = stream.send_task or task
+
     def _trim_history(self) -> None:
         """限制内存中保留的历史会话数量。
 
@@ -665,77 +586,10 @@ class StreamManager:
             self.history.pop(oldest, None)
 
     async def _persist_new(self, stream: ActiveStream, payload: StreamStart, origin: str) -> None:
-        """预写会话行，让界面在握手完成前就能拿到会话 ID。
-
-        实现：请求头经 ``redact_headers`` 脱敏后落库；
-        ``settings`` 记录本次上限与目标 origin，便于事后解释“为什么在这里停”。
-        """
-        from api_agent.infrastructure.targets import redact_headers
-
-        async with self.database.session() as session:
-            session.add(_session_row(stream, payload, origin, redact_headers(payload.headers)))
-            await session.commit()
+        await self.repository.create(stream, payload, origin)
 
     async def _flush(self, stream: ActiveStream, *, final: bool = False) -> None:
-        """把待落库事件与最新会话状态写入数据库。
-
-        实现：批量写入（每次最多 200 条），避免高频流把 SQLite 写锁占满；
-        ``final=True`` 时连同结束时间、关闭码、错误信息一起更新。
-        任何写库异常都吞掉并清空待写队列——持久化失败不应该中断正在观察的流。
-        """
-        if not stream.pending and not final:
-            return
-        pending = stream.pending
-        stream.pending = []
-        try:
-            from sqlalchemy import update
-
-            from api_agent.streams.models import StreamEventRecord, StreamSessionRecord
-
-            async with self.database.session() as session:
-                for event in pending:
-                    session.add(
-                        StreamEventRecord(
-                            session_id=stream.id,
-                            sequence=event.sequence,
-                            direction=event.direction,
-                            kind=event.kind,
-                            event_name=event.event_name,
-                            data=event.data,
-                            data_bytes=event.data_bytes,
-                            truncated=event.truncated,
-                            elapsed_ms=event.elapsed_ms,
-                        )
-                    )
-                await session.execute(
-                    update(StreamSessionRecord)
-                    .where(StreamSessionRecord.id == stream.id)
-                    .values(
-                        status=stream.status,
-                        stop_reason=stream.stop_reason,
-                        error_kind=stream.error_kind,
-                        error_message=stream.error_message,
-                        http_status=stream.http_status,
-                        content_type=stream.content_type,
-                        subprotocol=stream.subprotocol,
-                        close_code=stream.close_code,
-                        close_reason=stream.close_reason,
-                        event_count=stream.event_count,
-                        byte_count=stream.byte_count,
-                        sent_count=stream.sent_count,
-                        truncated_count=stream.truncated_count,
-                        opened_at=stream.opened_at,
-                        closed_at=stream.closed_at,
-                    )
-                )
-                await session.commit()
-        except Exception:  # noqa: BLE001 - 持久化失败不中断观察
-            import logging
-
-            logging.getLogger("api_agent").warning(
-                "Stream evidence could not be persisted", exc_info=True
-            )
-            stream.pending.clear()
+        await self.repository.flush(stream, final=final)
 
 
 async def _cancel_after(stream: ActiveStream, seconds: float) -> None:
@@ -751,34 +605,6 @@ async def _cancel_after(stream: ActiveStream, seconds: float) -> None:
     if stream.task is not None and not stream.task.done():
         stream.stop_reason = "deadline_exceeded"
         stream.task.cancel()
-
-
-def _session_row(stream: ActiveStream, payload: StreamStart, origin: str, headers: dict):
-    """构造待插入的会话行。
-
-    实现：``url`` 存规范 origin 拼上原始路径与查询串；
-    ``settings`` 保存本次上限与目标 origin，便于事后解释停止原因。
-    """
-    from api_agent.streams.models import StreamSessionRecord
-
-    return StreamSessionRecord(
-        id=stream.id,
-        project_id=payload.project_id,
-        kind=payload.kind,
-        url=stream.url,
-        request_headers=headers,
-        status=stream.status,
-        settings={
-            "origin": origin,
-            "max_events": payload.max_events,
-            "max_duration_ms": payload.max_duration_ms,
-            "connect_timeout_ms": payload.connect_timeout_ms,
-            "ping_interval_ms": payload.ping_interval_ms,
-            "subprotocols": payload.subprotocols,
-            "scheduled_sends": len(payload.send),
-        },
-        opened_at=None,
-    )
 
 
 def _canonical_stream_url(parsed, kind: Kind) -> str:
@@ -799,62 +625,6 @@ def _canonical_stream_url(parsed, kind: Kind) -> str:
     else:
         scheme = {"http": "ws", "https": "wss"}.get(scheme, scheme)
     return f"{scheme}://{netloc}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
-
-
-def serialize_event(event: StreamEvent, stream_id: str) -> dict:
-    """把内存事件序列化成对外 JSON。
-
-    实现：字段名与前端类型一一对应；``sequence`` 是增量拉取的游标，
-    因此必须原样透出，不能重新编号。
-    """
-    return {
-        "session_id": stream_id,
-        "sequence": event.sequence,
-        "direction": event.direction,
-        "kind": event.kind,
-        "event_name": event.event_name,
-        "data": event.data,
-        "data_bytes": event.data_bytes,
-        "truncated": event.truncated,
-        "elapsed_ms": event.elapsed_ms,
-    }
-
-
-def serialize_stream(stream: ActiveStream) -> dict:
-    """把会话状态序列化成对外 JSON。
-
-    实现：``finished`` 是派生值（终态判定），让前端不必自己枚举三种终态；
-    时间戳统一走 ``as_utc`` 以补齐 SQLite 丢失的时区。
-    """
-    return {
-        "id": stream.id,
-        "kind": stream.kind,
-        "url": stream.url,
-        "status": stream.status,
-        "finished": stream.finished,
-        "stop_reason": stream.stop_reason,
-        "error_kind": stream.error_kind,
-        "error_message": stream.error_message,
-        "http_status": stream.http_status,
-        "content_type": stream.content_type,
-        "subprotocol": stream.subprotocol,
-        "close_code": stream.close_code,
-        "close_reason": stream.close_reason,
-        "event_count": stream.event_count,
-        "byte_count": stream.byte_count,
-        "sent_count": stream.sent_count,
-        "truncated_count": stream.truncated_count,
-        "opened_at": as_utc(stream.opened_at),
-        "closed_at": as_utc(stream.closed_at),
-    }
-
-
-def event_preview(text: str | None) -> str | None:
-    """把事件正文裁到预览长度（供历史列表使用）。
-
-    实现：与 ``PREVIEW_CHARS`` 取小；保留原始换行以便前端按文本展示。
-    """
-    return None if text is None else text[:PREVIEW_CHARS]
 
 
 __all__ = [

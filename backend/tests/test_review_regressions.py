@@ -407,7 +407,10 @@ async def test_execution_validates_project_before_running(client, monkeypatch):
         def parse(self, plan):
             pass
 
-        async def run(self, plan):
+        def resolve_engine(self, name):
+            return None
+
+        async def run(self, plan, engine=None):
             calls.append(plan)
             return {"status": "passed"}
 

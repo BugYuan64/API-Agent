@@ -13,6 +13,10 @@ import {
   Zap,
 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
+import ResizableSplit from '@/components/ResizableSplit.vue'
+import HistoryList, { type HistoryEntry } from '@/components/HistoryList.vue'
+import TestWorkspace from '@/components/TestWorkspace.vue'
+import { useHeaderRows } from '@/composables/useHeaderRows'
 import EmptyState from '@/components/EmptyState.vue'
 import { describeError } from '@/api/client'
 import {
@@ -37,7 +41,6 @@ import { useToastStore } from '@/stores/toasts'
 const form = reactive({
   kind: 'sse' as StreamKind,
   url: 'http://127.0.0.1:8010/api/streams',
-  headers: [{ name: 'Accept', value: 'text/event-stream' }] as { name: string; value: string }[],
   subprotocols: '',
   maxEvents: 200,
   maxDurationMs: 60_000,
@@ -46,6 +49,15 @@ const form = reactive({
   scheduled: '',
   sendIntervalMs: 500,
 })
+
+/** 连接配置区宽度：内层分栏（配置|时间线）的受控尺寸。 */
+const configWidth = ref(320)
+try {
+  const saved = Number(window.localStorage.getItem('api-agent.layout.long-connection.config'))
+  if (Number.isFinite(saved) && saved > 0) configWidth.value = saved
+} catch {
+  // 存储不可用时保持默认宽度。
+}
 
 const session = ref<StreamSession | null>(null)
 const events = ref<StreamEvent[]>([])
@@ -97,10 +109,10 @@ watch(
   () => form.kind,
   (kind) => {
     if (kind === 'sse') {
-      form.headers = [{ name: 'Accept', value: 'text/event-stream' }]
+      resetHeaderRows([{ name: 'Accept', value: 'text/event-stream' }])
       form.pingIntervalMs = 20_000
     } else {
-      form.headers = [{ name: '', value: '' }]
+      resetHeaderRows([{ name: '', value: '' }])
       form.pingIntervalMs = 15_000
     }
   },
@@ -117,14 +129,12 @@ watch(
   },
 )
 
-const activeHeaders = computed(() =>
-  form.headers
-    .filter((row) => row.name.trim())
-    .reduce<Record<string, string>>((acc, row) => {
-      acc[row.name.trim()] = row.value
-      return acc
-    }, {}),
-)
+/** 头行编辑与折叠规则与接口调试页共用同一份实现。 */
+const {
+  rows: headerRows,
+  headers: activeHeaders,
+  reset: resetHeaderRows,
+} = useHeaderRows([{ name: 'Accept', value: 'text/event-stream' }])
 
 /** 把多行文本框拆成待发消息列表：空行忽略，但保留行内空格。 */
 const scheduledMessages = computed(() =>
@@ -287,14 +297,51 @@ function eventBody(event: StreamEvent): string {
   return looksLikeJson(data) ? prettyJson(data) : data
 }
 
+/** 把会话记录映射成共享历史列的条目形状（SSE/WS 与结束原因放进 label/meta）。 */
+const historyEntries = computed<HistoryEntry[]>(() =>
+  history.value.map((record) => ({
+    id: record.id,
+    label: `${record.kind === 'sse' ? 'SSE' : 'WS'} · ${record.url}`,
+    status: describeStopReason(record.stop_reason),
+    tone: record.status === 'closed' ? 'success' : record.status === 'error' ? 'danger' : 'neutral',
+    meta: `${record.event_count} 条 · ${formatRelative(record.created_at)}`,
+  })),
+)
+
+/** 共享历史列只回传 id。 */
+function replayById(id: string): void {
+  const target = history.value.find((item) => item.id === id)
+  if (target) replay(target)
+}
+
 onMounted(loadHistory)
 onBeforeUnmount(stopPolling)
 </script>
 
 <template>
-  <div class="lc">
-    <!-- 左：配置面板 -->
-    <aside class="lc-config scroll-y">
+  <TestWorkspace persist-key="api-agent.layout.long-connection.history" class="lc">
+    <!-- 左：最近会话（独立列，可拖动宽度） -->
+    <template #history>
+      <HistoryList
+        title="最近会话"
+        :items="historyEntries"
+        :active-id="activeHistoryId"
+        empty-text="还没有会话记录。建立一次连接后会出现在这里。"
+        @select="replayById"
+      />
+    </template>
+
+    <!-- 右：配置 + 时间线 -->
+    <div class="lc-main">
+      <ResizableSplit
+        v-model:size="configWidth"
+        persist-key="api-agent.layout.long-connection.config"
+        :min="280"
+        :min-other="360"
+        label="拖动调整连接配置区与时间线区宽度"
+      >
+        <template #first>
+      <aside class="lc-config scroll-y">
       <div class="config-head">
         <h2 class="config-title">长连接测试</h2>
         <p class="config-sub">SSE 与 WebSocket 共用一套观测视图</p>
@@ -340,19 +387,19 @@ onBeforeUnmount(stopPolling)
       <div class="field">
         <span class="field-label">请求头</span>
         <div class="header-list">
-          <div v-for="(row, index) in form.headers" :key="index" class="header-row">
+          <div v-for="(row, index) in headerRows" :key="index" class="header-row">
             <input v-model="row.name" class="input mono" placeholder="名称" spellcheck="false" />
             <input v-model="row.value" class="input mono" placeholder="值" spellcheck="false" />
             <button
               class="btn btn-ghost btn-icon btn-sm"
               title="删除"
-              @click="form.headers.splice(index, 1)"
+              @click="headerRows.splice(index, 1)"
             >
               ×
             </button>
           </div>
         </div>
-        <button class="btn btn-sm" @click="form.headers.push({ name: '', value: '' })">
+        <button class="btn btn-sm" @click="headerRows.push({ name: '', value: '' })">
           + 添加
         </button>
       </div>
@@ -420,30 +467,9 @@ onBeforeUnmount(stopPolling)
         </p>
       </div>
 
-      <div class="history-block">
-        <div class="history-head">
-          <span>最近会话</span>
-          <button class="btn btn-ghost btn-sm" @click="loadHistory">刷新</button>
-        </div>
-        <button
-          v-for="record in history"
-          :key="record.id"
-          class="history-item"
-          :class="{ 'history-item-active': activeHistoryId === record.id }"
-          @click="replay(record)"
-        >
-          <div class="history-top">
-            <span class="tag tag-accent">{{ record.kind === 'sse' ? 'SSE' : 'WS' }}</span>
-            <span class="history-count">{{ record.event_count }} 条</span>
-            <span class="history-time">{{ formatRelative(record.created_at) }}</span>
-          </div>
-          <div class="history-url truncate" :title="record.url">{{ record.url }}</div>
-          <div class="history-reason">{{ describeStopReason(record.stop_reason) }}</div>
-        </button>
-        <p v-if="!history.length" class="hint">还没有会话记录。</p>
-      </div>
     </aside>
-
+        </template>
+        <template #second>
     <!-- 右：会话与时间线 -->
     <section class="lc-stage">
       <div class="stage-head">
@@ -558,21 +584,37 @@ onBeforeUnmount(stopPolling)
         <span class="foot-fill" />
         <span>{{ cursor }} / {{ session.event_count }} 已加载</span>
       </footer>
-    </section>
-  </div>
+      </section>
+        </template>
+      </ResizableSplit>
+    </div>
+  </TestWorkspace>
 </template>
 
 <style scoped>
 .lc {
+  height: 100%;
+  min-height: 0;
+}
+
+/* 最近会话列：填满左侧插槽，自身滚动 */
+/* 右半：配置栏与时间线并排 */
+.lc-main {
   display: flex;
   height: 100%;
   min-height: 0;
 }
 
+/* 内层分栏是 flex 子项：必须显式撑满，否则会按内容宽度塌缩，
+   导致可用宽度测错、拖动上限被压到几百像素。 */
+.lc-main > .resizable-split {
+  flex: 1;
+  min-width: 0;
+}
+
 /* ---------- 配置栏 ---------- */
 .lc-config {
-  width: 320px;
-  flex: none;
+  height: 100%;
   padding: 16px 16px 24px;
   border-right: 1px solid var(--border-subtle);
   background: var(--bg-surface);
@@ -683,74 +725,6 @@ onBeforeUnmount(stopPolling)
   color: var(--text-secondary);
 }
 
-.history-block {
-  margin-top: auto;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-subtle);
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.history-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
-}
-
-.history-item {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  width: 100%;
-  padding: 7px 8px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  text-align: left;
-}
-
-.history-item:hover {
-  background: var(--bg-hover);
-}
-
-.history-item-active {
-  background: var(--accent-soft);
-  border-color: var(--accent-border);
-}
-
-.history-top {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.history-count {
-  font-size: 10.5px;
-  color: var(--text-tertiary);
-}
-
-.history-time {
-  margin-left: auto;
-  font-size: 10.5px;
-  color: var(--text-tertiary);
-}
-
-.history-url {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.history-reason {
-  font-size: 10.5px;
-  color: var(--text-tertiary);
-}
 
 /* ---------- 舞台 ---------- */
 .lc-stage {
@@ -759,7 +733,8 @@ onBeforeUnmount(stopPolling)
   flex: 1;
   min-width: 0;
   min-height: 0;
-  background: var(--bg-canvas);
+  /* 与另两个测试页一致的连续白面。 */
+  background: var(--bg-surface);
 }
 
 .stage-head {

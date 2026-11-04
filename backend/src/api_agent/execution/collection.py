@@ -1,8 +1,8 @@
 """Compile fixed test templates; input text is never treated as JavaScript."""
 
 import json
-from urllib.parse import urlencode
 
+from api_agent.execution.request import build_request_headers, build_request_url
 from api_agent.execution.schemas import ExecutionPlan
 
 
@@ -26,18 +26,10 @@ def compile_collection(plan: ExecutionPlan, secrets: dict[str, str]) -> dict:
     """
     items = []
     for case in plan.requests:
-        canonical = {"accept": "Accept", "content-type": "Content-Type"}
-        headers = {"Accept": "application/json"}
-        headers.update({canonical[name.lower()]: value for name, value in case.headers.items()})
-        if case.body is not None:
-            headers.setdefault("Content-Type", "application/json")
-        if plan.auth_ref:
-            value = secrets[plan.auth_ref.env_var]
-            name = plan.auth_ref.header_name or "Authorization"
-            headers[name] = f"Bearer {value}" if plan.auth_ref.kind == "bearer" else value
+        headers = build_request_headers(plan, case, secrets)
         request = {
             "method": case.method,
-            "url": plan.origin + case.path + ("?" + urlencode(case.query) if case.query else ""),
+            "url": build_request_url(plan, case),
             "header": [{"key": name, "value": value} for name, value in headers.items()],
         }
         if case.body is not None:

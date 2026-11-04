@@ -1,0 +1,18 @@
+{
+  "contract": "POST /register 是公开注册校验接口，无需 token。JSON 必填 phone 和 password；phone 必须是 11 位数字，password 至少 8 个字符。合法返回 200，参数非法返回 400。请覆盖正向、手机号 10/12 位、缺失必填字段、空密码。",
+  "scope": {
+    "origin": "http://127.0.0.1:9100",
+    "allowed_methods": ["POST"],
+    "path_templates": ["/register"],
+    "delay_ms": 50
+  },
+  "max_cases": 5,
+  "engine": "native",
+  "limits": {
+    "target_requests": 10,
+    "model_calls": 8,
+    "max_rounds": 2,
+    "wall_time_seconds": 180.0
+  },
+  "allow_mutating_followups": false
+}

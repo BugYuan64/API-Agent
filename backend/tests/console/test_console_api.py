@@ -162,13 +162,15 @@ def test_redaction_only_touches_credential_headers():
     """脱敏只应命中凭据类头，其余头必须原样保留以便排查。
 
     实现：一次给全敏感与非敏感头，断言敏感值被替换、非敏感值不变。
+    多值头（``Set-Cookie`` 以列表传入）逐项替换并保持列表形态——
+    把它压成单个字符串会丢失“目标发了几个 Set-Cookie”这一事实。
     """
     redacted = redact_headers(
         {"Authorization": "Bearer x", "Cookie": "a=1", "X-Trace": "keep-me", "Set-Cookie": ["a"]}
     )
     assert redacted["Authorization"] == "[redacted]"
     assert redacted["Cookie"] == "[redacted]"
-    assert redacted["Set-Cookie"] == "[redacted]"
+    assert redacted["Set-Cookie"] == ["[redacted]"]
     assert redacted["X-Trace"] == "keep-me"
 
 

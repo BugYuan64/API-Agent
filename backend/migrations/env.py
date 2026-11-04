@@ -8,6 +8,7 @@ from sqlalchemy import engine_from_config, pool
 from api_agent.console import models as _console_models  # noqa: F401
 from api_agent.execution import models as _execution_models  # noqa: F401
 from api_agent.infrastructure.orm import Base
+from api_agent.llm import models as _llm_models  # noqa: F401
 from api_agent.projects import models as _project_models  # noqa: F401
 from api_agent.runs import models as _run_models  # noqa: F401
 from api_agent.streams import models as _stream_models  # noqa: F401

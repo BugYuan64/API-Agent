@@ -174,7 +174,11 @@ class RunWorker:
                     run, action, snapshot.resource_limits.get("max_actions", 100)
                 )
                 if attempt is None:
-                    await repository.finish(run_id, "completed", "action_budget_exhausted")
+                    await session.refresh(run)
+                    if run.status == CANCELLING:
+                        await self._finish_cancelled(session, run_id)
+                    elif run.status == "running":
+                        await repository.finish(run_id, "completed", "action_budget_exhausted")
                     return
             try:
                 await asyncio.sleep(attempt_duration(action))

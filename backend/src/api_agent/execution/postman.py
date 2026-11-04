@@ -129,6 +129,8 @@ class PostmanRunner:
     每次运行都在临时目录里生成集合与报告，运行结束即删除整个目录。
     """
 
+    name = "postman-cli"
+
     def __init__(self, executable: Path, temp_root: Path, omit_response_payload: bool = False):
         """记录可执行文件、临时根目录与是否裁剪响应负载。
 

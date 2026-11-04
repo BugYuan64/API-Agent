@@ -8,18 +8,18 @@ import {
   History,
   ListTree,
   Plus,
+  Settings as SettingsIcon,
   Terminal,
   Waypoints,
 } from 'lucide-vue-next'
 
-/** 侧边栏分组：与 apifox 的「接口管理 / 自动化测试 / 请求历史」三段结构对应，
- *  但只保留本项目真实存在的能力，不摆空入口。 */
+/** 侧边栏分组：与 apifox 的「接口管理 / 自动化测试 / 请求历史 / 项目设置」结构对应。 */
 const groups = [
   {
     label: '接口管理',
     items: [
       { to: '/request', label: '接口调试', icon: Braces },
-      { to: '/plan', label: '用例计划', icon: ListTree },
+      { to: '/testcases', label: '用例测试', icon: ListTree },
       { to: '/long-connection', label: '长连接测试', icon: Cable },
     ],
   },
@@ -35,6 +35,12 @@ const groups = [
     items: [
       { to: '/history', label: '请求历史', icon: History },
       { to: '/executions', label: '执行结果', icon: Terminal },
+    ],
+  },
+  {
+    label: '设置',
+    items: [
+      { to: '/settings', label: '系统设置', icon: SettingsIcon },
     ],
   },
 ]

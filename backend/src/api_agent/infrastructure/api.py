@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
@@ -89,6 +89,25 @@ def not_found(resource: str) -> ApiError:
     不暴露内部 ID 或数据库细节。
     """
     return ApiError(404, "not_found", f"{resource} was not found")
+
+
+# 分页参数类型：所有列表接口共用同一组边界，避免各自声明的上下限漂移。
+LimitParam = Annotated[int, Query(ge=1, le=200)]
+OffsetParam = Annotated[int, Query(ge=0)]
+
+
+def paginate(model, rows, limit: int, offset: int, total: int) -> Page:
+    """把已取回的行组装成统一分页响应。
+
+    作用：六个列表接口此前各自手写 ``Page[X](items=..., page=PageInfo(...))``，
+    分页元信息的组装方式一旦改口径就要改六处。这里收敛为一条语句。
+    实现：``model`` 是响应模型类；``from_attributes`` 已在 ``ApiModel`` 开启，
+    因此 ORM 行与已构造的 Pydantic 对象都能直接校验通过。
+    """
+    return Page[model](
+        items=[item if isinstance(item, model) else model.model_validate(item) for item in rows],
+        page=PageInfo(limit=limit, offset=offset, total=total),
+    )
 
 
 def conflict(code: str, message: str) -> ApiError:

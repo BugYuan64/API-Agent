@@ -4,24 +4,31 @@
 
 import { request } from './client'
 import type {
+  AgentDiagnosis,
+  AgentRun,
+  AgentRunInput,
   BudgetEntry,
   ConsoleHistory,
   ConsoleRequestInput,
   ConsoleResult,
   DispatchAttempt,
+  EngineInfo,
   EngineStatus,
   Environment,
   EnvironmentHistory,
   EnvironmentInput,
   Execution,
   Health,
+  LLMConfig,
+  LLMConfigUpdate,
+  LLMModelListResult,
+  LLMPingResult,
   Paged,
   Project,
   Run,
   RunEvent,
   StreamEventPage,
   StreamHistory,
-  StreamKind,
   StreamSession,
   StreamStartInput,
 } from './types'
@@ -58,10 +65,10 @@ export const updateEnvironment = (
 ) => request<Environment>(`/api/environments/${environmentId}`, { method: 'PUT', body })
 
 /* ---------- 模拟运行 ---------- */
-export const listRuns = (limit = 50, offset = 0) =>
-  request<Paged<Run>>(`/api/runs?limit=${limit}&offset=${offset}`)
+export const listRuns = (limit = 50, offset = 0, signal?: AbortSignal) =>
+  request<Paged<Run>>(`/api/runs?limit=${limit}&offset=${offset}`, { signal })
 
-export const getRun = (runId: string) => request<Run>(`/api/runs/${runId}`)
+export const getRun = (runId: string, signal?: AbortSignal) => request<Run>(`/api/runs/${runId}`, { signal })
 
 export const createRun = (body: {
   project_id: string
@@ -73,14 +80,14 @@ export const createRun = (body: {
 export const cancelRun = (runId: string) =>
   request<Run>(`/api/runs/${runId}/cancel`, { method: 'POST' })
 
-export const listRunEvents = (runId: string, limit = 200, offset = 0) =>
-  request<Paged<RunEvent>>(`/api/runs/${runId}/events?limit=${limit}&offset=${offset}`)
+export const listRunEvents = (runId: string, limit = 200, offset = 0, signal?: AbortSignal) =>
+  request<Paged<RunEvent>>(`/api/runs/${runId}/events?limit=${limit}&offset=${offset}`, { signal })
 
-export const listRunBudget = (runId: string) =>
-  request<BudgetEntry[]>(`/api/runs/${runId}/budget`)
+export const listRunBudget = (runId: string, signal?: AbortSignal) =>
+  request<BudgetEntry[]>(`/api/runs/${runId}/budget`, { signal })
 
-export const listRunAttempts = (runId: string) =>
-  request<DispatchAttempt[]>(`/api/runs/${runId}/attempts`)
+export const listRunAttempts = (runId: string, signal?: AbortSignal) =>
+  request<DispatchAttempt[]>(`/api/runs/${runId}/attempts`, { signal })
 
 /* ---------- 控制台请求 ---------- */
 export const sendConsoleRequest = (body: ConsoleRequestInput) =>
@@ -115,13 +122,62 @@ export const sendStreamMessage = (sessionId: string, message: string) =>
 export const stopStream = (sessionId: string) =>
   request<StreamSession>(`/api/streams/${sessionId}/stop`, { method: 'POST' })
 
-export const streamKindLabel = (kind: StreamKind) => (kind === 'sse' ? 'SSE' : 'WebSocket')
 
 /* ---------- 计划执行 ---------- */
-export const engineStatus = () => request<EngineStatus>('/api/executions/engine/status')
+export const engineStatus = (engine?: string) =>
+  request<EngineStatus>(
+    `/api/executions/engine/status${engine ? `?engine=${encodeURIComponent(engine)}` : ''}`,
+  )
 
-export const runExecution = (body: { plan: unknown; label: string; project_id: string | null }) =>
-  request<Execution>('/api/executions', { method: 'POST', body, timeoutMs: 180_000 })
+export const engineList = () =>
+  request<{ items: EngineInfo[]; default: string }>('/api/executions/engine/list')
+
+export const runExecution = (body: {
+  plan: unknown
+  label: string
+  project_id: string | null
+  engine?: string | null
+}) => request<Execution>('/api/executions', { method: 'POST', body, timeoutMs: 180_000 })
 
 export const listExecutions = (limit = 50, offset = 0) =>
   request<Paged<Execution>>(`/api/executions?limit=${limit}&offset=${offset}`)
+
+/* ---------- 大模型动态设置 ---------- */
+export const getLLMConfig = () => request<LLMConfig>('/api/settings/llm')
+
+export const updateLLMConfig = (body: LLMConfigUpdate) =>
+  request<LLMConfig>('/api/settings/llm', { method: 'PUT', body })
+
+export const pingLLM = (body?: { base_url?: string; api_key?: string; model?: string }) =>
+  request<LLMPingResult>('/api/settings/llm/ping', { method: 'POST', body, timeoutMs: 20_000 })
+
+export const getLLMModels = (body?: { base_url?: string; api_key?: string }) =>
+  request<LLMModelListResult>('/api/settings/llm/models', { method: 'POST', body, timeoutMs: 20_000 })
+
+
+
+/* ---------- AI 编排 ---------- */
+export const startAgentRun = (body: AgentRunInput) =>
+  request<AgentRun>('/api/agent/runs', { method: 'POST', body, timeoutMs: 30_000 })
+
+export const getAgentRun = (runId: string) => request<AgentRun>(`/api/agent/runs/${runId}`)
+
+export const cancelAgentRun = (runId: string) =>
+  request<AgentRun>(`/api/agent/runs/${runId}/cancel`, { method: 'POST', timeoutMs: 30_000 })
+
+/** 报告是 Markdown 纯文本，不走 JSON request 封装。 */
+export const getAgentReport = async (runId: string): Promise<string> => {
+  const response = await fetch(`/api/agent/runs/${runId}/report`)
+  if (!response.ok) {
+    throw new Error(`report request failed: ${response.status}`)
+  }
+  return response.text()
+}
+
+/** 对一次已有执行结果做 AI 诊断（/plan 页的「AI 分析」）。 */
+export const diagnoseExecution = (
+  executionId: string,
+  body: { contract: string | Record<string, unknown> },
+) => request<AgentDiagnosis>(`/api/agent/executions/${encodeURIComponent(executionId)}/diagnose`, {
+  method: 'POST', body, timeoutMs: 120_000,
+})

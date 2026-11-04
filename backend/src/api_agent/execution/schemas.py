@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from api_agent.infrastructure.json_pointer import is_valid as is_valid_pointer
 from api_agent.projects.schemas import AuthReference
 
 Method = Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
@@ -85,7 +86,7 @@ class Assertion(Input):
         ):
             raise ValueError("status requires an HTTP status integer")
         if self.kind in {"json_equals", "json_exists"}:
-            if not re.fullmatch(r"(?:/(?:[^~]|~[01])*)*", self.pointer):
+            if not is_valid_pointer(self.pointer):
                 raise ValueError("invalid JSON Pointer")
         if self.kind == "json_equals":
             pending = [self.expected]
@@ -296,6 +297,11 @@ class AssertionResult(BaseModel):
     kind: str
     passed: bool | None = None
     message: str | None = None
+    pointer: str = ""
+    actual: JsonValue = None
+    actual_present: bool = False
+    actual_type: str | None = None
+    actual_truncated: bool = False
 
 
 class ResponseCapture(BaseModel):

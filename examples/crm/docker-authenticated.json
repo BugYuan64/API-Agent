@@ -1,0 +1,48 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8088",
+  "allowed_methods": ["GET"],
+  "path_templates": ["/api/customer/list", "/api/customer/{id}"],
+  "auth_ref": {"kind": "header", "header_name": "token", "env_var": "CRM_TEST_TOKEN"},
+  "max_requests": 3,
+  "requests": [
+    {
+      "id": "list-authenticated",
+      "method": "GET",
+      "path": "/api/customer/list",
+      "query": {"pageNum": "1", "pageSize": "2"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_exists", "pointer": "/data/list"},
+        {"kind": "json_exists", "pointer": "/data/total"},
+        {"kind": "json_exists", "pointer": "/data/list/0/id"},
+        {"kind": "json_exists", "pointer": "/data/list/0/name"},
+        {"kind": "json_equals", "pointer": "/data/list/0/status", "expected": "active"}
+      ]
+    },
+    {
+      "id": "list-search-keyword",
+      "method": "GET",
+      "path": "/api/customer/list",
+      "query": {"keyword": "华为", "pageNum": "1", "pageSize": "5"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_equals", "pointer": "/data/total", "expected": 1},
+        {"kind": "json_equals", "pointer": "/data/list/0/company", "expected": "华为技术有限公司"}
+      ]
+    },
+    {
+      "id": "detail-authenticated",
+      "method": "GET",
+      "path": "/api/customer/1",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_equals", "pointer": "/data/id", "expected": 1},
+        {"kind": "json_equals", "pointer": "/data/name", "expected": "李明"}
+      ]
+    }
+  ]
+}

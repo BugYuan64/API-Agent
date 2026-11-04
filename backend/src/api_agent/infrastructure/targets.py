@@ -4,6 +4,8 @@ import ipaddress
 import re
 from urllib.parse import SplitResult, urlsplit
 
+from api_agent.infrastructure.logging import is_sensitive_key
+
 HTTP_SCHEMES = frozenset({"http", "https"})
 STREAM_SCHEMES = HTTP_SCHEMES | frozenset({"ws", "wss"})
 HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -153,20 +155,14 @@ def redact_headers(headers: dict[str, str] | dict[str, list[str]]) -> dict:
 
     作用：控制台的即时响应仍然保留真实值（本机操作者当场核对），
     但持久化到 SQLite 的历史记录不应保存凭据与 Cookie。
-    实现：键名小写后命中敏感名单就整体替换；键名保持原样写回，
-    这样历史里看到的仍是目标/用户原本书写的头名，只有值被抹掉。
-    值列表保持列表形态（响应侧多值头不会退化成字符串）。
+    实现：键名判定统一交给 ``is_sensitive_key``（覆盖 ``token``、
+    ``X-Auth-Token``、``X-Access-Token`` 等写法），命中就整体替换；
+    键名保持原样写回，这样历史里看到的仍是用户/目标原本书写的头名。
+    值列表逐项替换并保持列表形态（响应侧多值头不会退化成字符串）。
     """
-    sensitive = {
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "x-api-key",
-        "api-key",
-        "x-auth-token",
-    }
     return {
-        name: "[redacted]" if name.lower() in sensitive else value
+        name: (["[redacted]"] * len(value) if isinstance(value, list) else "[redacted]")
+        if is_sensitive_key(name)
+        else value
         for name, value in headers.items()
     }

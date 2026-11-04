@@ -10,7 +10,12 @@ from api_agent.infrastructure.config import ConfigurationError, load_settings
 from api_agent.tools.client import call_tool
 
 
-async def execute(command: str, plan_path: Path | None, allowed_origins: list[str] | None) -> dict:
+async def execute(
+    command: str,
+    plan_path: Path | None,
+    allowed_origins: list[str] | None,
+    engine: str | None = None,
+) -> dict:
     """按子命令准备输入并通过 MCP 调用对应工具。
 
     作用：把 CLI 的三个命令（doctor/validate/run）映射到三个 MCP 工具，
@@ -22,7 +27,8 @@ async def execute(command: str, plan_path: Path | None, allowed_origins: list[st
     ② ``doctor`` 不需要载荷；其余命令要求计划文件存在且不超过 256KiB，
        读取时用 ``utf-8-sig`` 容忍 BOM；
        任何 OSError/JSON 解析错误都折叠成 ``invalid_plan_file``；
-    ③ 用字典把命令名映射到工具名后调用 ``call_tool``。
+    ③ ``--engine`` 透传给 MCP 工具，缺省由服务端选择默认驱动；
+    ④ 用字典把命令名映射到工具名后调用 ``call_tool``。
     """
     settings = load_settings(
         **({"target_allowed_origins": allowed_origins} if allowed_origins else {})
@@ -36,7 +42,7 @@ async def execute(command: str, plan_path: Path | None, allowed_origins: list[st
         except (OSError, ValueError):
             return {"status": "error", "error_kind": "invalid_plan_file"}
     names = {"doctor": "postman_status", "validate": "validate_plan", "run": "run_plan"}
-    return await call_tool(settings, names[command], payload)
+    return await call_tool(settings, names[command], payload, engine)
 
 
 def exit_code(result: dict) -> int:
@@ -60,29 +66,40 @@ def exit_code(result: dict) -> int:
 def main() -> None:
     """CLI 入口：解析参数、执行、输出 JSON、设置退出码。
 
-    实现：argparse 定义全局 ``--allow-origin``（可重复）与三个子命令
-    （doctor / validate <plan> / run <plan>）；执行过程按异常分层兜底——
+    实现：argparse 定义全局 ``--allow-origin``（可重复）、``--engine``
+    与三个子命令（doctor / validate <plan> / run <plan>）；执行过程按异常分层兜底——
     ``KeyboardInterrupt`` → cancelled，``ConfigurationError`` → invalid_configuration，
     其它异常统一 → mcp_connection_error（不打印堆栈，避免泄露宿主细节）；
     结果始终以单行 JSON 打印到标准输出，最后用 ``exit_code`` 决定退出状态。
     """
     parser = argparse.ArgumentParser(
-        description="Run controlled API tests via local MCP and Postman CLI"
+        description="Run controlled API tests via local MCP with pluggable engines"
     )
     parser.add_argument(
         "--allow-origin",
         action="append",
         help="Explicit local origin permission for this invocation",
     )
+    parser.add_argument(
+        "--engine",
+        choices=["native", "postman"],
+        default=None,
+        help="Execution engine: native in-memory HTTPX or Postman CLI sandbox",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("doctor", help="Check CLI availability over MCP")
+    commands.add_parser("doctor", help="Check engine availability over MCP")
     for name in ("validate", "run"):
         command = commands.add_parser(name)
         command.add_argument("plan", type=Path)
     arguments = parser.parse_args()
     try:
         result = asyncio.run(
-            execute(arguments.command, getattr(arguments, "plan", None), arguments.allow_origin)
+            execute(
+                arguments.command,
+                getattr(arguments, "plan", None),
+                arguments.allow_origin,
+                arguments.engine,
+            )
         )
     except KeyboardInterrupt:
         result = {"status": "cancelled", "error_kind": "cancelled"}

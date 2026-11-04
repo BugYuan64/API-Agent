@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft, CircleStop, RefreshCw } from 'lucide-vue-next'
 import EmptyState from '@/components/EmptyState.vue'
@@ -18,6 +18,7 @@ import {
   formatDateTime,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
+import { usePolling } from '@/composables/usePolling'
 
 const route = useRoute()
 const router = useRouter()
@@ -30,12 +31,6 @@ const attempts = ref<DispatchAttempt[]>([])
 const loading = ref(false)
 const loadError = ref<string | null>(null)
 const tab = ref<'timeline' | 'budget' | 'attempts'>('timeline')
-
-let timer: number | undefined
-
-const isActive = computed(
-  () => !!run.value && ['queued', 'running', 'cancelling'].includes(run.value.status),
-)
 
 /** 预算聚合：账本是 append-only 的，这里按资源汇总成可读余额。 */
 const budgetSummary = computed(() => {
@@ -50,28 +45,50 @@ const budgetSummary = computed(() => {
   return [...byResource.entries()].map(([resource, value]) => ({ resource, ...value }))
 })
 
-async function load() {
-  if (!runId.value) return
-  loading.value = true
-  loadError.value = null
-  try {
-    run.value = await getRun(runId.value)
-    const [eventPage, budgetRows, attemptRows] = await Promise.all([
-      listRunEvents(runId.value),
-      listRunBudget(runId.value),
-      listRunAttempts(runId.value),
+const polling = usePolling({
+  fetch: async signal => {
+    // Capture identity once: navigation cannot mix A's summary with B's evidence.
+    const id = runId.value
+    const [current, eventPage, budgetRows, attemptRows] = await Promise.all([
+      getRun(id, signal),
+      listRunEvents(id, 200, 0, signal),
+      listRunBudget(id, signal),
+      listRunAttempts(id, signal),
     ])
+    return { current, eventPage, budgetRows, attemptRows }
+  },
+  onResult: ({ current, eventPage, budgetRows, attemptRows }) => {
+    run.value = current
     events.value = eventPage.items
     budget.value = budgetRows
     attempts.value = attemptRows
-  } catch (error) {
-    loadError.value = describeError(error)
-  } finally {
     loading.value = false
-  }
-  window.clearTimeout(timer)
-  if (isActive.value) timer = window.setTimeout(load, 1500)
+    loadError.value = null
+  },
+  onError: error => {
+    loading.value = false
+    loadError.value = describeError(error)
+    polling.stop()
+  },
+  isTerminal: ({ current }) => !['queued', 'running', 'cancelling'].includes(current.status),
+  intervalMs: 1500,
+})
+
+function load() {
+  if (!runId.value) return
+  loading.value = true
+  loadError.value = null
+  polling.start()
 }
+
+watch(runId, () => {
+  polling.stop()
+  run.value = null
+  events.value = []
+  budget.value = []
+  attempts.value = []
+  load()
+})
 
 async function cancel() {
   if (!run.value) return
@@ -92,7 +109,6 @@ function eventTone(status: string) {
 }
 
 onMounted(load)
-onBeforeUnmount(() => window.clearTimeout(timer))
 </script>
 
 <template>
