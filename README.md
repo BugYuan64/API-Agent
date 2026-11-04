@@ -283,6 +283,7 @@ backend/
     llm/                         # 设置、客户端传输、response 供应方解析、errors 统一异常
     agent/                       # AI 闭环：契约生成、证据诊断、自适应补测、Markdown 报告
     tools/                       # MCP服务与独立客户端
+    static/                      # 离线 Swagger UI 资源（js/css/图标）与上游 LICENSE/NOTICE
   tests/                         # 模块测试、agent 闭环与真实 MCP/CLI 集成验证
 frontend/
   package.json, vite.config.ts, tsconfig.json
