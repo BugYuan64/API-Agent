@@ -10,7 +10,9 @@ from api_agent.execution.schemas import (
     ResponseCapture,
     RunResult,
     empty_result,
+    unevaluated_assertions,
 )
+from api_agent.infrastructure.outcomes import outcome_for
 
 # 单条响应体最多保留的字符数；超出部分截断并置 body_truncated，
 # 避免一个超大响应把整份结果撑到不可用。
@@ -121,12 +123,13 @@ def normalize_report(
        且不得重复——出现未知或重复条目就整体判为无效报告，
        因为无法再保证“结果与计划一一对应”；
     ③ 统计 observed/unknown，使上层能看出有多少请求根本没有回音；
-    ④ 按计划顺序遍历用例：缺条目保持 unknown；有 ``requestError`` 记为 request_error；
+    ④ 按计划顺序遍历用例：缺条目保持 unknown；明确请求超时记为 timed_out，
+       其他 ``requestError`` 记为 request_error，传输异常说明只使用固定文本；
        状态码必须是 100..599 的真实 int；耗时必须是有限非负数才采信；
        断言数组长度必须与计划完全一致，且每条断言名要对上 ``a{下标}_{类型}``、
        不能被标记 skipped，否则判为 invalid_assertions；
-    ⑤ 最后按优先级定总体状态：存在 unknown/error → 报告不完整；
-       有用例 failed → 整体 failed；CLI 退出码非 0 或报告里有 error/failures → cli_error；
+    ⑤ 最后按优先级定总体状态：存在 unknown → 报告不完整；已知 error 保留其错误码；
+       请求 timed_out 优先于 failed；CLI 退出码非 0 或报告里有 error/failures → cli_error；
        全部通过才置 passed。
 
     ``capture=False`` 时不读取响应头与响应体，但仍在每条结果上挂一个
@@ -150,16 +153,21 @@ def normalize_report(
     result.unknown_requests = len(expected) - len(observed)
     executions = []
     for case in plan.requests:
-        item = CaseResult(id=case.id)
+        item = CaseResult(id=case.id, assertions=unevaluated_assertions(case))
         executions.append(item)
         entry = observed.get(case.id)
         if entry is None:
             continue
         response = entry.get("response")
         if entry.get("requestError") or not isinstance(response, dict):
-            item.status, item.error_kind = "error", "request_error"
+            request_error = entry.get("requestError")
+            error_code = request_error.get("code") if isinstance(request_error, dict) else None
+            if isinstance(error_code, str) and error_code in {"ETIMEDOUT", "ESOCKETTIMEDOUT"}:
+                item.status, item.error_kind = "timed_out", "request_timeout"
+            else:
+                item.status, item.error_kind = "error", "request_error"
             item.response = (
-                ResponseCapture(body=_error_text(entry.get("requestError")))
+                ResponseCapture(body=outcome_for(item.status, item.error_kind).message)
                 if capture
                 else ResponseCapture(omitted=True)
             )
@@ -179,6 +187,7 @@ def normalize_report(
             item.status, item.error_kind = "error", "missing_assertions"
             continue
         valid = True
+        item.assertions = []
         for index, (actual, wanted) in enumerate(zip(assertions, case.assertions, strict=True)):
             if (
                 not isinstance(actual, dict)
@@ -192,6 +201,7 @@ def normalize_report(
                 AssertionResult(
                     index=index,
                     kind=wanted.kind,
+                    pointer=wanted.pointer,
                     passed=passed,
                     message=_assertion_message(actual) if capture and not passed else None,
                 )
@@ -201,8 +211,12 @@ def normalize_report(
         else:
             item.status = "passed" if all(a.passed for a in item.assertions) else "failed"
     result.executions = executions
-    if any(item.status in {"unknown", "error"} for item in executions):
+    if any(item.status == "unknown" for item in executions):
         result.error_kind = "incomplete_or_error_report"
+    elif any(item.status == "error" for item in executions):
+        result.error_kind = next(item.error_kind for item in executions if item.status == "error")
+    elif any(item.status == "timed_out" for item in executions):
+        result.status, result.error_kind = "timed_out", "request_timeout"
     elif any(item.status == "failed" for item in executions):
         result.status, result.error_kind = "failed", None
     elif exit_code != 0 or run.get("error") or run.get("failures"):
@@ -221,15 +235,6 @@ def _assertion_message(actual: dict) -> str | None:
     error = actual.get("error")
     if isinstance(error, dict):
         message = error.get("message")
-        if isinstance(message, str) and message:
-            return message
-    return None
-
-
-def _error_text(raw) -> str | None:
-    """取出请求级错误（连接失败、超时等）的可读说明。"""
-    if isinstance(raw, dict):
-        message = raw.get("message")
         if isinstance(message, str) and message:
             return message
     return None

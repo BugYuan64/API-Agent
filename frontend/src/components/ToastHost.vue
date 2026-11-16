@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 全局提示宿主：依赖共享 toast store 和语义图标，显示队列并允许用户关闭。提示内容和保留时间由 store 与调用方决定，不更改业务结果。 */
+
 import { computed } from 'vue'
 import { CheckCircle2, Info, TriangleAlert, X, XCircle } from 'lucide-vue-next'
 import { useToastStore } from '@/stores/toasts'
@@ -8,6 +10,7 @@ const toastStore = useToastStore()
 /** 每种语义色对应一个图标，形状本身也传达含义（不只靠颜色）。 */
 const icons = { success: CheckCircle2, danger: XCircle, warning: TriangleAlert, info: Info }
 
+/** 读取 store 的响应式提示队列用于展示；过期和关闭操作仍由 store 维护。 */
 const items = computed(() => toastStore.items)
 </script>
 

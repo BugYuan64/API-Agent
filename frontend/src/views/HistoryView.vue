@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 历史聚合页：依赖 HTTP、长连接及执行列表 API，并行读取三类已存证据。部分来源失败仍显示其余结果；删除操作仅作用于 HTTP 历史。 */
+
 import { computed, onMounted, ref } from 'vue'
 import { ChevronRight, History, Inbox, Radio, Trash2 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
@@ -13,15 +15,14 @@ import {
 } from '@/api/endpoints'
 import type { ConsoleHistory, Execution, StreamHistory } from '@/api/types'
 import {
-  describeExecutionStatus,
   describeStopReason,
   formatBytes,
   formatDateTime,
   formatDuration,
   prettyJson,
-  statusTone,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
+import { presentResult, resultCodeLabel } from '@/lib/results'
 
 /** 请求历史：把三类证据（HTTP 请求、长连接会话、计划执行）放在同一页，
  *  因为它们回答的是同一个问题——“我做过什么，结果如何”。 */
@@ -32,8 +33,10 @@ const executionItems = ref<Execution[]>([])
 const loading = ref(false)
 const selectedHttp = ref<ConsoleHistory | null>(null)
 
-const activeTone = computed(() => (selectedHttp.value ? statusTone(selectedHttp.value.status_code) : 'neutral'))
+/** 根据选中 HTTP 历史的状态码计算色调；未选择时使用 neutral。 */
+const activeTone = computed(() => (selectedHttp.value ? presentResult(selectedHttp.value, selectedHttp.value.status_code).tone : 'neutral'))
 
+/** 并行读取三类历史，成功来源独立显示，失败来源置空并汇总一条提示；始终解除 loading。 */
 async function load() {
   loading.value = true
   try {
@@ -54,6 +57,7 @@ async function load() {
   }
 }
 
+/** 删除指定 HTTP 历史并同步列表和当前选中项；其他历史来源不受影响，失败提示。 */
 async function removeRecord(record: ConsoleHistory) {
   try {
     await deleteConsoleHistory(record.id)
@@ -64,6 +68,7 @@ async function removeRecord(record: ConsoleHistory) {
   }
 }
 
+/** 清空服务端 HTTP 历史并重置本页 HTTP 选择；长连接和执行记录由各自来源保留，失败提示。 */
 async function clearAll() {
   try {
     await clearConsoleHistory()
@@ -129,8 +134,8 @@ onMounted(load)
           <div class="row-main">
             <div class="row-top">
               <span class="method" :class="`method-${record.method.toLowerCase()}`">{{ record.method }}</span>
-              <span class="row-status" :class="`tone-${statusTone(record.status_code)}`">
-                {{ record.ok ? record.status_code : record.error_kind }}
+              <span class="row-status" :class="`tone-${presentResult(record, record.status_code).tone}`">
+                {{ record.ok ? record.status_code : presentResult(record).title }}
               </span>
               <span class="row-time">{{ formatDuration(record.elapsed_ms) }}</span>
               <span class="row-fill" />
@@ -156,7 +161,7 @@ onMounted(load)
                 {{ selectedHttp.method }}
               </span>
               <span class="tag" :class="`tag-${activeTone === 'neutral' ? '' : activeTone}`">
-                {{ selectedHttp.ok ? selectedHttp.status_code : selectedHttp.error_kind }}
+                {{ selectedHttp.ok ? selectedHttp.status_code : presentResult(selectedHttp).title }}
               </span>
               <span class="tag">{{ formatDuration(selectedHttp.elapsed_ms) }}</span>
               <span class="tag">{{ formatBytes(selectedHttp.response_bytes) }}</span>
@@ -173,9 +178,12 @@ onMounted(load)
             <div class="hint">{{ formatDateTime(selectedHttp.created_at) }}</div>
           </div>
 
-          <div v-if="selectedHttp.error_message" class="detail-error">
-            <strong>{{ selectedHttp.error_kind }}</strong>
-            <span>{{ selectedHttp.error_message }}</span>
+          <div v-if="!selectedHttp.ok" class="detail-error">
+            <strong>
+              {{ presentResult(selectedHttp).title }}<template v-if="resultCodeLabel(presentResult(selectedHttp).resultStatus)"> · {{ resultCodeLabel(presentResult(selectedHttp).resultStatus) }}</template>
+              <template v-if="selectedHttp.error_kind"> · <code>{{ selectedHttp.error_kind }}</code></template>
+            </strong>
+            <span>{{ presentResult(selectedHttp).message }}</span>
           </div>
 
           <div class="detail-section">
@@ -275,13 +283,13 @@ onMounted(load)
           <tr v-for="item in executionItems" :key="item.id">
             <td>{{ item.label || '(未命名)' }}</td>
             <td>
-              <span class="tag" :class="`tag-${item.status === 'passed' ? 'success' : item.status === 'failed' ? 'warning' : 'danger'}`">
-                {{ describeExecutionStatus(item.status) }}
+              <span class="tag" :class="`tag-${presentResult(item).tone}`" :title="presentResult(item).message">
+                {{ presentResult(item).title }}
               </span>
             </td>
             <td class="mono">{{ item.observed_attempts }}/{{ item.reserved_requests }}</td>
             <td class="mono hint">{{ formatDuration(item.duration_ms) }}</td>
-            <td class="mono hint">{{ item.error_kind ?? '—' }}</td>
+            <td class="mono hint">{{ item.result_code ?? item.error_kind ?? '—' }}</td>
             <td class="hint">{{ formatDateTime(item.created_at) }}</td>
           </tr>
         </tbody>

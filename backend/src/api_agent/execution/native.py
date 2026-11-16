@@ -15,6 +15,7 @@ from api_agent.execution.schemas import (
     ExecutionPlan,
     ResponseCapture,
     RunResult,
+    unevaluated_assertions,
 )
 from api_agent.infrastructure.http import (
     MAX_BODY_CHARS,
@@ -25,6 +26,7 @@ from api_agent.infrastructure.http import (
     group_headers,
 )
 from api_agent.infrastructure.json_pointer import resolve as evaluate_pointer
+from api_agent.infrastructure.outcomes import transport_error_kind
 from api_agent.infrastructure.privacy import Context
 
 # 哨兵：区分“断言没有可记录的观察值”与“观察值就是 None”。
@@ -34,9 +36,9 @@ _ABSENT = object()
 class NativeHttpEngine:
     """纯 Python 原生执行驱动引擎。
 
-    优势：
-    1. 纯内存极速执行，无需外部可执行文件（Node/Postman CLI），启动与执行耗时降至毫秒级；
-    2. 无外部依赖，开箱即用，天然跨平台（Windows / Linux / macOS）；
+    边界：
+    1. 计划和结果在内存中处理，不需要 Node/Postman CLI 可执行文件；
+    2. 网络访问依赖项目中的 httpx；实际耗时由目标、网络和超时配置决定；
     3. 支持完整的 5 种受控断言类型：status、content_type、response_time、
        json_equals、json_exists。
     """
@@ -44,6 +46,7 @@ class NativeHttpEngine:
     name = "native"
 
     def __init__(self, omit_response_payload: bool = False, max_response_bytes: int = 2_097_152):
+        """保存捕获开关与响应字节预算；每次 run 自行创建并关闭 HTTP 客户端。"""
         self.omit_response_payload = omit_response_payload
         self.max_response_bytes = max_response_bytes
 
@@ -80,7 +83,11 @@ class NativeHttpEngine:
             finished_ids = {r.id for r in results}
             for case in plan.requests:
                 if case.id not in finished_ids:
-                    results.append(CaseResult(id=case.id, status="unknown"))
+                    results.append(
+                        CaseResult(
+                            id=case.id, status="unknown", assertions=unevaluated_assertions(case)
+                        )
+                    )
             return RunResult(
                 status="timed_out",
                 error_kind="execution_timeout",
@@ -96,7 +103,11 @@ class NativeHttpEngine:
             finished_ids = {r.id for r in results}
             for case in plan.requests:
                 if case.id not in finished_ids:
-                    results.append(CaseResult(id=case.id, status="unknown"))
+                    results.append(
+                        CaseResult(
+                            id=case.id, status="unknown", assertions=unevaluated_assertions(case)
+                        )
+                    )
             return RunResult(
                 status="cancelled",
                 error_kind="cancelled",
@@ -110,11 +121,17 @@ class NativeHttpEngine:
 
         duration = round((time.monotonic() - started) * 1000, 2)
         has_error = any(r.status == "error" for r in results)
+        has_timeout = any(r.status == "timed_out" for r in results)
         has_failed = any(r.status == "failed" for r in results)
 
         if has_error:
             overall_status = "error"
-            error_kind = next((r.error_kind for r in results if r.error_kind), "request_error")
+            error_kind = next(
+                (r.error_kind for r in results if r.status == "error"), "request_error"
+            )
+        elif has_timeout:
+            overall_status = "timed_out"
+            error_kind = "request_timeout"
         elif has_failed:
             overall_status = "failed"
             error_kind = None
@@ -155,48 +172,41 @@ class NativeHttpEngine:
         case_start = time.monotonic()
         try:
             request = client.build_request(case.method, url, headers=headers, content=content)
-            response = await bounded_send(client, request, self.max_response_bytes)
+            # HTTPX 的读超时按片段重置；额外限制整次请求至完整正文的挂钟耗时。
+            async with asyncio.timeout(plan.request_timeout_ms / 1000):
+                response = await bounded_send(client, request, self.max_response_bytes)
             elapsed_ms = round((time.monotonic() - case_start) * 1000, 2)
         except (ResponseLimitError, ResponseEncodingError) as error:
             return CaseResult(
                 id=case.id,
                 status="error",
-                error_kind=str(error),
+                error_kind=(
+                    "response_limit_exceeded"
+                    if isinstance(error, ResponseLimitError)
+                    else "response_encoding_not_supported"
+                    if str(error) == "response_encoding_not_supported"
+                    else "response_decode_error"
+                ),
                 response_time_ms=round((time.monotonic() - case_start) * 1000, 2),
-                assertions=[
-                    AssertionResult(
-                        index=i,
-                        kind=a.kind,
-                        pointer=a.pointer,
-                        passed=None,
-                        message="Response could not be evaluated",
-                    )
-                    for i, a in enumerate(case.assertions)
-                ],
+                assertions=unevaluated_assertions(case),
             )
-        except httpx.TimeoutException:
+        except (TimeoutError, httpx.TimeoutException):
             elapsed_ms = round((time.monotonic() - case_start) * 1000, 2)
             return CaseResult(
                 id=case.id,
-                status="error",
+                status="timed_out",
                 error_kind="request_timeout",
                 response_time_ms=elapsed_ms,
-                assertions=[
-                    AssertionResult(index=i, kind=a.kind, passed=False, message="Request timed out")
-                    for i, a in enumerate(case.assertions)
-                ],
+                assertions=unevaluated_assertions(case),
             )
-        except httpx.HTTPError as error:
+        except (httpx.HTTPError, OSError) as error:
             elapsed_ms = round((time.monotonic() - case_start) * 1000, 2)
             return CaseResult(
                 id=case.id,
                 status="error",
-                error_kind="request_failed",
+                error_kind=transport_error_kind(error),
                 response_time_ms=elapsed_ms,
-                assertions=[
-                    AssertionResult(index=i, kind=a.kind, passed=False, message=str(error)[:150])
-                    for i, a in enumerate(case.assertions)
-                ],
+                assertions=unevaluated_assertions(case),
             )
 
         # 尝试解析 JSON 响应体用于 JSON 断言

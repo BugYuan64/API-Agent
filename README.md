@@ -6,7 +6,7 @@
 
 > 2026-11-03（审核修复）：按第二轮审核修复 **R01–R13 共 13 项问题**（不可回退约束见[开发实施契约](开发实施契约.md)第 20 节），包括 JSON 断言类型严格性（`true` 不再等于 `1`）、跨源不复用已存密钥、历史记录统一脱敏（含 `token` 头、请求体密码、响应 JWT）、流式响应字节预算、执行计划冻结与按 ID 诊断、流事件共享预算与取消一致性。后端 **304 项测试通过**，Ruff 与前端构建通过。CRM 有效身份业务链、真实 SSE 问答与真实模型调用仍未验收。
 
-> 2026-11-03（界面统一）：`/request`、`/testcases`、`/long-connection` 三个测试页统一为「左历史 + 右功能区」，共用 `TestWorkspace` 与唯一的 `HistoryList`；用例测试的手动/自动模式**共用同一份历史**（合并按时间倒序，标题固定为「测试历史」），切换模式只替换右侧内容。分隔边界支持长按拖动、最小阈值与独立持久化。修复设置页因根容器 `display:flex; height:100%` 导致的纵向滚动失效（API Key、模型列表、退出按钮曾落在视口外不可操作）。设置页每个引擎右上角新增配置入口，详情改为通用弹窗（`AppModal`，支持 Esc/遮罩关闭与锁定背景滚动，保存按钮为预留）；模型字段统一为单一输入点；密钥可见性与模型选择补上右下角提示。前端 `vue-tsc` 0 错误、44 项行为回归通过。
+> 2026-11-03 的双模式界面说明属于历史设计。2026-11-16 当前页面分为接口管理（HTTP/SSE 接口测试、WebSocket 长连接调试）与任务测试（文档驱动用例测试）。
 
 > 2026-11-02（AI 编排）：新增独立 `agent` 业务模块，实现契约生成、证据诊断、预算内单因素补测和 Markdown 报告。通过 `POST /api/agent/runs` 后台运行，支持取消、重启中断恢复与部分报告。真实兼容模型已完成两轮 7 请求、5 次模型调用联调；测试目标是自建无状态接口，不代表实际业务系统验收。使用方法见 [AI 编排说明](docs/ai-agent.md)。
 
@@ -18,43 +18,61 @@
 
 > 2026-10-29：阶段 1 管理后端与 Postman 执行基座已实现。独立命令通过本地 MCP 调用真实 Postman CLI；CRM 阶段 2 的 8 项参数/鉴权场景、16 条断言已实测通过。模型生成、诊断、自适应补测、动态短链尚未实现。
 
-本项目是专用于 API 测试的课程设计。目标流程为接口契约 → 用例生成 → 工具执行 → 异常事实与诊断 → 有预算的补测 → 报告。运行时由 API-Agent 自己编排，不依赖 Codex。
+本项目是专用于 API 测试的课程设计。目标流程为接口契约 → 用例生成 → 工具执行 → 异常事实与诊断 → 报告。运行时由 API-Agent 自己编排，不依赖 Codex。
+
+当前界面将单接口验证放在 `/request`（普通 HTTP 与 SSE），WebSocket 双向调试放在 `/long-connection`，文档驱动的自动化任务放在 `/testcases`。侧边栏“接口管理”仅含接口测试和长连接测试，“任务测试”包含自动文档识别、用例生成与执行。标准 OpenAPI/Swagger JSON、YAML 可本地解析；非标准 UTF-8 文本使用已配置的大模型提取接口和文档用例。任务逐项复用 HTTP/SSE 与 WebSocket 执行类，默认跳过写请求与 WebSocket 主动发送，需用户显式授权；报告提供 Markdown 下载。内置生成器不集成 Schemathesis/RESTler，也不宣称具备完整 property-based 或状态化序列生成能力。
 
 独立 CLI/MCP 继续提供确定性执行，新增 `/api/agent` 提供独立的大模型闭环编排，不依赖 Codex 运行。“轻量”指工具与上下文只围绕 API 测试；尚未与 Codex 比较速度、token 或成本。设计见[项目最终架构](项目最终架构.md)第 14～16 节（MCP 执行基座、控制台与长连接、AI 业务编排），跨模块约定见[开发实施契约](开发实施契约.md)，进度与证据见[阶段步骤实现](阶段步骤实现.md)，设计与调整依据见[项目最终架构](项目最终架构.md)。
 
 ## 实际能力
 
+结果接口追加 `result_code`（稳定分类）与 `result_status`（本项目语义码）。目标实际 HTTP 仍在 `response.status` / `http_status`，不会用超时结果覆盖它。主要分类如下：
+
+| 场景 | 结果分类 / 语义码 | 行为 |
+| --- | --- | --- |
+| 目标请求超时 / 整体执行超时 | `REQUEST_TIMEOUT` / `EXECUTION_TIMEOUT`，504 | 保留已完成证据；未取得完整响应的断言显示“未评估” |
+| 模型超时 / 输出不可用 / 供应方鉴权失败 | `MODEL_TIMEOUT` 504 / `MODEL_ERROR` 502 / `MODEL_AUTH_FAILED` 502 | 与目标请求错误分开显示 |
+| 断言失败 | `ASSERTION_FAILED`，422 | 展示实际响应与期望差异 |
+| 连接 / TLS / 解码失败 | `CONNECTION_FAILED` / `TLS_ERROR` / `RESPONSE_ENCODING_ERROR`，502 | 使用固定安全说明，不回显传输异常原文 |
+| 响应超过大小限制 | `RESPONSE_LIMIT_EXCEEDED`，413 | 中止读取，不将不完整响应判为通过 |
+| 取消 / 未知 / 进程中断 | `CANCELLED` / `UNKNOWN_RESULT` / `INTERRUPTED`，无数字码 | 保留已有证据，不暗示目标操作已撤销 |
+| 流程完成 | `COMPLETED`，200 | 仅表示流程结束，测试结论仍以逐项断言为准 |
+
+`POST /api/console/requests` 的目标传输失败会在保存历史后返回 HTTP 504、502 或 413，并携带完整结果信封；确实收到目标 HTTP 4xx/5xx 时，管理接口返回 200，目标状态原样放在响应字段中。计划执行和运行查询的管理 HTTP 状态表示管理操作结果，测试分类看上述字段。页面等待 API-Agent 超时另显示 `BROWSER_TIMEOUT`，后端可能仍在运行，请先查询历史再决定是否重试。
+
+文档任务页保持左侧任务历史和右侧工作区；输入/结果分栏独立保存尺寸偏好。
+
 | 能力 | 当前状态 |
 | --- | --- |
-| 项目/环境追加版本、SQLite 迁移、模拟任务创建/取消/恢复 | 已实现；`/api` 管理 API |
+| 项目/环境追加版本、SQLite 迁移 | 已实现；`/api` 管理 API |
 | 独立测试命令、本地 stdio MCP | 已实现；`doctor`、`validate`、`run`（均支持 `--engine`） |
 | **执行驱动适配器（Driver / Adapter Pattern）** | **已实现可切换双引擎**；测试内容（`ExecutionPlan`）与执行技术解耦，`native` 与 `postman` 并列注册 |
 | **原生 `native` 引擎（纯 Python / httpx）** | **已实现**；零外部依赖、毫秒级、跨平台，覆盖全部 5 类受控断言 |
 | **Postman CLI `postman` 引擎（沙箱）** | **已实现**；受控 Collection v2.1 编译、隔离工作区、Windows Job Object 进程树管控、Newman 报告归一化 |
 | 结构化计划 → Postman Collection v2.1 → JSON reporter | 已实现；只接受本项目受控编译的集合 |
 | 目标限制、JSON 断言、预算上限、超时/取消、脱敏结果 | 已实现；只支持明确授权的数字回环 origin |
-| **Vue 3 + TS 控制台（接口调试 / 用例计划 / 长连接 / 项目环境 / 任务 / 历史 / 设置）** | **已实现**；Vite 构建产物由 FastAPI 同源托管 |
+| **Vue 3 + TS 控制台（接口管理 / 任务测试 / 项目 / 历史 / 设置）** | **已实现**；Vite 构建产物由 FastAPI 同源托管 |
 | **大模型配置：API Key 写入/覆盖/清空 + 在线拉取模型列表** | **已实现**；`PUT /api/settings/llm`、`POST /api/settings/llm/models` |
 | **系统设置页测试引擎选择器（本地原生 / Postman CLI / 导入入口）** | **已实现**；卡片式选择、实时就绪状态、选择同步到用例计划页 |
 | **MCP 服务详情（postmanmcp 工具清单与客户端接入配置）** | **已实现**；随引擎选择器一同展示 |
-| **HTTP 手动请求控制台 + 脱敏历史** | **已实现**；`/api/console/requests` + `/api/console/history` |
-| **SSE 长连接测试** | **已实现**；逐事件记录、握手状态、字节/事件上限、主动停止、历史回放 |
-| **WebSocket 长连接测试** | **已实现**；握手、子协议协商、逐帧收发、关闭码、预置消息调度、主动停止 |
-| **计划执行的界面入口 + 引擎选择 + 逐断言历史** | **已实现**；`POST /api/executions` 接受 `engine`，`GET /api/executions/engine/list` 供界面渲染选择器 |
+| **HTTP 手动请求控制台 + 脱敏历史** | **已实现**；`/api/console/requests` + `GET/DELETE /api/console/history` |
+| **HTTP/SSE 接口测试** | **已实现**；接口调试页支持受限 SSE 事件观察，用例任务支持 SSE 断言 |
+| **WebSocket 长连接调试** | **已实现**；长连接页仅调试 WebSocket，支持握手、子协议、逐帧双向收发、关闭码、预置消息、历史回放；SSE 在接口测试或用例测试中执行 |
+| **计划执行 API + 引擎选择 + 逐断言历史** | **已实现**；`POST /api/executions` 接受 `engine`，供 CLI/MCP 与已有消费者使用 |
+| **三类历史统一删除** | **已实现**；console / streams / executions / agent 各自提供单条删除，前端由共享 `HistoryList` 的可选回调启用 |
 | CRM 阶段 2 参数校验与未登录拦截 | 已完成 8 请求/16 断言实测 |
 | 有效身份下的业务 CRUD、数据库验证 | Docker 鉴权只读分页/搜索/详情已验证；写入、软删除及数据库后验仍未验收 |
 | 契约/接口描述 → AI 用例生成 | 已实现；生成受控 `ExecutionPlan` 与期望依据，通过本地范围校验 |
 | 断言结果 → AI 诊断与自适应补测 | 已实现；证据引用校验、预算/单因素/去重/写操作重放约束 |
 | 后台 AI 闭环与 Markdown 诊断报告 | 已实现；`/api/agent/runs`，取消、重启中断、部分报告与脱敏 JSON 快照 |
-| **前端用例测试页（`/testcases` 双模式）** | **已实现**；顶部胶囊切换手动（`/testcases?mode=manual`）与自动（`/testcases?mode=auto`），旧路由 `/plan` 与 `/agent` 自动重定向 |
-| **手动模式的 AI 分析按钮** | **已实现**；显式触发 `POST /api/agent/executions/{id}/diagnose`，计划与结果取自该次执行的冻结记录，多传计划直接 422；旧记录返回 409 要求重新执行 |
+| **文档驱动用例任务（`/testcases`）** | **已实现**；单一自动流程：上传并识别 OpenAPI/Swagger 或非标准文本，保留原有用例、由内置生成器补充用例，复用 HTTP/SSE 与 WebSocket 执行类，持久化结果并生成 AI 总结和 Markdown 导出；当前不集成 Schemathesis/RESTler |
 | **执行计划溯源与断言证据结构** | **已实现**；`executions.plan` / `plan_sha256` 冻结脱敏计划，断言结果携带 `pointer`/`actual`/`actual_type` |
 | **历史记录统一脱敏** | **已实现**；写入/启动迁移/读取三处共用 `infrastructure/history.py`，覆盖 `token` 头、请求体密码与响应 JWT |
 | 完整确定性 OpenAPI IR、业务链/数据库验证、动态短链 | 后续阶段；当前直接将契约对象交模型理解，不请求外部 `$ref` |
 
-管理端的 `/api/runs` 仍只执行模拟动作。真实 AI 测试通过 `/api/agent/runs`，手工计划通过 `/api/executions` 或独立 CLI/MCP 执行；各自的记录明确分离。AI 能力同时提供 REST 与前端「用例测试」（`/testcases`）页面：顶部胶囊式切换按钮（手动 / 自动），手动模式保持纯确定性执行并提供显式「AI 分析」按钮，自动模式支持输入契约与授权范围、实时轮询展示预算与事件时间线，并可预览 Markdown 报告。
+既有 AI 闭环通过 `/api/agent/runs`，确定性计划仍通过 `/api/executions` 或独立 CLI/MCP 执行。文档任务使用 `/api/tasks/recognize`、`POST /api/tasks`、详情/取消/报告接口；本地标准文档识别无需 LLM，非标准文档识别与任务总结需模型服务可用。单接口页面的 SSE 请求通过 HTTP 响应呈现，事件观察使用字节、事件数与时间上限。
 
-**2026-11-01 新增的界面层**：Vue 3 + TypeScript + Vite 控制台，配色取自 magpie 的克制浅色体系（近白底 + 墨黑主色 + 单一紫色强调），布局参考 apifox（左侧栏 + 顶栏 + 左历史/右工作台三段式）。包含八类视图功能：接口调试、用例测试（手动/自动双模式）、长连接测试、项目与环境、模拟任务、请求历史、执行结果、系统设置（含大模型配置与测试引擎选择器）。构建产物由 FastAPI 同源挂载（`/assets` 静态资源 + history 模式 SPA 回退），无需单独启动前端进程即可使用。
+**前端控制台**：Vue 3 + TypeScript + Vite，侧边栏分为接口管理、任务测试、项目、记录和设置；SSE 在接口测试或文档用例测试中执行，长连接页仅调试 WebSocket。Iconify 图标数据本地打包，不请求远端图标服务。
 
 ## 组成与数据流
 
@@ -183,7 +201,7 @@ uv run --project backend --locked api-agent-mcp
 uv run --project backend --locked uvicorn api_agent.main:create_app --factory --host 127.0.0.1 --port 8010 --no-access-log
 ```
 
-使用 8010 避免与 CRM RAG 默认的 8000 冲突。提供 `/health`、`/docs` 和 `/api` 下的项目、环境、模拟任务与事件/预算查询。单进程运行；启动会迁移 SQLite 并恢复任务状态。健康检查成功仅表示管理端可用。
+使用 8010 避免与 CRM RAG 默认的 8000 冲突。提供 `/health`、`/docs` 和 `/api` 下的项目、环境、控制台请求、计划执行、长连接与大模型编排接口。单进程运行；启动会迁移 SQLite 并恢复长连接会话与中断的编排运行。健康检查成功仅表示管理端可用。
 
 ## 前端控制台
 
@@ -202,9 +220,9 @@ cd ..
 uv run --project backend --locked uvicorn api_agent.main:create_app --factory --host 127.0.0.1 --port 8010 --no-access-log
 
 # 3) 浏览器打开
-#    http://127.0.0.1:8010/                → 接口调试
-#    http://127.0.0.1:8010/long-connection → 长连接测试
-#    http://127.0.0.1:8010/testcases       → 用例测试（手动/自动双模式）
+#    http://127.0.0.1:8010/                → 接口测试
+#    http://127.0.0.1:8010/long-connection → WebSocket 调试
+#    http://127.0.0.1:8010/testcases       → 文档驱动用例测试
 ```
 
 ### 开发模式（可选）
@@ -221,23 +239,20 @@ npm run dev   # vite dev server，端口 5180，/api 与 /health 代理到 8010
 | 页面 | 路径 | 调用的管理接口 |
 | --- | --- | --- |
 | 接口调试 | `/request` | `POST /api/console/requests`、`GET/DELETE /api/console/history` |
-| 用例计划 | `/testcases?mode=manual` | `POST /api/executions`（可带 `engine`）、`GET /api/executions/engine/list`、`GET /api/executions/engine/status` |
-| 长连接测试 | `/long-connection` | `POST/GET /api/streams`、`/{id}/send`、`/{id}/stop` |
+| 文档任务测试 | `/testcases` | `/api/tasks/recognize`、`POST/GET/DELETE /api/tasks/{id}`、`/{id}/cancel`、`/{id}/report` |
+| 长连接测试 | `/long-connection` | `POST/GET /api/streams`、`/{id}/send`、`/{id}/stop`、`DELETE /api/streams/{id}` |
 | 项目与环境 | `/projects` | `/api/projects`、`/api/environments*` |
-| 模拟任务 | `/runs`、`/runs/:id` | `/api/runs*` |
 | 请求历史 | `/history` | console + streams + executions 三组历史 |
 | 执行结果 | `/executions` | `GET /api/executions` |
 | 系统设置 | `/settings` | `GET/PUT /api/settings/llm`、`POST /api/settings/llm/ping`、`POST /api/settings/llm/models`、`GET /api/executions/engine/list`（引擎选择器） |
 
+三类历史列共用同一个 `HistoryList` 组件：条目以 `HistoryEntry[]` 传入，删除与清空由**可选回调**（`onDelete` / `onClear`）启用——不传则完全不渲染。样式与行为绑定在组件内，`@click.stop` 由组件保证，调用方不必各自复制按钮或记得阻止冒泡。删除按钮**常驻**并以低不透明度弱化，悬浮整行时提亮；不能用 `display: none` 切换——按钮高 18px 高于文字行高约 15.3px，显隐会让条目在悬浮时跳动 2.7px。
+
 ### 执行驱动选择
 
-执行引擎在两处可选，且共享同一份选择：
+执行引擎在系统设置页选择，供计划执行 API 使用：
 
 - **系统设置页**（`/settings`）——「测试执行引擎」卡片式选择器，逐个列出引擎的名称、类型、传输方式、版本与就绪状态（绿点/红点 + 错误码）；末尾提供「导入引擎」入口（当前仅界面占位，导入逻辑尚未实现）。
-- **用例计划页**（手动模式面板）——执行前的「执行引擎」下拉框与状态芯片。
-
-两处选择通过 `localStorage` 的 `api-agent.engine` 键同步：在设置页选定后，用例计划页下次打开会默认沿用。
-
 | 驱动 | 标识 | 特点 | 适用场景 |
 | --- | --- | --- | --- |
 | 本地原生引擎 | `native` | 基于 `httpx` 内存发包，零外部依赖、毫秒级、跨平台 | 日常高频调试、CI、无 Postman 环境 |
@@ -271,12 +286,11 @@ npm run dev   # vite dev server，端口 5180，/api 与 /health 代理到 8010
 ```text
 backend/
   pyproject.toml, uv.lock
-  migrations/                    # 阶段1迁移 + 20261101 控制台/执行/长连接表
+  migrations/                    # 阶段1迁移 + 20261101 控制台/执行/长连接表 + 20261105 删模拟任务表
   src/api_agent/
     main.py, cli.py
     infrastructure/              # 配置、日志、ORM、API公共契约、目标策略
     projects/                    # 项目和环境版本
-    runs/                        # 持久化模拟任务、预算、事件、worker
     execution/                   # 计划、engine(协议)、native(原生驱动)、postman(CLI驱动)、Collection、报告、路由
     console/                     # 手动 HTTP 请求 + 脱敏历史
     streams/                     # schemas 输入输出、state 内存、repository 写库、service 编排、transport 读取预算
@@ -291,7 +305,7 @@ frontend/
     api/                         # 类型化的 fetch 封装 + 接口函数
     components/                  # 侧边栏、顶栏、提示、复制按钮、空状态
     composables/                 # 共享轮询生命周期与请求头表单
-    views/                       # 接口调试/用例测试(双模式)/长连接/项目/任务/历史/执行/设置
+    views/                       # 接口调试/用例测试(双模式)/长连接/项目/历史/执行/设置
     styles/                      # magpie 配色设计令牌 + apifox 布局基础样式
     stores/                      # Pinia（toast 队列）
   dist/                          # 生产构建产物（由 FastAPI 挂载，不入库）
@@ -308,7 +322,7 @@ examples/stream_target.py        # 本地 SSE/WebSocket 测试目标（9100）
 
 ## 验证与限制
 
-在 backend 目录运行（2026-11-04 收工复核：**325 passed**，Ruff check/format 与锁文件检查通过；前端 **44 项行为测试**、类型检查和生产构建通过）：
+在 backend 目录运行（2026-11-16 删除模拟任务模块后复核：**371 passed**，Ruff check/format 与锁文件检查通过；前端 **62 项行为测试**、类型检查和生产构建通过）：
 
 ```powershell
 uv lock --check --offline

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 未匹配路由的空状态页面：依赖 EmptyState 和图标展示返回入口。仅提供导航反馈，不发起业务请求或推断服务端资源是否存在。 */
+
 import { Compass } from 'lucide-vue-next'
 import EmptyState from '@/components/EmptyState.vue'
 </script>

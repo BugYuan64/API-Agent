@@ -9,6 +9,7 @@
 
 仅用于本机调试。启动后按 Ctrl+C 退出。
 """
+
 import asyncio
 
 import uvicorn
@@ -20,10 +21,13 @@ app = FastAPI(title="API-Agent stream fixture")
 
 @app.get("/sse")
 async def sse():
+    """提供有限的多行 SSE 样例，返回 StreamingResponse，便于观察自然关闭。"""
+
     async def events():
+        """按固定间隔产生演示事件和多行 data；取消由流式响应关闭传播。"""
         yield b": stream-start\n\n"
         for i in range(5):
-            yield f"event: tick\nid: {i}\ndata: {{\"index\": {i}}}\n\n".encode()
+            yield f'event: tick\nid: {i}\ndata: {{"index": {i}}}\n\n'.encode()
             await asyncio.sleep(0.3)
         yield b"data: last line one\ndata: line two\n\n"
 
@@ -32,7 +36,10 @@ async def sse():
 
 @app.get("/sse-forever")
 async def sse_forever():
+    """提供持续 SSE 样例，用于手动停止、时长与事件预算测试。"""
+
     async def events():
+        """循环产生单调递增事件，直到客户端断开；不写入业务数据。"""
         i = 0
         while True:
             yield f"data: {i}\n\n".encode()
@@ -44,6 +51,7 @@ async def sse_forever():
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
+    """接受连接并回显文本；目标断开正常退出，只用于回环测试。"""
     await websocket.accept()
     await websocket.send_text("welcome-1")
     await websocket.send_text("welcome-2")
@@ -57,6 +65,7 @@ async def ws(websocket: WebSocket):
 
 @app.websocket("/ws-close")
 async def ws_close(websocket: WebSocket):
+    """接受后发送一条消息，再以正常关闭码结束连接。"""
     await websocket.accept()
     await websocket.send_text("bye")
     await websocket.close(code=1000, reason="done")
@@ -64,6 +73,7 @@ async def ws_close(websocket: WebSocket):
 
 @app.websocket("/ws-reject")
 async def ws_reject(websocket: WebSocket):
+    """在接受前关闭握手，演示被拒连接的错误路径。"""
     await websocket.close(code=1008, reason="not allowed")
 
 

@@ -1,4 +1,8 @@
-"""Service for managing effective LLM configuration and explicit SQLite overrides."""
+"""选择有效模型配置，保存数据库显式覆盖并构建普通或预览客户端。
+
+依赖 SQLAlchemy、环境 Settings 和 HTTP 客户端；读取可回退环境且不落库，
+隐式密钥仅同源复用，不负责模型请求或数据库密钥加密。
+"""
 
 from urllib.parse import urlsplit
 
@@ -13,9 +17,13 @@ from api_agent.llm.schemas import LLMConfigResponse, LLMConfigUpdate
 
 
 def same_origin(first: str | None, second: str | None) -> bool:
-    """Reuse credentials only across valid HTTP(S) origins with equal effective ports."""
+    """比较两个合法 HTTP(S) 地址的协议、主机和有效端口，返回密钥可否隐式复用。
+
+    拒绝空值、空白、控制字符、用户信息和非法端口；路径不同不影响同源。
+    """
 
     def origin(value):
+        """把合法地址规范为协议、主机和有效端口元组；无法安全解释时返回 None。"""
         if not value or any(char.isspace() or ord(char) < 32 for char in value):
             return None
         try:
@@ -43,18 +51,19 @@ def same_origin(first: str | None, second: str | None) -> bool:
 
 
 class LLMSettingService:
-    """大模型动态配置业务层：管理存储在 SQLite 中的模型 Base URL、密钥与启用状态。"""
+    """管理数据库显式配置与环境回退，并在地址变化时约束隐式密钥复用。"""
 
     def __init__(self, session: AsyncSession, settings: Settings | None = None):
+        """绑定数据库会话及可选环境设置；不读取、创建或提交配置记录。"""
         self.session = session
         self.settings = settings
 
     async def get_record(self) -> LLMSettingRecord | None:
-        """读取当前的配置记录，不存在时返回 None。"""
+        """读取至多一条显式配置；不存在返回 None，数据库错误向外传播。"""
         return (await self.session.scalars(select(LLMSettingRecord).limit(1))).first()
 
     async def get_effective_record(self) -> LLMSettingRecord:
-        """Read the explicit override, otherwise expose environment defaults without writing."""
+        """返回显式覆盖或按环境默认构造的未持久化配置，不产生数据库写入。"""
         record = await self.get_record()
         if record is None:
             settings = self.settings
@@ -74,7 +83,10 @@ class LLMSettingService:
         return record
 
     async def get_or_create(self) -> LLMSettingRecord:
-        """Create an override only for an explicit save, preserving effective defaults."""
+        """读取显式配置，缺失时将有效默认值新增提交并刷新后返回。
+
+        用于保存流程；提交及刷新失败向外传播，不用于普通只读查询。
+        """
         record = await self.get_record()
         if record is None:
             record = await self.get_effective_record()
@@ -84,7 +96,7 @@ class LLMSettingService:
         return record
 
     async def get_response(self) -> LLMConfigResponse:
-        """返回供前端展示的脱敏配置（不包含明文密钥）。"""
+        """把有效配置转换为脱敏响应，仅返回密钥是否存在，不暴露密钥文本。"""
         record = await self.get_effective_record()
         has_key = bool(record.api_key and record.api_key.strip())
         return LLMConfigResponse(
@@ -97,12 +109,10 @@ class LLMSettingService:
         )
 
     async def update(self, data: LLMConfigUpdate) -> LLMConfigResponse:
-        """根据前端提交更新配置，持久化落库。
+        """根据输入更新并提交显式配置，返回脱敏展示；数据库错误向外传播。
 
-        规则：
-        - ``api_key`` 为 None 时仅同 origin 保留原密钥；
-        - 空字符串清空密钥，非空字符串更新密钥；
-        - ``base_url`` 统一去除尾部斜杠。
+        api_key=None 仅在地址同源时保留原密钥，空字符串清空；地址字段
+        未传则保留，传入时去首尾空白和末尾斜杠，其他字段按输入覆盖。
         """
         record = await self.get_or_create()
         record.enabled = data.enabled
@@ -133,7 +143,7 @@ class LLMSettingService:
         )
 
     async def get_client(self) -> OpenAIClient:
-        """Construct a client from the explicit override or environment, without writing."""
+        """根据显式配置或环境回退构建客户端，不写数据库，也不探测端点。"""
         record = await self.get_effective_record()
         return OpenAIClient(
             base_url=record.base_url,
@@ -150,7 +160,11 @@ class LLMSettingService:
         api_key: str | None = None,
         model: str | None = None,
     ) -> OpenAIClient:
-        """Preview a configuration, never carrying implicit credentials across origins."""
+        """合并预览字段与有效配置，返回启用且超时最多 15 秒的临时客户端。
+
+        未显式传密钥时只对同源地址沿用旧密钥，空字符串表示无鉴权；
+        不保存预览、不发起网络请求，数据库读取错误仍向外传播。
+        """
         record = await self.get_effective_record()
         target = base_url.strip().rstrip("/") if base_url and base_url.strip() else record.base_url
         key = (

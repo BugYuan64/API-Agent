@@ -4,6 +4,20 @@ const fs = require('node:fs')
 const path = require('node:path')
 const ts = require('typescript')
 const vue = require('vue')
+const { compile } = require('@vue/compiler-dom')
+const { renderToString } = require('@vue/server-renderer')
+
+// Reuse production result classification inside executed SFC setup scripts.
+const resultExports = {}
+new Function('exports', ts.transpileModule(
+  fs.readFileSync(path.join(__dirname, '../src/lib/results.ts'), 'utf8'),
+  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
+).outputText)(resultExports)
+const clientExports = {}
+new Function('exports', ts.transpileModule(
+  fs.readFileSync(path.join(__dirname, '../src/api/client.ts'), 'utf8'),
+  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
+).outputText)(clientExports)
 
 // Execute the production SFC setup scripts with real Vue reactivity. Only the
 // API, lifecycle registration and browser clock are substituted; no HTTP/model.
@@ -28,6 +42,8 @@ function load(name, names, mocks = {}) {
   const scope = vue.effectScope()
   const env = {
     ...vue,
+    ...resultExports,
+    ApiError: clientExports.ApiError,
     onMounted: () => {},
     onBeforeUnmount: fn => unmount.push(fn),
     describeError: error => String(error),
@@ -50,6 +66,15 @@ function load(name, names, mocks = {}) {
     withDefaults: (props) => props,
     engineLabel: id => id,
     engineMeta: id => ({ name: id, kind: '内置', description: '', transports: '' }),
+    useHeaderRows: () => ({ rows: vue.ref([{ name: '', value: '' }]), headers: vue.ref({}),
+      count: vue.ref(0), add: () => {}, remove: () => {}, reset: () => {} }),
+    formatRelative: () => '刚刚',
+    formatDateTime: value => value ?? '—',
+    formatDuration: value => `${value}ms`,
+    // AutoPane 用别名导入 HTTP 状态码色调（内部另有同名生命周期函数），
+    // 测试原先只桩了 format* 系列，别名缺失会让断言证据渲染直接抛错。
+    httpStatusTone: value => (value >= 500 ? 'danger' : value >= 400 ? 'warning'
+      : value >= 300 ? 'info' : value >= 200 ? 'success' : 'neutral'),
     window: {
       localStorage: { getItem: () => null },
       setTimeout: fn => { timers.set(++timerId, { fn, repeat: false }); return timerId },
@@ -69,9 +94,38 @@ function load(name, names, mocks = {}) {
   )
   env.usePolling = pollExports.usePolling
   const exposed = names.map(key => `${key}: typeof ${key} === 'undefined' ? undefined : ${key}`).join(',')
-  const api = scope.run(() => new Function(...Object.keys(env), `${js};return {${exposed}}`)(...Object.values(env)))
+  // 编译原模板并复用实际 setup 状态，检查用户看见的结果，而非检查源码字符串。
+  const bindings = []
+  function bindingNames(node) {
+    if (ts.isIdentifier(node)) bindings.push(node.text)
+    else node.elements.forEach(entry => { if (!ts.isOmittedExpression(entry)) bindingNames(entry.name) })
+  }
+  for (const node of ts.createSourceFile(name, source, ts.ScriptTarget.Latest, true).statements) {
+    if (ts.isVariableStatement(node)) node.declarationList.declarations.forEach(entry => bindingNames(entry.name))
+    if (ts.isFunctionDeclaration(node)) bindings.push(node.name.text)
+  }
+  const api = scope.run(() => new Function(...Object.keys(env),
+    `${js};return {${exposed}, templateState: {${bindings.join(',')}}}`)(...Object.values(env)))
+  const template = sfc.split('<template>')[1].split('</script>')[0].split('<style')[0].replace(/<\/template>\s*$/, '')
+  const renderJs = ts.transpileModule(
+    `function build() { ${compile(template, { mode: 'function', isTS: true }).code} }`,
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
+  ).outputText
+  const render = new Function('Vue', `${renderJs}; return build()`)(vue)
   return {
     ...api,
+    render: async () => {
+      const icons = sfc.match(/import\s*\{([^}]+)\}\s*from\s*['"]lucide-vue-next['"]/)?.[1] ?? ''
+      const iconNames = icons.split(',').map(value => value.trim()).filter(Boolean)
+      const context = vue.proxyRefs({ ...env, $slots: {}, ...Object.fromEntries(iconNames.map(icon => [icon, {}])), ...api.templateState })
+      const app = vue.createSSRApp({ render: () => render(context, []) })
+      // 这里只替代布局与图标等展示依赖，真实面板模板、结果分类和响应式状态均执行。
+      for (const component of sfc.matchAll(/import\s+(\w+)\s+from\s+['"][^'"]+\.vue['"]/g)) {
+        app.component(component[1], { setup: (_, { slots }) => () => vue.h('div', Object.values(slots).flatMap(slot => slot())) })
+      }
+      for (const icon of iconNames) app.component(icon, { render: () => null })
+      return renderToString(app)
+    },
     tick: () => {
       const [id, timer] = [...timers][0] ?? []
       assert.equal(typeof timer?.fn, 'function', 'expected a scheduled poll')
@@ -83,260 +137,69 @@ function load(name, names, mocks = {}) {
   }
 }
 
-test('task list refresh stays single-flight and discards the previous generation', async () => {
-  const first = deferred(), second = deferred()
-  let calls = 0
-  const page = load('RunsView', ['load', 'runs'], {
-    listRuns: () => ++calls === 1 ? first.promise : second.promise,
-  })
-  page.load()
-  page.load()
-  assert.equal(calls, 1)
-  first.resolve({ items: [{ id: 'stale', status: 'completed' }] })
-  await vue.nextTick()
-  await Promise.resolve()
-  if (calls === 1 && page.timerCount()) { page.tick(); await Promise.resolve() }
-  assert.equal(calls, 2)
-  second.resolve({ items: [{ id: 'current', status: 'completed' }] })
-  await vue.nextTick()
-  assert.equal(page.runs.value[0].id, 'current')
-  page.dispose()
-})
-
-test('task details discard late responses after leaving the page', async () => {
+test('console clears previous success while waiting and keeps browser timeout outside target results', async () => {
   const pending = deferred()
-  const page = load('RunDetail', ['load', 'run'], {
-    useRoute: () => ({ params: { runId: 'A' } }), useRouter: () => ({}),
-    getRun: () => pending.promise,
-    listRunEvents: async () => ({ items: [] }), listRunBudget: async () => [],
-    listRunAttempts: async () => [],
+  const page = load('RequestConsole', ['send', 'result', 'localFailure'], {
+    sendConsoleRequest: () => pending.promise,
   })
-  page.load()
+  page.result.value = { ok: true, response: { status: 200 } }
+  const sending = page.send()
+  assert.equal(page.result.value, null)
+  pending.reject(new clientExports.ApiError(0, 'client_timeout', 'timeout'))
+  await sending
+  assert.equal(page.result.value, null)
+  assert.equal(page.localFailure.value.code, 'BROWSER_TIMEOUT')
+  assert.equal(page.localFailure.value.resultStatus, null)
   page.dispose()
-  pending.resolve({ id: 'A', status: 'running' })
-  for (let i = 0; i < 10; i++) await Promise.resolve()
-  assert.equal(page.run.value, null)
-  assert.equal(page.timerCount(), 0)
 })
 
-test('task detail navigation keeps one identity for the entire evidence batch', async () => {
-  const first = deferred(), route = vue.reactive({ params: { runId: 'A' } }), ids = []
-  const page = load('RunDetail', ['load', 'run', 'events'], {
-    useRoute: () => route, useRouter: () => ({}),
-    getRun: id => { ids.push(['run', id]); return id === 'A' ? first.promise : Promise.resolve({ id, status: 'completed' }) },
-    listRunEvents: async id => { ids.push(['events', id]); return { items: [{ run_id: id }] } },
-    listRunBudget: async id => { ids.push(['budget', id]); return [] },
-    listRunAttempts: async id => { ids.push(['attempts', id]); return [] },
+const taskRecord = (id, status = 'running') => ({ id, status, stage: 'executing',
+  created_at: '2026-11-16T00:00:00Z', snapshot: { cases: [], warnings: [] }, results: [], summary: null })
+
+test('switching task history rejects late progress for the previous task', async () => {
+  const late = deferred()
+  const page = load('TestCasesView', ['run', 'openHistory'], {
+    readTask: id => id === 'old' ? late.promise : Promise.resolve(taskRecord('new', 'completed')),
+    listTasks: async () => ({ items: [] }),
   })
-  page.load()
-  route.params.runId = 'B'
-  await vue.nextTick()
-  first.resolve({ id: 'A', status: 'running' })
-  for (let i = 0; i < 10; i++) await Promise.resolve()
-  assert.equal(page.run.value, null)
-  page.tick()
-  for (let i = 0; i < 10; i++) await Promise.resolve()
-  assert.equal(page.run.value.id, 'B')
-  assert.equal(page.events.value[0].run_id, 'B')
-  assert.deepEqual(ids.map(([, id]) => id), ['A', 'A', 'A', 'A', 'B', 'B', 'B', 'B'])
-  page.dispose()
-})
-
-function agent(mocks) {
-  return load('AutoPane', ['form', 'discover', 'canSubmit', 'buildPayload', 'selectedPathList',
-    'run', 'startPolling', 'cancel', 'isRunning', 'loadReport', 'report', 'submit'], mocks)
-}
-function planner(mocks) {
-  return load('ManualPane', ['planText', 'result', 'diagnosis', 'diagnosing', 'analyzeWithAI',
-    'selectExecution', 'canAnalyze', 'planSummary'], mocks)
-}
-const execution = id => ({ id, plan: { origin: 'http://127.0.0.1:8010', allowed_methods: ['GET'],
-  path_templates: ['/health'], requests: [], max_requests: 1 },
-  plan_sha256: 'saved-plan-hash', project_id: null, label: 'fixture', engine: 'native', status: 'passed',
-  error_kind: null, duration_ms: 1, reserved_requests: 0, observed_attempts: 0, unknown_requests: 0,
-  executions: [], created_at: '2026-11-02T00:00:00Z' })
-const diagnosis = summary => ({ evidence: [], analysis: { summary, hypotheses: [], coverage_gaps: [] } })
-const run = (status = 'running', id = 'run-A') => ({ id, status, schema_version: '1',
-  created_at: '2026-11-02T00:00:00Z', report_status: 'partial', stop_reason: null,
-  snapshot: {}, snapshot_sha256: 'fixture-hash', actual_llm_status: 'not_called',
-  degradation_reasons: [], rounds: [], events: [], model_calls: [], commentary: null,
-  budget: { target_http: { limit: 1, reserved: 0, consumed: 0 },
-    model_call: { limit: 1, reserved: 0, consumed: 0 } } })
-
-test('R07: a first plain-text contract can run with manually confirmed path templates', () => {
-  const page = agent()
-  page.form.contractText = 'GET /health should return status=ok'
-  page.form.origin = 'http://127.0.0.1:8010'
-  page.form.manualPaths = '/health\n/users/{id}\n/health'
-  assert.equal(page.canSubmit.value, true)
-  assert.deepEqual(page.buildPayload().scope.path_templates, ['/health', '/users/{id}'])
-  page.dispose()
-})
-
-test('R07: JSON scalar/array contracts never crash discovery or send a non-object contract', () => {
-  const page = agent()
-  for (const text of ['null', '[]', '42', 'true', '"description"']) {
-    page.form.contractText = text
-    assert.doesNotThrow(() => page.discover())
-    assert.equal(page.buildPayload().contract, text)
-  }
-  page.dispose()
-})
-
-test('R07: OpenAPI checkbox paths and manual paths combine without losing explicit choices', () => {
-  const page = agent()
-  page.form.contractText = '{"paths":{"/health":{"get":{}},"/users":{"post":{}}}}'
-  page.discover()
-  page.form.selectedPaths.delete('/users')
-  page.form.manualPaths = '/extra\n/health'
-  assert.deepEqual(page.buildPayload().scope.path_templates, ['/health', '/extra'])
-  page.dispose()
-})
-
-test('R06: diagnosis submits saved execution identity and contract, never the edited plan or result', async () => {
-  let sent
-  const page = planner({ diagnoseExecution: async (...args) => { sent = args; return diagnosis('saved') },
-    diagnosePlan: async (...args) => { sent = args; return diagnosis('unsafe') } })
-  page.result.value = execution('execution-A')
-  page.planText.value = '{"requests":[{"id":"changed"}]}'
-  await page.analyzeWithAI()
-  assert.deepEqual(sent, ['execution-A', { contract: '（未提供契约；仅就断言差异作观察）' }])
-  page.dispose()
-})
-
-test('R06: legacy history without a stored plan cannot invoke AI diagnosis', async () => {
-  let calls = 0
-  const invoke = async () => { calls++; return diagnosis('legacy') }
-  const page = planner({ diagnoseExecution: invoke, diagnosePlan: invoke })
-  page.result.value = { ...execution('legacy'), plan: null, plan_sha256: null }
-  await page.analyzeWithAI()
-  assert.equal(calls, 0)
-  page.dispose()
-})
-
-for (const change of ['execution', 'editor']) {
-  test(`R06: ${change} change discards an in-flight diagnosis and clears previous analysis`, async () => {
-    const waiting = deferred()
-    const page = planner({ diagnoseExecution: () => waiting.promise, diagnosePlan: () => waiting.promise })
-    page.result.value = execution('execution-A')
-    const pending = page.analyzeWithAI()
-    if (change === 'execution') page.result.value = execution('execution-B')
-    else page.planText.value = '{"requests":[]}'
-    await vue.nextTick()
-    waiting.resolve(diagnosis('execution-A'))
-    await pending
-    assert.equal(page.diagnosis.value, null)
-    page.diagnosis.value = diagnosis('old')
-    page.planText.value = '{"requests":[],"origin":"changed"}'
-    await vue.nextTick()
-    assert.equal(page.diagnosis.value, null)
-    page.dispose()
-  })
-}
-
-test('R06: selecting saved history restores its plan; legacy history cannot retain a misleading plan', () => {
-  const page = planner()
-  assert.equal(typeof page.selectExecution, 'function')
-  const saved = execution('saved')
-  page.selectExecution(saved)
-  assert.deepEqual(JSON.parse(page.planText.value), saved.plan)
-  page.selectExecution({ ...execution('legacy'), plan: null, plan_sha256: null })
-  assert.equal(page.planText.value, '')
-  assert.equal(page.canAnalyze.value, false)
-  page.dispose()
-})
-
-test('R06: JSON null and malformed request entries do not crash plan summary', () => {
-  const page = planner()
-  for (const text of ['null', '[]', '{"requests":[null,4]}']) {
-    page.planText.value = text
-    assert.doesNotThrow(() => page.planSummary.value)
-  }
-  page.dispose()
-})
-
-test('R08: polling never schedules a second GET while the first is pending', async () => {
-  const waiting = deferred()
-  const page = agent({ getAgentRun: () => waiting.promise })
-  page.run.value = run()
-  page.startPolling('run-A')
-  const pending = page.tick()
-  assert.equal(page.timerCount(), 0)
-  waiting.resolve(run())
+  const pending = page.openHistory('old')
+  await page.openHistory('new')
+  late.resolve(taskRecord('old'))
   await pending
-  assert.equal(page.timerCount(), 1)
+  assert.equal(page.run.value.id, 'new')
+  assert.equal(page.timerCount(), 0)
   page.dispose()
 })
 
-test('R08: restarting polling keeps a pending GET single-flight across generations', async () => {
-  const waiting = deferred()
+test('unmount cancels task polling and ignores late progress', async () => {
+  const late = deferred()
+  let signal
+  const page = load('TestCasesView', ['run', 'openHistory'], {
+    readTask: (id, input) => { signal = input; return late.promise },
+  })
+  const pending = page.openHistory('old')
+  page.dispose()
+  assert.equal(signal.aborted, true)
+  late.resolve(taskRecord('old'))
+  await pending
+  assert.equal(page.run.value, null)
+  assert.equal(page.timerCount(), 0)
+})
+
+test('task cancellation cannot be overwritten by an in-flight running snapshot', async () => {
+  const late = deferred()
   let calls = 0
-  const page = agent({ getAgentRun: () => { calls++; return waiting.promise } })
-  page.run.value = run()
-  page.startPolling('run-A')
-  const old = page.tick()
-  page.startPolling('run-A')
-  const restarted = page.tick()
-  assert.equal(calls, 1)
-  waiting.resolve(run())
-  await Promise.all([old, restarted])
-  assert.equal(page.run.value.status, 'running')
-  assert.equal(page.timerCount(), 1)
-  page.dispose()
-})
-
-test('R08: a late GET cannot replace cancellation with running', async () => {
-  const waiting = deferred()
-  const page = agent({ getAgentRun: () => waiting.promise, cancelAgentRun: async () => run('cancelled') })
-  page.run.value = run()
-  page.startPolling('run-A')
-  const pending = page.tick()
+  const page = load('TestCasesView', ['run', 'openHistory', 'cancel'], {
+    readTask: () => ++calls === 1 ? late.promise : Promise.resolve(taskRecord('same', 'cancelled')),
+    cancelTask: async () => taskRecord('same', 'cancelled'),
+    listTasks: async () => ({ items: [] }),
+  })
+  page.run.value = taskRecord('same')
+  const pending = page.openHistory('same')
   await page.cancel()
-  waiting.resolve(run())
+  late.resolve(taskRecord('same'))
   await pending
   assert.equal(page.run.value.status, 'cancelled')
-  assert.equal(page.timerCount(), 0)
-  page.dispose()
-})
-
-test('R08: unmount invalidates in-flight GET and report writes', async () => {
-  const getting = deferred(), reporting = deferred()
-  const page = agent({ getAgentRun: () => getting.promise, getAgentReport: () => reporting.promise })
-  page.run.value = run()
-  page.startPolling('run-A')
-  const poll = page.tick()
-  const report = page.loadReport()
-  page.dispose()
-  getting.resolve(run('completed'))
-  reporting.resolve('late report')
-  await Promise.all([poll, report])
-  assert.equal(page.run.value.status, 'running')
-  assert.equal(page.report.value, null)
-  assert.equal(page.timerCount(), 0)
-})
-
-test('R08: a report from an old run cannot attach to the new run', async () => {
-  const waiting = deferred()
-  const page = agent({ getAgentReport: () => waiting.promise })
-  page.run.value = run()
-  const pending = page.loadReport()
-  page.run.value = run('running', 'run-B')
-  waiting.resolve('report for run-A')
-  await pending
-  assert.equal(page.report.value, null)
-  page.dispose()
-})
-
-test('R08: a stale poll cannot regress a terminal state of the same run', async () => {
-  const waiting = deferred()
-  const page = agent({ getAgentRun: () => waiting.promise })
-  page.run.value = run()
-  page.startPolling('run-A')
-  const pending = page.tick()
-  page.run.value = run('completed')
-  waiting.resolve(run())
-  await pending
-  assert.equal(page.run.value.status, 'completed')
   assert.equal(page.timerCount(), 0)
   page.dispose()
 })

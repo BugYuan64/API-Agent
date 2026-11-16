@@ -1,10 +1,15 @@
-"""Facts are rendered by code; model prose is a visibly separate commentary."""
+"""把 AgentStore 运行记录渲染为 Markdown 诊断报告。
+
+依赖标准库完成转义和 JSON 编码；事实来自已保存证据，模型概述单独标识，
+不调用模型、发送目标请求或独立证明业务根因。
+"""
 
 import html
 import json
 
 
 def cell(value) -> str:
+    """把任意值转为单行表格单元格，转义 HTML、管道符与换行以保留报告结构。"""
     return html.escape(str(value)).replace("|", "\\|").replace("\n", " ")
 
 
@@ -49,11 +54,20 @@ def _explain(fact: dict) -> str:
 
 def json_block(value) -> list[str]:
     # A string value cannot close the Markdown fence and inject an extra report section.
+    """把可 JSON 编码的值转为代码块行；转义反引号以防值关闭围栏。
+
+    不可编码的输入由 json.dumps 报错，调用者负责提供已脱敏内容。
+    """
     encoded = json.dumps(value, ensure_ascii=False, indent=2).replace("`", "\\u0060")
     return ["```json", encoded, "```", ""]
 
 
 def render_report(record: dict) -> str:
+    """由完整运行记录生成含证据、限制、预算及事件的 Markdown 文本。
+
+    依赖存储记录的既定字段，缺失必需字段直接报错；只渲染既有事实，
+    不把未评估结果当通过，也不补写模型未产生的分析。
+    """
     target = record["budget"]["target_http"]
     model = record["budget"]["model_call"]
     lines = [

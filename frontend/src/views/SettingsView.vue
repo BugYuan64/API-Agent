@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 系统设置页：依赖 LLM 配置接口与共享引擎选择，维护模型表单、探测状态和引擎详情弹窗。保存密钥后清空输入，不回显已存明文；引擎导入、配置保存与退出入口仍为界面反馈。 */
+
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
   AlertCircle,
@@ -91,8 +93,10 @@ const pingStatus = ref<{
   message: string
 } | null>(null)
 
+/** 仅判断当前表单是否填写 Base URL；不表示配置已保存或服务可连通。 */
 const isConfigured = computed(() => !!form.baseUrl.trim())
 
+/** 读取已保存模型配置填入表单，密钥仅保留存在标志且清空明文输入；失败提示并解除 loading。 */
 async function loadSettings() {
   loading.value = true
   try {
@@ -127,6 +131,7 @@ function toggleKeyVisibility(): void {
   )
 }
 
+/** 将指定预设的地址和模型填入表单并清理旧探测结果；仅本地编辑，需要保存后才生效。 */
 function applyPreset(preset: (typeof PRESETS)[number]) {
   form.baseUrl = preset.url
   form.model = preset.model
@@ -134,6 +139,7 @@ function applyPreset(preset: (typeof PRESETS)[number]) {
   useToastStore().push('info', `已填入 ${preset.name} 预设`, `Base URL 与推荐模型已就绪`)
 }
 
+/** 通过后端使用当前表单探测模型连通性；空地址拦截，接口或探测失败写入失败状态并提示，始终解除 testing。 */
 async function testConnection() {
   if (!form.baseUrl.trim()) {
     useToastStore().push('warning', '请先填写接口 Base URL')
@@ -178,6 +184,7 @@ async function testConnection() {
 const fetchingModels = ref(false)
 const availableModels = ref<string[]>([])
 
+/** 按当前地址与可选新密钥读取可用模型；空地址拦截，空列表和服务失败分别提示，始终解除加载态。 */
 async function fetchModels() {
   if (!form.baseUrl.trim()) {
     useToastStore().push('warning', '请先填写接口 Base URL')
@@ -205,6 +212,7 @@ async function fetchModels() {
   }
 }
 
+/** 经浏览器确认后发送空密钥清除已保存值，同时提交当前表单配置；失败提示，成功只回显密钥存在状态。 */
 async function clearApiKey() {
   if (!confirm('确定要清空已在本地保存的 API Key 吗？')) return
   try {
@@ -224,6 +232,7 @@ async function clearApiKey() {
   }
 }
 
+/** 保存当前模型配置；空密钥输入以 undefined 保留旧值，成功清空明文输入，失败提示并解除 saving。 */
 async function saveSettings() {
   saving.value = true
   try {
@@ -288,11 +297,13 @@ function importEngine() {
 const configOpen = ref(false)
 const configEngineId = ref<string>('')
 
+/** 按弹窗所选 ID 读取引擎显示名；未知 ID 使用共享元信息回退。 */
 const configEngineName = computed(() => engineMeta(configEngineId.value).name)
 /** 当前弹窗对应的引擎条目（版本、可用性等）。 */
 const configEngine = computed(
   () => engines.value.find((item) => item.id === configEngineId.value) ?? null,
 )
+/** 读取弹窗引擎的可用版本字符串；未加载或未报告时为空。 */
 const configEngineVersion = computed(() => configEngine.value?.version ?? '')
 
 /** 打开某个引擎的配置弹窗（每个引擎卡片右上角都有入口）。 */
@@ -301,6 +312,7 @@ function openEngineConfig(engine: { id: string }): void {
   configOpen.value = true
 }
 
+/** 关闭引擎配置弹窗；不保存配置或变更当前引擎。 */
 function closeEngineConfig(): void {
   configOpen.value = false
 }
@@ -316,6 +328,7 @@ function saveEngineConfig(): void {
   )
 }
 
+/** 刷新共享引擎列表，可按 showToast 展示就绪数量或错误；错误在此消费，初次静默刷新不弹出提示。 */
 async function refreshEngines(showToast = false) {
   try {
     await refreshEnginesBase()
@@ -335,6 +348,7 @@ async function refreshEngines(showToast = false) {
 }
 
 
+/** 生成本地 MCP 接入配置示例供复制；只输出非秘密模板，不安装、连接或修改服务配置。 */
 const mcpConfigJson = computed(() => {
   return JSON.stringify(
     {
@@ -354,6 +368,7 @@ const mcpConfigJson = computed(() => {
   )
 })
 
+/** 挂载后独立加载模型配置与引擎列表；各任务自行处理失败，不发起模型探测。 */
 onMounted(() => {
   loadSettings()
   refreshEngines()

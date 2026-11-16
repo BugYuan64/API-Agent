@@ -1,4 +1,8 @@
-"""Independent AI capabilities and a durable, cancellable orchestration API."""
+"""暴露独立 Agent 能力与可查询、可取消的后台运行接口。
+
+依赖 FastAPI、模型配置、执行历史和应用级任务管理器；负责取依赖、
+校验历史可用性及错误码映射，业务校验和闭环执行交给服务与运行时。
+"""
 
 from typing import Annotated
 
@@ -23,6 +27,7 @@ from api_agent.execution.schemas import ExecutionPlan, RunResult
 from api_agent.execution.service import PlanError
 from api_agent.infrastructure.api import ApiError, not_found
 from api_agent.infrastructure.database import session_for
+from api_agent.infrastructure.outcomes import result_fields
 from api_agent.llm.client import OpenAIClient
 from api_agent.llm.service import LLMSettingService
 
@@ -31,6 +36,7 @@ Session = Annotated[AsyncSession, Depends(session_for)]
 
 
 async def agent_for(request: Request, session: Session) -> AgentService:
+    """根据数据库配置或环境回退构建请求级 AgentService；未启用配置返回 503。"""
     settings = LLMSettingService(session)
     record = await settings.get_record()
     client = (
@@ -47,6 +53,7 @@ Agent = Annotated[AgentService, Depends(agent_for)]
 
 
 def api_error(error: AgentError | PlanError):
+    """将 Agent/计划稳定错误码映射为 HTTP 状态和统一提示，返回 ApiError。"""
     code = str(error)
     if code == "agent_capacity_exceeded":
         status = 429
@@ -63,7 +70,7 @@ def api_error(error: AgentError | PlanError):
 
 @router.post("/generate", response_model=Generation)
 async def generate(payload: GenerateRequest, agent: Agent):
-    """契约 → 已通过本地范围校验的 ExecutionPlan，不发送目标请求。"""
+    """由契约生成通过本地校验的计划，不发送目标请求；领域错误映射为 HTTP 错误。"""
     try:
         return await agent.generate(payload)
     except (AgentError, PlanError) as error:
@@ -72,7 +79,7 @@ async def generate(payload: GenerateRequest, agent: Agent):
 
 @router.post("/diagnose", response_model=Diagnosis)
 async def diagnose(payload: DiagnoseRequest, agent: Agent):
-    """保留断言事实，生成有证据引用的未证实根因假设。"""
+    """由计划和结果生成证据及未证实假设；对应校验或模型失败映射为 HTTP 错误。"""
     try:
         return await agent.diagnose(payload)
     except (AgentError, PlanError) as error:
@@ -86,12 +93,10 @@ async def diagnose_execution(
     agent: Agent,
     session: Session,
 ):
-    """按执行 ID 诊断：计划与结果一律取自该次执行的冻结记录。
+    """按执行 ID 诊断，计划与结果取自该次执行的冻结记录。
 
-    作用：切断“编辑器已改、历史未动”的证据错配——
-    调用方只能提供契约，不能提交自己的计划，后端忽略任何额外 plan 字段。
-    实现：旧记录缺冻结计划时返回 409 ``execution_plan_unavailable``，
-    明确要求重新执行，而不是拿当前编辑器内容顶替。
+    调用方只提供契约，额外 plan 字段由输入模型拒绝为 422；记录不存在
+    返回 404，缺失或不兼容的冻结计划/结果返回 409，模型错误按领域码映射。
     """
     record = await session.get(ExecutionRecord, execution_id)
     if record is None:
@@ -136,7 +141,10 @@ async def diagnose_execution(
 
 @router.post("/adapt", response_model=Adaptation)
 async def adapt(payload: AdaptRequest, agent: Agent):
-    """返回经过单因素/重复/预算/重放权限过滤的下一轮计划，不自动执行。"""
+    """返回经范围、单因素、去重、预算与重放权限过滤的补测计划；不自动执行。
+
+    计划校验或模型失败映射为统一 HTTP 错误。
+    """
     try:
         return await agent.adapt(payload)
     except (AgentError, PlanError) as error:
@@ -145,35 +153,61 @@ async def adapt(payload: AdaptRequest, agent: Agent):
 
 @router.post("/runs", status_code=202)
 async def start_run(payload: AgentRunRequest, request: Request, response: Response, agent: Agent):
-    """创建后台闭环，立即返回 ID；通过详情/报告查询或主动取消。"""
+    """接受闭环请求，返回初始记录及查询 Location，由后台继续运行。
+
+    容量、引擎或目标校验失败按领域码返回 HTTP 错误。
+    """
     try:
         record = request.app.state.agents.start(agent, payload)
     except (AgentError, PlanError) as error:
         raise api_error(error) from None
     response.headers["Location"] = f"/api/agent/runs/{record['id']}"
-    return record
+    return result_fields(record)
 
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str, request: Request):
+    """按 ID 返回持久化运行记录；ID 非法或文件不存在返回 404。"""
     try:
-        return request.app.state.agents.store.read(run_id)
+        return result_fields(request.app.state.agents.store.read(run_id))
     except (ValueError, FileNotFoundError):
         raise not_found("Agent run") from None
 
 
 @router.post("/runs/{run_id}/cancel")
 async def cancel_run(run_id: str, request: Request):
+    """取消本进程中的指定运行并返回记录；ID 非法或不存在返回 404。"""
     try:
-        return await request.app.state.agents.cancel(run_id)
+        return result_fields(await request.app.state.agents.cancel(run_id))
     except (ValueError, FileNotFoundError):
         raise not_found("Agent run") from None
 
 
 @router.get("/runs/{run_id}/report", response_class=PlainTextResponse)
 async def get_report(run_id: str, request: Request):
+    """按 ID 返回 Markdown 纯文本报告；ID 非法或不存在返回 404。"""
     try:
         report = request.app.state.agents.store.report(run_id)
     except (ValueError, FileNotFoundError):
         raise not_found("Agent run") from None
     return PlainTextResponse(report, media_type="text/markdown")
+
+
+@router.delete("/runs/{run_id}", status_code=204)
+async def delete_run(run_id: str, request: Request):
+    """删除一次编排运行的证据文件。
+
+    作用：让编排历史可以清理，而不是只能越积越多。
+    实现：先读一次记录确认它已到终态——``queued``/``running`` 的运行仍有后台任务
+    在写同一个文件，此时删除会与写入竞争，也会让用户误以为任务被取消了；
+    这种情况返回 409 并要求先取消。终态才真的删文件，不存在或 ID 非法返回 404。
+    """
+    store = request.app.state.agents.store
+    try:
+        record = store.read(run_id)
+    except (ValueError, FileNotFoundError):
+        raise not_found("Agent run") from None
+    if record.get("status") in {"queued", "running"}:
+        raise ApiError(409, "agent_run_active", "Cancel the run before deleting it")
+    if not store.delete(run_id):
+        raise not_found("Agent run")

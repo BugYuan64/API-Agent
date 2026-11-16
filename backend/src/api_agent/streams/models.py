@@ -9,7 +9,7 @@ from api_agent.infrastructure.orm import Base, CreatedAtMixin, IdMixin
 
 
 class StreamSessionRecord(IdMixin, CreatedAtMixin, Base):
-    """一次 SSE 或 WebSocket 长连接测试的会话。
+    """一次 WebSocket 调试会话。
 
     作用：把“连了什么、协商出什么、收了多少条、为什么结束”持久化，
     让界面在会话结束后仍能展示完整证据链。
@@ -48,7 +48,7 @@ class StreamSessionRecord(IdMixin, CreatedAtMixin, Base):
 class StreamEventRecord(IdMixin, CreatedAtMixin, Base):
     """长连接上收发的单条事件。
 
-    作用：构成可回看的时间线——每条 SSE 事件或 WebSocket 帧占一行，
+    作用：构成可回看的时间线——每条 WebSocket 帧占一行，
     带序号、方向、类型与数据预览。
     实现：``(session_id, sequence)`` 唯一约束保证序号不重复；
     ``data`` 只存前 64KiB，超出部分丢弃并置 ``truncated``，

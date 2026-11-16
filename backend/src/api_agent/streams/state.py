@@ -8,9 +8,10 @@ from datetime import datetime
 from typing import Any, Literal
 
 from api_agent.infrastructure.orm import as_utc, utc_now
+from api_agent.infrastructure.outcomes import outcome_for
 
 MAX_EVENT_CHARS = 64 * 1024
-Kind = Literal["sse", "websocket"]
+Kind = Literal["websocket"]
 Status = Literal["connecting", "open", "closed", "error", "cancelled"]
 
 
@@ -162,11 +163,14 @@ def serialize_stream(stream: ActiveStream) -> dict:
     实现：``finished`` 是派生值（终态判定），让前端不必自己枚举三种终态；
     时间戳统一走 ``as_utc`` 以补齐 SQLite 丢失的时区。
     """
+    outcome = outcome_for(stream.status, stream.error_kind, stop_reason=stream.stop_reason)
     return {
         "id": stream.id,
         "kind": stream.kind,
         "url": stream.url,
         "status": stream.status,
+        "result_code": outcome.code,
+        "result_status": outcome.status,
         "finished": stream.finished,
         "stop_reason": stream.stop_reason,
         "error_kind": stream.error_kind,

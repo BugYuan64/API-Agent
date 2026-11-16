@@ -1,10 +1,12 @@
 <script setup lang="ts">
+/** 受控弹窗组件：接收 open、标题和按钮配置，输出打开状态变更、取消与确认事件。依赖 Vue 生命周期及 DOM 监听，负责 Esc、遮罩关闭和滚动锁定；保存校验由父级负责。 */
+
 /**
  * 通用模态弹窗。
  *
  * 作用：设置页里引擎的“配置”入口需要在不离开页面的前提下展开详情
  * （如 postmanmcp 的服务元信息、工具清单与接入配置）。抽成通用组件后，
- * 遮罩、焦点管理、Esc 关闭与页脚按钮布局都只有一份实现。
+ * 遮罩、Esc 关闭、滚动锁定与页脚按钮布局都只有一份实现。
  *
  * 组成：标题栏（可带副标题）+ 内容插槽 + 页脚插槽（默认提供「取消 / 保存」）。
  * 行为：点击遮罩或按 Esc 关闭；打开时锁定页面滚动，关闭后恢复。
@@ -33,11 +35,13 @@ const emit = defineEmits<{
   (event: 'cancel'): void
 }>()
 
+/** 通知父级关闭弹窗并发送 cancel；不直接修改受控 open，也不执行保存。 */
 function close(): void {
   emit('update:open', false)
   emit('cancel')
 }
 
+/** 处理键盘事件，仅 Escape 触发取消关闭；其他按键保留默认行为。 */
 function onKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') close()
 }
@@ -48,6 +52,7 @@ function lockScroll(open: boolean): void {
   document.body.style.overflow = open ? 'hidden' : ''
 }
 
+/** 按 open 同步滚动锁与 Esc 监听，立即执行以覆盖初始打开状态；关闭时移除监听。 */
 watch(
   () => props.open,
   (open) => {
@@ -58,6 +63,7 @@ watch(
   { immediate: true },
 )
 
+/** 组件销毁时解除背景滚动锁和键盘监听，避免路由切换后留下全局副作用。 */
 onBeforeUnmount(() => {
   lockScroll(false)
   window.removeEventListener('keydown', onKeydown)

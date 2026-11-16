@@ -17,6 +17,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    """建立项目、环境版本、模拟运行及预算事件的初始表和约束；由 Alembic 事务上下文执行。"""
     op.create_table(
         "projects",
         sa.Column("name", sa.String(length=80), nullable=False),
@@ -152,6 +153,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """按外键依赖逆序删除首版表；这会丢失相应业务数据，不是数据恢复操作。"""
     for table in (
         "dispatch_attempts",
         "budget_ledger",

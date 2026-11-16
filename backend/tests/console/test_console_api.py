@@ -74,11 +74,12 @@ async def test_console_records_transport_failure_without_faking_status(client):
         "/api/console/requests",
         json={"method": "GET", "url": f"http://127.0.0.1:{port}/nobody"},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 502, response.text
     payload = response.json()
     assert payload["ok"] is False
     assert payload["response"] is None
-    assert payload["error_kind"] in {"request_failed", "request_timeout"}
+    assert payload["error_kind"] == "request_failed"
+    assert payload["result_code"] == "CONNECTION_FAILED"
 
 
 async def test_console_classifies_timeout(client, target):
@@ -90,7 +91,7 @@ async def test_console_classifies_timeout(client, target):
         "/api/console/requests",
         json={"method": "GET", "url": f"{target.base_url}/slow", "timeout_ms": 300},
     )
-    assert response.status_code == 200
+    assert response.status_code == 504
     assert response.json()["error_kind"] == "request_timeout"
 
 
@@ -183,3 +184,51 @@ def test_utc_helper_marks_naive_timestamps():
     assert as_utc(naive).tzinfo is not None
     aware = utc_now() + timedelta(seconds=1)
     assert as_utc(aware) == aware
+
+
+async def test_redirect_is_reported_as_a_real_response_when_not_followed(client, target):
+    """默认不跟随跳转时，302 是目标真实回包，不是失败。
+
+    实现：断言外层管理接口仍是 200、``ok`` 为真、``response.status`` 保留 302，
+    且 ``redirects`` 为空——空表示“没有被跟随”，不是“目标没有跳转”。
+    """
+    response = await client.post(
+        "/api/console/requests",
+        json={"method": "GET", "url": f"{target.base_url}/redirect", "body_mode": "none"},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["result_code"] == "HTTP_RESPONSE"
+    assert payload["response"]["status"] == 302
+    assert payload["response"]["reason"] == "Found"
+    assert payload["response"]["redirects"] == []
+    assert payload["response"]["headers"]["location"] == ["/json"]
+
+
+async def test_followed_redirect_chain_exposes_every_hop(client, target):
+    """跟随跳转时，每一跳都要带上状态码、原因与目标地址。
+
+    实现：302 指向同源 ``/json``，因此只有一跳且不跨源；断言这三个字段
+    来自目标真实回包，界面据此才能画出 ``302 → 200`` 的链路。
+    """
+    response = await client.post(
+        "/api/console/requests",
+        json={
+            "method": "GET",
+            "url": f"{target.base_url}/redirect",
+            "body_mode": "none",
+            "follow_redirects": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["response"]["status"] == 200
+    hops = payload["response"]["redirects"]
+    assert len(hops) == 1
+    hop = hops[0]
+    assert hop["status"] == 302
+    assert hop["reason"] == "Found"
+    assert hop["url"].endswith("/json")
+    assert hop["cross_origin"] is False

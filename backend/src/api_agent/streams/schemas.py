@@ -2,23 +2,16 @@
 
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator
 
 from api_agent.infrastructure.api import ApiInput, ApiModel, UtcDatetime
-from api_agent.streams.state import Kind
+from api_agent.infrastructure.outcomes import OutcomeFields
 
 
 class StreamStart(ApiInput):
-    """启动一次长连接测试的输入契约。
+    """启动有界 WebSocket 调试；SSE 已归入 HTTP 接口测试。"""
 
-    作用：把 SSE 与 WebSocket 的差异收敛到 ``kind`` 一个开关上——
-    两者共享 URL、头、超时与上限，只在 ``kind`` 上分流，
-    界面因此可以用一套表单覆盖两种协议。
-    实现：``send`` 只在 WebSocket 下有效（SSE 是单向流，服务端不接受客户端消息），
-    由 ``valid_kind`` 拒绝在 SSE 上携带待发消息，避免“发了但被忽略”的错觉。
-    """
-
-    kind: Kind
+    kind: Literal["websocket"] = "websocket"
     url: str = Field(min_length=1, max_length=2000)
     headers: dict[str, str] = Field(default_factory=dict, max_length=20)
     subprotocols: list[str] = Field(default_factory=list, max_length=5)
@@ -65,19 +58,8 @@ class StreamStart(ApiInput):
             raise ValueError("subprotocols must be unique HTTP tokens")
         return values
 
-    @model_validator(mode="after")
-    def valid_kind(self):
-        """拒绝“SSE 上携带待发消息”这类不可能生效的组合。
 
-        实现：SSE 是服务器到客户端的单向流，没有客户端写入通道，
-        因此带了 ``send`` 就说明用户预期与实际行为不符，应在提交前就报错。
-        """
-        if self.kind == "sse" and self.send:
-            raise ValueError("SSE streams cannot send messages; use the websocket kind")
-        return self
-
-
-class StreamSessionResponse(ApiModel):
+class StreamSessionResponse(ApiModel, OutcomeFields):
     """长连接会话的当前状态。
 
     实现：``finished`` 是派生值（终态判定），让前端不必自己枚举三种终态；
@@ -86,7 +68,7 @@ class StreamSessionResponse(ApiModel):
     """
 
     id: str
-    kind: Literal["sse", "websocket"]
+    kind: Literal["websocket"]
     url: str
     status: str
     finished: bool
@@ -148,7 +130,7 @@ class StreamSendRequest(ApiInput):
     message: str = Field(min_length=1, max_length=65_536)
 
 
-class StreamHistoryResponse(ApiModel):
+class StreamHistoryResponse(ApiModel, OutcomeFields):
     """数据库中的历史会话摘要（进程重启后仍可回看）。
 
     实现：请求头已脱敏；``event_count`` 是落库时的最终计数。

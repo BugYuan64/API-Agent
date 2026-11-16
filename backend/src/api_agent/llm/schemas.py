@@ -1,4 +1,8 @@
-"""OpenAI-compatible request and response schemas, including tool/function definitions."""
+"""定义 OpenAI 兼容对话、工具与动态配置接口的数据结构。
+
+依赖 Pydantic 和公共 API 模型；输入约束字段结构及范围，供应商响应
+由解析器规范化，密钥复用与实际工具执行均不由这些结构决定。
+"""
 
 from typing import Any, Literal
 
@@ -8,10 +12,10 @@ from api_agent.infrastructure.api import ApiInput, ApiModel
 
 
 class FunctionCall(ApiModel):
-    """大模型发起的单个函数调用。
+    """承载模型建议调用的函数名及参数字典，不自动执行或校验函数业务语义。
 
-    实现：``arguments`` 在解析阶段已将模型返回的 JSON 字符串反序列化为结构化字典，
-    调用方可直接传参执行，不必在业务层再次 ``json.loads``。
+    解析器通常解码 JSON 字符串；无法解析时可能保存 _raw 诊断字段，
+    调用方执行前仍须验证参数与权限。
     """
 
     name: str
@@ -19,10 +23,9 @@ class FunctionCall(ApiModel):
 
 
 class ToolCall(ApiModel):
-    """OpenAI 规范的工具调用对象。
+    """承载工具调用 ID、固定 function 类型与函数参数，供工具结果关联。
 
-    实现：包含唯一的 ``id`` 与函数签名，后续工具执行结果需以此 ``id``
-    回传作为 role="tool" 的 ``tool_call_id``。
+    ID 来自供应商，结构本身不保证全局唯一或非空。
     """
 
     id: str
@@ -56,11 +59,10 @@ class ToolDefinition(ApiInput):
 
 
 class ChatCompletionRequest(ApiInput):
-    """向 OpenAI 兼容接口发起单次请求的输入体（支持工具定义）。
+    """向 OpenAI 兼容 Chat Completions 接口发送的非流式输入。
 
-    实现：``model`` 可选，未传时默认使用配置项 ``LLM_MODEL``；
-    ``tools`` 传入支持的函数列表，模型可自主决定是直接回复文本还是调用工具；
-    ``tool_choice`` 允许强制调用特定工具或交由模型决定（auto/required/none）。
+    model 未传时使用客户端有效默认模型；tools 仅声明函数，tool_choice
+    原样传给供应商，具体语义及支持情况由供应商决定。
     """
 
     model: str | None = None
@@ -72,9 +74,9 @@ class ChatCompletionRequest(ApiInput):
 
 
 class ChatCompletionResponse(ApiModel):
-    """OpenAI 兼容接口的结构化响应（非流式 Response 模式）。
+    """统一暴露非流式 Chat Completions 的文本、工具调用、停止原因和用量。
 
-    作用：统一提取并暴露模型返回的文本正文、发起的工具调用清单以及 Token 消耗统计。
+    usage 只含已接受的供应商统计，缺失字段不能作为零成本证明。
     """
 
     id: str
@@ -86,7 +88,7 @@ class ChatCompletionResponse(ApiModel):
 
 
 class LLMStatusResponse(ApiModel):
-    """当前大模型接口配置与可用性状态（脱敏暴露）。"""
+    """展示有效模型配置的本地就绪状态及密钥是否存在，不代表网络验证结果。"""
 
     configured: bool
     mode: str
@@ -130,7 +132,7 @@ class LLMPingRequest(ApiInput):
 
 
 class LLMPingResponse(ApiModel):
-    """大模型接口连通性探测结果。"""
+    """返回真实对话探测的成功标志、经过时间及结果说明，不涵盖全部模型能力。"""
 
     ok: bool
     latency_ms: float
@@ -145,7 +147,7 @@ class LLMModelListRequest(ApiInput):
 
 
 class LLMModelListResponse(ApiModel):
-    """大模型服务返回的可用模型列表。"""
+    """返回供应商报告的模型清单、数量及查询结果，不保证各模型可实际调用。"""
 
     ok: bool
     models: list[str] = Field(default_factory=list)

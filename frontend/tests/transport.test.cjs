@@ -80,7 +80,7 @@ test('a pre-aborted signal never starts an HTTP request', async () => {
   const controller = new AbortController()
   controller.abort()
   await assert.rejects(module.request('/fixture', { signal: controller.signal }),
-    error => error.code === 'network_aborted')
+    error => error.code === 'request_cancelled')
   assert.equal(calls, 0)
 })
 
@@ -94,6 +94,34 @@ test('HTTP timeout remains active while reading the response body', async () => 
   await settle()
   assert.equal(module.timers.size, 1, 'headers do not complete the request')
   module.tick()
-  await assert.rejects(reading, error => error.code === 'network_aborted')
+  await assert.rejects(reading, error => error.code === 'client_timeout' && error.status === 0)
   assert.equal(module.timers.size, 0)
+})
+
+test('caller cancellation during body reading is distinct from the browser deadline', async () => {
+  const body = deferred(), caller = new AbortController()
+  const module = load('api/client.ts', async (_url, options) => {
+    options.signal.addEventListener('abort', () => body.reject(Error('cancelled')))
+    return { ok: true, text: () => body.promise }
+  })
+  const reading = module.request('/fixture', { signal: caller.signal })
+  await settle()
+  caller.abort()
+  await assert.rejects(reading, error => error.code === 'request_cancelled')
+  assert.equal(module.timers.size, 0)
+})
+
+test('console preserves a structured 504 result so it can be displayed and saved', async () => {
+  const result = { ok: false, request: { method: 'GET', url: '/fixture' }, response: null,
+    error_kind: 'request_timeout', result_code: 'REQUEST_TIMEOUT', result_status: 504, elapsed_ms: 50 }
+  const module = load('api/client.ts', async () => new Response(JSON.stringify(result), { status: 504 }))
+  assert.deepEqual(await module.request('/fixture', { acceptResultErrors: true }), result)
+})
+
+test('console opt-in does not hide a management validation or policy rejection', async () => {
+  const module = load('api/client.ts', async () => new Response(JSON.stringify({
+    error: { code: 'target_not_allowed', message: 'Target rejected' },
+  }), { status: 400 }))
+  await assert.rejects(module.request('/fixture', { acceptResultErrors: true }),
+    error => error.status === 400 && error.code === 'target_not_allowed')
 })

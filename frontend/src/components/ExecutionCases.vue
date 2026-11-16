@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 用例与断言结果组件：接收 CaseResult 列表及空态文案，依赖展示格式化函数和图标库。通过 expanded 模型交由父级控制展开项；只展示已返回证据，不重新执行断言。 */
+
 /**
  * 逐用例 + 逐断言的结果列表（可折叠）。
  *
@@ -10,6 +12,7 @@
 import { ChevronDown, CircleCheck, CircleX, TriangleAlert } from 'lucide-vue-next'
 import type { CaseResult } from '@/api/types'
 import { describeAssertionKind, formatDuration, statusTone } from '@/lib/format'
+import { assertionVerdict, presentResult, resultCodeLabel } from '@/lib/results'
 
 const props = withDefaults(
   defineProps<{
@@ -22,10 +25,12 @@ const props = withDefaults(
 
 const expanded = defineModel<string | null>('expanded', { default: null })
 
+/** 切换指定用例的展开 ID；再次点击当前项收起，变更通过 expanded 模型同步父级。 */
 function toggle(id: string): void {
   expanded.value = expanded.value === id ? null : id
 }
 
+/** 统计给定用例中 passed 为真值的断言数量；未执行或失败断言不计入通过数。 */
 function passedCount(item: CaseResult): number {
   return item.assertions.filter((a) => a.passed).length
 }
@@ -56,7 +61,11 @@ function httpTone(status: number | null): string {
         <span v-if="item.response_time_ms != null" class="case-time">
           {{ formatDuration(item.response_time_ms) }}
         </span>
-        <span v-if="item.error_kind" class="case-error">{{ item.error_kind }}</span>
+        <span class="tag" :class="`tag-${presentResult(item).tone}`">
+          {{ presentResult(item).title }}
+          <template v-if="resultCodeLabel(presentResult(item).resultStatus)"> · {{ resultCodeLabel(presentResult(item).resultStatus) }}</template>
+        </span>
+        <span v-if="item.error_kind" class="case-error" :title="presentResult(item).message">{{ item.error_kind }}</span>
         <span class="fill" />
         <span class="case-count">
           {{ passedCount(item) }}/{{ item.assertions.length }}
@@ -69,11 +78,13 @@ function httpTone(status: number | null): string {
       </button>
       <div v-if="expanded === item.id" class="assertions">
         <div v-for="assertion in item.assertions" :key="assertion.index" class="assertion">
-          <span class="assertion-icon" :class="assertion.passed ? 'ok' : 'bad'">
-            {{ assertion.passed ? '✓' : '✕' }}
+          <span class="assertion-icon" :class="assertion.passed === true ? 'ok' : assertion.passed === false ? 'bad' : 'unknown'"
+            :title="assertionVerdict(assertion.passed).label">
+            {{ assertionVerdict(assertion.passed).symbol }}
           </span>
           <span class="assertion-kind">{{ describeAssertionKind(assertion.kind) }}</span>
           <span class="assertion-idx">#{{ assertion.index + 1 }}</span>
+          <span v-if="assertion.passed == null" class="hint">未评估</span>
           <span v-if="assertion.message" class="assertion-msg">{{ assertion.message }}</span>
         </div>
         <div v-if="!item.assertions.length" class="hint">
@@ -106,6 +117,9 @@ function httpTone(status: number | null): string {
 .case-error {
   border-color: #f6e0c8;
 }
+
+.case-timed_out { border-color: var(--warning); }
+.assertion-icon.unknown { color: var(--text-tertiary); }
 
 .case-head {
   display: flex;

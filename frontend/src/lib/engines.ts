@@ -1,3 +1,4 @@
+/** 引擎展示信息与共享选择状态：依赖 Vue、管理 API 和 localStorage。模块单例供顶栏、设置及测试页共用；存储失败可降级为内存选择，探测失败由刷新调用方处理。 */
 /**
  * 执行引擎的展示元信息与选择状态（单一定义来源）。
  *
@@ -10,6 +11,7 @@ import { ref, computed } from 'vue'
 import { engineList } from '@/api/endpoints'
 import type { EngineInfo } from '@/api/types'
 
+/** 引擎的静态展示元信息；实际就绪状态来自管理 API，不由名称或说明推断。 */
 export interface EngineMeta {
   name: string
   kind: string
@@ -53,6 +55,7 @@ export function engineLabel(id: string): string {
   return `${engineMeta(id).name}`
 }
 
+/** 读取持久化的引擎 ID；未保存或浏览器拒绝访问存储时返回 null，由刷新逻辑选择服务端默认值。 */
 function readStored(): string | null {
   try {
     return window.localStorage.getItem(STORAGE_KEY)
@@ -62,6 +65,7 @@ function readStored(): string | null {
   }
 }
 
+/** 尝试持久化给定引擎 ID；存储异常静默忽略，当前模块内的选择仍然有效。 */
 function writeStored(id: string): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, id)
@@ -80,10 +84,12 @@ function writeStored(id: string): void {
 const engines = ref<EngineInfo[]>([])
 const loading = ref(false)
 const selected = ref('native')
+/** 按共享选中 ID 查找最新探测条目；列表未加载或没有匹配项时返回 null。 */
 const activeEngine = computed(
   () => engines.value.find((item) => item.id === selected.value) ?? null,
 )
 
+/** 拉取引擎列表，并在已存 ID 仍可用时恢复选择，否则使用服务端默认项。错误向调用方传播，始终解除 loading。 */
 async function refresh(): Promise<void> {
   loading.value = true
   try {
@@ -97,6 +103,7 @@ async function refresh(): Promise<void> {
   }
 }
 
+/** 更新共享选中 ID 并尝试保存；不重新探测引擎或校验 ID，实际可用性由调用方展示。 */
 function select(id: string): void {
   selected.value = id
   writeStored(id)

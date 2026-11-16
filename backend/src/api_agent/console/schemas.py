@@ -1,9 +1,10 @@
 """Response contracts for console HTTP requests and their history."""
 
 from api_agent.infrastructure.api import ApiModel, UtcDatetime
+from api_agent.infrastructure.outcomes import OutcomeFields
 
 
-class ConsoleHistoryResponse(ApiModel):
+class ConsoleHistoryResponse(ApiModel, OutcomeFields):
     """一条控制台请求的历史摘要。
 
     实现：头已脱敏、正文只留预览，``response_bytes`` 保留真实长度，

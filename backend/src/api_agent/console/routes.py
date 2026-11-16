@@ -2,7 +2,7 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,8 +25,18 @@ router = APIRouter(prefix="/api/console", tags=["console"])
 Session = Annotated[AsyncSession, Depends(session_for)]
 
 
-@router.post("/requests", response_model=ConsoleResult)
-async def send_request(payload: ConsoleRequest, session: Session, request: Request):
+@router.post(
+    "/requests",
+    response_model=ConsoleResult,
+    responses={
+        413: {"model": ConsoleResult, "description": "Target response exceeded the read limit"},
+        502: {"model": ConsoleResult, "description": "Target transport or decoding failed"},
+        504: {"model": ConsoleResult, "description": "Target request deadline exceeded"},
+    },
+)
+async def send_request(
+    payload: ConsoleRequest, session: Session, request: Request, response: Response
+):
     """发出一条受控 HTTP 请求，并把它记入历史。
 
     作用：这是界面上「发送」按钮的落点，也是唯一由界面触发真实请求的入口。
@@ -64,6 +74,9 @@ async def send_request(payload: ConsoleRequest, session: Session, request: Reque
     )
     session.add(record)
     await session.commit()
+    # 仅本机传输失败改变外层 HTTP；目标 4xx/5xx 仍是收到真实响应的正常结果。
+    if not result.ok:
+        response.status_code = result.result_status or 500
     return result
 
 

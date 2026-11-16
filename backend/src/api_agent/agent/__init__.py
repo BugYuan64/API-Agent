@@ -1,1 +1,4 @@
-"""Contract-driven AI generation, diagnosis and bounded follow-up testing."""
+"""契约驱动的用例生成、证据诊断与受预算约束的自动补测包。
+
+模块分别承接 HTTP、模型建议、执行编排和本地产物；目标请求由执行层发送。
+"""

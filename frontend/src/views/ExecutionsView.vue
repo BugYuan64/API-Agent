@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 执行结果回看页：依赖执行列表 API、格式化函数及 ExecutionCases，展示落库执行与可折叠断言。只维护展开状态，不重新执行计划；列表失败通过全局提示反馈。 */
+
 import { onMounted, reactive, ref } from 'vue'
 import { ChevronDown, Terminal } from 'lucide-vue-next'
 import EmptyState from '@/components/EmptyState.vue'
@@ -7,11 +9,11 @@ import { describeError } from '@/api/client'
 import { listExecutions } from '@/api/endpoints'
 import type { Execution } from '@/api/types'
 import {
-  describeExecutionStatus,
   formatDateTime,
   formatDuration,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
+import { presentResult, resultCodeLabel } from '@/lib/results'
 
 /** 执行结果页：与「用例计划」右侧同构，但面向回看而不是即时运行，
  *  因此把每条用例的断言默认折叠，保持长列表可扫读。 */
@@ -21,6 +23,7 @@ const expanded = ref<string | null>(null)
 /** 每条执行记录内展开的用例 id；由 ExecutionCases 受控维护。 */
 const caseExpanded = reactive<Record<string, string | null>>({})
 
+/** 读取最近执行记录到结果列表；失败通过全局提示反馈，始终解除 loading。 */
 async function load() {
   loading.value = true
   try {
@@ -33,10 +36,9 @@ async function load() {
   }
 }
 
-function toneOf(status: string) {
-  if (status === 'passed') return 'success'
-  if (status === 'failed') return 'warning'
-  return 'danger'
+/** 将执行状态映射为展示色调：通过为 success，断言失败为 warning，其余为 danger；不重新裁决结果。 */
+function toneOf(item: Execution) {
+  return presentResult(item).tone
 }
 
 onMounted(load)
@@ -49,7 +51,7 @@ onMounted(load)
         <h2 class="page-title">执行结果</h2>
         <p class="page-sub">
           每次执行的逐用例与逐断言结果都会落库。断言失败与执行错误是两件事：前者说明目标行为不符预期，
-          后者说明请求没跑起来（CLI 缺失、连接失败、报告不完整等）。
+          后者表示超时、连接、引擎或报告异常，不能据此断言请求未发出。
         </p>
       </div>
       <button class="btn btn-sm" :disabled="loading" @click="load">刷新</button>
@@ -58,8 +60,9 @@ onMounted(load)
     <div class="list scroll-y">
       <article v-for="item in items" :key="item.id" class="execution">
         <button class="execution-head" @click="expanded = expanded === item.id ? null : item.id">
-          <span class="tag" :class="`tag-${toneOf(item.status)}`">
-            {{ describeExecutionStatus(item.status) }}
+          <span class="tag" :class="`tag-${toneOf(item)}`" :title="presentResult(item).message">
+            {{ presentResult(item).title }}
+            <template v-if="resultCodeLabel(presentResult(item).resultStatus)"> · {{ resultCodeLabel(presentResult(item).resultStatus) }}</template>
           </span>
           <span class="execution-label truncate">{{ item.label || '(未命名)' }}</span>
           <span class="hint mono">{{ item.observed_attempts }}/{{ item.reserved_requests }} 请求</span>

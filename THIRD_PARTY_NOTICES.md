@@ -21,3 +21,9 @@ assets and do not assign a license to the API-Agent project itself.
 Other Python and JavaScript dependencies are installed through the package
 managers from `backend/uv.lock` and `frontend/package-lock.json`; their source
 and installed dependency directories are not bundled in this repository.
+
+The task-test page bundles three selected Lucide icons from Iconify's
+`@iconify-json/lucide` package. The extracted path data is stored in
+`frontend/src/lib/icons.generated.ts`, derived from the installed icon set;
+Lucide and the data package are licensed under ISC. No icon runtime service or
+full icon catalog is loaded by the browser.

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 空状态展示组件：接收标题、可选说明及 Vue 图标组件，由父级决定何时展示。仅负责呈现，不判断空数据原因或自动重试请求。 */
+
 import type { Component } from 'vue'
 
 withDefaults(

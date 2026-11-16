@@ -22,15 +22,17 @@ from api_agent.infrastructure.history import sanitize_history
 from api_agent.infrastructure.logging import configure_logging
 from api_agent.llm.routes import router as llm_router
 from api_agent.projects.routes import router as projects_router
-from api_agent.runs.routes import router as runs_router
-from api_agent.runs.worker import RunWorker
 from api_agent.streams.routes import router as streams_router
 from api_agent.streams.service import StreamManager
+from api_agent.tasks.routes import router as tasks_router
+from api_agent.tasks.service import TaskManager
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 class HealthResponse(BaseModel):
+    """公开探活结果：给出服务身份、版本和模型模式，不回显凭据或本地配置。"""
+
     status: str
     service: str
     version: str
@@ -46,7 +48,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ① 未显式传 settings 时按标准优先级装载；随后配置应用专属 logger；
     ② 建立 FastAPI 实例，并把 settings 挂到 ``app.state`` 供依赖读取；
     ③ 安装统一错误处理（含 request_id 中间件）；
-    ④ 用 ``lifespan`` 管理启动/关闭资源：迁移、恢复运行与流会话，
+    ④ 用 ``lifespan`` 管理启动/关闭资源：迁移、恢复流会话与中断的编排运行，
        用退出栈保证启动失败或关闭异常时也释放所有已取得资源；
     ⑤ 注册各领域路由，最后声明 ``/health``；
     ⑥ 用本地静态资源提供 Swagger UI（``/docs``），不依赖外网 CDN。
@@ -89,11 +91,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await sanitize_history(database)
             app.state.database = database
 
-            worker = RunWorker(database)
-            app.state.worker = worker
-            resources.push_async_callback(worker.stop)
-            await worker.recover()
-
             streams = StreamManager(database, settings)
             app.state.streams = streams
             resources.push_async_callback(streams.shutdown)
@@ -103,17 +100,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.agents = agents
             resources.push_async_callback(agents.shutdown)
             agents.store.recover()
-            worker.start()
+            tasks = TaskManager(settings.artifact_dir / "tasks", settings, streams)
+            app.state.tasks = tasks
+            resources.push_async_callback(tasks.shutdown)
+            tasks.recover()
             yield
 
     app.router.lifespan_context = lifespan
     app.include_router(projects_router)
-    app.include_router(runs_router)
     app.include_router(console_router)
     app.include_router(streams_router)
     app.include_router(executions_router)
     app.include_router(llm_router)
     app.include_router(agent_router)
+    app.include_router(tasks_router)
 
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health() -> HealthResponse:

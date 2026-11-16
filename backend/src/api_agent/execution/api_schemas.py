@@ -2,7 +2,9 @@
 
 from pydantic import Field
 
+from api_agent.execution.schemas import CaseResult
 from api_agent.infrastructure.api import ApiInput, ApiModel, UtcDatetime
+from api_agent.infrastructure.outcomes import OutcomeFields
 
 
 class ExecutionRunRequest(ApiInput):
@@ -20,7 +22,7 @@ class ExecutionRunRequest(ApiInput):
     engine: str | None = Field(default=None, max_length=32)
 
 
-class ExecutionHistoryResponse(ApiModel):
+class ExecutionHistoryResponse(ApiModel, OutcomeFields):
     """一次执行的摘要与逐用例结果。
 
     实现：``executions`` 原样保留每条用例的状态、HTTP 状态、耗时与断言明细，
@@ -37,7 +39,7 @@ class ExecutionHistoryResponse(ApiModel):
     reserved_requests: int
     observed_attempts: int
     unknown_requests: int
-    executions: list[dict]
+    executions: list[CaseResult]
     # 执行时冻结的脱敏原计划与指纹；旧记录为 None，
     # 界面据此禁用「按本次执行诊断」并提示需要重新执行。
     plan: dict | None = None

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 项目与环境管理页：依赖项目、环境及版本 API，创建项目、编辑授权配置并查看历史。认证只保存环境变量引用；追加版本带乐观锁，管理接口失败通过全局提示反馈。 */
+
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
   ChevronRight,
@@ -52,6 +54,7 @@ const creatingEnvironment = ref(false)
 const savingEnvironment = ref(false)
 const showEnvironmentForm = ref(false)
 
+/** 将逗号分隔方法转换为去空白的大写列表；只做输入归一化，合法性由后端校验。 */
 const parsedMethods = computed(() =>
   environmentForm.methods
     .split(',')
@@ -59,6 +62,7 @@ const parsedMethods = computed(() =>
     .filter(Boolean),
 )
 
+/** 将多行路径转换为去空白的非空列表；不扩展模板或验证授权范围。 */
 const parsedPaths = computed(() =>
   environmentForm.paths
     .split('\n')
@@ -66,6 +70,7 @@ const parsedPaths = computed(() =>
     .filter(Boolean),
 )
 
+/** 切换当前项目并清空旧环境选中及历史，再读取该项目环境；失败提示并清空环境列表，始终解除 loading。 */
 async function selectProject(project: Project) {
   selectedProject.value = project
   selectedEnvironment.value = null
@@ -82,6 +87,7 @@ async function selectProject(project: Project) {
   }
 }
 
+/** 切换当前环境并读取版本历史；失败时清空历史并提示，不修改已保存版本。 */
 async function selectEnvironment(environment: Environment) {
   selectedEnvironment.value = environment
   showEnvironmentForm.value = false
@@ -93,6 +99,7 @@ async function selectEnvironment(environment: Environment) {
   }
 }
 
+/** 读取项目列表并默认加载第一项的环境；失败提示且始终解除 loading。 */
 async function loadProjects() {
   loading.value = true
   try {
@@ -106,6 +113,7 @@ async function loadProjects() {
   }
 }
 
+/** 校验名称后创建项目，追加本地列表并选中；失败提示，始终解除创建态。 */
 async function submitProject() {
   if (!projectForm.name.trim()) {
     useToastStore().push('warning', '请填写项目名称')
@@ -130,6 +138,7 @@ async function submitProject() {
   }
 }
 
+/** 把环境表单转换为后端输入，解析方法、路径及敏感字段规则；认证仅引用环境变量，默认关闭重放，不验证服务端范围策略。 */
 function buildEnvironmentInput() {
   return {
     name: environmentForm.name.trim(),
@@ -153,6 +162,7 @@ function buildEnvironmentInput() {
   }
 }
 
+/** 在已选项目下创建具名环境，成功追加并展示版本历史；缺少名称时拦截，接口失败提示并解除创建态。 */
 async function submitEnvironment() {
   if (!selectedProject.value) return
   const payload = buildEnvironmentInput()
@@ -175,6 +185,7 @@ async function submitEnvironment() {
   }
 }
 
+/** 以当前环境版本号作为乐观锁追加配置版本；空 origin、方法、路径沿用旧配置，成功同步列表及历史，冲突或其他错误提示。 */
 async function saveVersion() {
   if (!selectedEnvironment.value) return
   const payload = buildEnvironmentInput()
@@ -206,6 +217,7 @@ async function saveVersion() {
   }
 }
 
+/** 将指定环境的当前配置填回编辑表单；只恢复认证引用和规则，不读取认证值或立即保存。 */
 function startEdit(environment: Environment) {
   showEnvironmentForm.value = true
   environmentForm.name = environment.name

@@ -1,4 +1,6 @@
 <script setup lang="ts" generic="T extends string">
+/** 泛型受控标签条：接收带键值的标签项，使用 modelValue 输出选中键。依赖 Vue 模型绑定，由父级维护具体内容和合法标签集合，不自行导航或请求数据。 */
+
 /**
  * 标签页切换条：受控组件（`v-model`）+ 泛型键，避免调用方到处写类型断言。
  *

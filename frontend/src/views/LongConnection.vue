@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** WebSocket 调试页面：依赖 streams API、请求头行模型与共享布局，启动会话、增量读取事件并回放历史。 */
+
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   ArrowDownToLine,
@@ -10,7 +12,6 @@ import {
   Radio,
   Send,
   ServerOff,
-  Zap,
 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
 import ResizableSplit from '@/components/ResizableSplit.vue'
@@ -20,13 +21,14 @@ import { useHeaderRows } from '@/composables/useHeaderRows'
 import EmptyState from '@/components/EmptyState.vue'
 import { describeError } from '@/api/client'
 import {
+  deleteStream,
   listStreams,
   readStream,
   sendStreamMessage,
   startStream,
   stopStream,
 } from '@/api/endpoints'
-import type { StreamEvent, StreamKind, StreamSession } from '@/api/types'
+import type { StreamEvent, StreamSession } from '@/api/types'
 import {
   describeStopReason,
   formatBytes,
@@ -36,11 +38,11 @@ import {
   prettyJson,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
+import { presentResult, resultCodeLabel } from '@/lib/results'
 
-/** 表单：SSE 与 WebSocket 共用一套字段，只有个别项按类型显示/隐藏。 */
+/** 长连接表单仅配置 WebSocket 握手、消息和会话上限。 */
 const form = reactive({
-  kind: 'sse' as StreamKind,
-  url: 'http://127.0.0.1:8010/api/streams',
+  url: 'ws://127.0.0.1:8010/ws',
   subprotocols: '',
   maxEvents: 200,
   maxDurationMs: 60_000,
@@ -76,14 +78,16 @@ const logRef = ref<HTMLElement | null>(null)
 let pollAbort: AbortController | null = null
 let pollTimer: number | undefined
 
-const isWebSocket = computed(() => form.kind === 'websocket')
+/** 按会话是否存在及 finished 判断仍可操作的会话；不以事件数量推断连接状态。 */
 const isLive = computed(
   () => !!session.value && !session.value.finished,
 )
+/** 按收发方向过滤当前事件用于展示；全部模式返回完整列表，不移动服务端游标。 */
 const filteredEvents = computed(() =>
   filter.value === 'all' ? events.value : events.value.filter((item) => item.direction === filter.value),
 )
 
+/** 根据当前会话及 finished 生成展示色调；终止错误为 danger，其余结束状态为 neutral。 */
 const statusTone = computed(() => {
   if (!session.value) return 'neutral'
   if (session.value.finished) {
@@ -92,6 +96,7 @@ const statusTone = computed(() => {
   return 'success'
 })
 
+/** 将当前会话状态转换为中文标签；无会话显示未连接，未知状态保留原值。 */
 const statusLabel = computed(() => {
   if (!session.value) return '未连接'
   const labels: Record<string, string> = {
@@ -104,21 +109,7 @@ const statusLabel = computed(() => {
   return labels[session.value.status] ?? session.value.status
 })
 
-/** 切换协议时给出对应的默认头，省掉“为什么 SSE 连不上”的一半问题。 */
-watch(
-  () => form.kind,
-  (kind) => {
-    if (kind === 'sse') {
-      resetHeaderRows([{ name: 'Accept', value: 'text/event-stream' }])
-      form.pingIntervalMs = 20_000
-    } else {
-      resetHeaderRows([{ name: '', value: '' }])
-      form.pingIntervalMs = 15_000
-    }
-  },
-)
-
-/** 新事件到达时滚动到底部，但只在用户没有手动上滚时执行。 */
+/** 新事件到达且 autoScroll 开关开启时，等待 DOM 更新后滚动到底部；不检测用户滚动位置。 */
 watch(
   () => events.value.length,
   async () => {
@@ -133,14 +124,14 @@ watch(
 const {
   rows: headerRows,
   headers: activeHeaders,
-  reset: resetHeaderRows,
-} = useHeaderRows([{ name: 'Accept', value: 'text/event-stream' }])
+} = useHeaderRows()
 
 /** 把多行文本框拆成待发消息列表：空行忽略，但保留行内空格。 */
 const scheduledMessages = computed(() =>
   form.scheduled.split('\n').filter((line) => line.trim().length > 0),
 )
 
+/** 提交当前协议配置并重置本页事件游标，成功后启动管理接口长轮询与刷新历史；空地址拦截，失败提示并解除 connecting。 */
 async function start() {
   if (!form.url.trim()) {
     useToastStore().push('warning', '请先填写长连接地址')
@@ -153,7 +144,7 @@ async function start() {
   activeHistoryId.value = null
   try {
     const created = await startStream({
-      kind: form.kind,
+      kind: 'websocket',
       url: form.url.trim(),
       headers: activeHeaders.value,
       subprotocols: form.subprotocols
@@ -164,7 +155,7 @@ async function start() {
       max_duration_ms: form.maxDurationMs,
       connect_timeout_ms: form.connectTimeoutMs,
       ping_interval_ms: form.pingIntervalMs,
-      send: isWebSocket.value ? scheduledMessages.value : [],
+      send: scheduledMessages.value,
       send_interval_ms: form.sendIntervalMs,
       project_id: null,
     })
@@ -181,6 +172,7 @@ async function start() {
 /** 轮询循环：用 wait_ms 长轮询，服务端有事件就立刻返回。
  *  这样界面接近实时，又不必维持第二条浏览器长连接。 */
 function startPolling(sessionId: string) {
+  /** 读取指定会话游标后的事件并追加到时间线；会话终止时刷新历史，中止或读取失败退出，否则延迟继续读取。 */
   const step = async () => {
     if (!session.value || session.value.id !== sessionId || session.value.finished) return
     pollAbort = new AbortController()
@@ -206,12 +198,14 @@ function startPolling(sessionId: string) {
   void step()
 }
 
+/** 中止当前读取并清理下次调度；只停止浏览器观测，不结束后端会话。 */
 function stopPolling() {
   pollAbort?.abort()
   pollAbort = null
   window.clearTimeout(pollTimer)
 }
 
+/** 请求服务端结束当前会话，成功后停轮询、刷新历史并展示结束原因；失败提示并始终解除 stopping。 */
 async function stop() {
   if (!session.value) return
   stopping.value = true
@@ -228,6 +222,7 @@ async function stop() {
   }
 }
 
+/** 将非空输入作为消息发送到当前会话并更新摘要；成功后清空输入，失败保留输入并提示，始终解除发送态。 */
 async function sendMessage() {
   if (!session.value || !outgoing.value.trim()) return
   sendingMessage.value = true
@@ -241,7 +236,7 @@ async function sendMessage() {
   }
 }
 
-/** 历史会话回放：会话结束与事件读尽是两个独立状态。 */
+/** 回放指定历史的事件并更新会话摘要；会话结束与事件读尽独立判断，最多读取 40 页或遇空页停止，失败提示并保留已读事件。 */
 async function replay(record: (typeof history.value)[number]) {
   stopPolling()
   activeHistoryId.value = record.id
@@ -267,15 +262,45 @@ async function replay(record: (typeof history.value)[number]) {
   }
 }
 
+/** 读取最近长连接会话供回放；管理请求失败时回退空列表，不影响当前连接。 */
 async function loadHistory() {
   try {
     const page = await listStreams(20)
-    history.value = page.items
+    history.value = page.items.filter(item => item.kind === 'websocket')
   } catch {
     history.value = []
   }
 }
 
+/**
+ * 删除一条会话记录。
+ *
+ * 作用：删除的是历史回看线索；若该会话正在跑，后端会先收尾再删，
+ * 因此本页必须同时把当前连接状态复位，否则界面还显示一个已不存在的连接。
+ * 实现：成功后从本地列表移除；若删的正是当前选中项，清空选中并断开显示。
+ */
+async function removeHistory(record: (typeof history.value)[number]) {
+  try {
+    await deleteStream(record.id)
+    history.value = history.value.filter((item) => item.id !== record.id)
+    if (activeHistoryId.value === record.id) {
+      activeHistoryId.value = null
+      session.value = null
+      events.value = []
+    }
+    useToastStore().push('success', '会话记录已删除')
+  } catch (error) {
+    useToastStore().push('danger', '删除失败', describeError(error))
+  }
+}
+
+/** 按共享历史列表提供的 ID 发起删除；记录未加载时忽略。 */
+function removeHistoryById(id: string): void {
+  const target = history.value.find((item) => item.id === id)
+  if (target) removeHistory(target)
+}
+
+/** 按事件方向和种类返回中文标签；发送方向优先，未知事件种类保留原值。 */
 function eventLabel(event: StreamEvent): string {
   if (event.direction === 'out') return '发送'
   const labels: Record<string, string> = {
@@ -291,17 +316,18 @@ function eventLabel(event: StreamEvent): string {
   return labels[event.kind] ?? event.kind
 }
 
+/** 生成事件正文展示：二进制显示截断的 base64 预览，合法 JSON 美化，其余原样保留。 */
 function eventBody(event: StreamEvent): string {
   const data = event.data ?? ''
   if (event.kind === 'binary') return `base64: ${data.slice(0, 600)}`
   return looksLikeJson(data) ? prettyJson(data) : data
 }
 
-/** 把会话记录映射成共享历史列的条目形状（SSE/WS 与结束原因放进 label/meta）。 */
+/** 把会话记录映射成共享历史列的 WebSocket 条目。 */
 const historyEntries = computed<HistoryEntry[]>(() =>
   history.value.map((record) => ({
     id: record.id,
-    label: `${record.kind === 'sse' ? 'SSE' : 'WS'} · ${record.url}`,
+    label: `WS · ${record.url}`,
     status: describeStopReason(record.stop_reason),
     tone: record.status === 'closed' ? 'success' : record.status === 'error' ? 'danger' : 'neutral',
     meta: `${record.event_count} 条 · ${formatRelative(record.created_at)}`,
@@ -327,6 +353,7 @@ onBeforeUnmount(stopPolling)
         :items="historyEntries"
         :active-id="activeHistoryId"
         empty-text="还没有会话记录。建立一次连接后会出现在这里。"
+        :on-delete="removeHistoryById"
         @select="replayById"
       />
     </template>
@@ -343,27 +370,8 @@ onBeforeUnmount(stopPolling)
         <template #first>
       <aside class="lc-config scroll-y">
       <div class="config-head">
-        <h2 class="config-title">长连接测试</h2>
-        <p class="config-sub">SSE 与 WebSocket 共用一套观测视图</p>
-      </div>
-
-      <div class="segmented">
-        <button
-          class="segment"
-          :class="{ 'segment-active': form.kind === 'sse' }"
-          @click="form.kind = 'sse'"
-        >
-          <Radio :size="13" />
-          SSE
-        </button>
-        <button
-          class="segment"
-          :class="{ 'segment-active': form.kind === 'websocket' }"
-          @click="form.kind = 'websocket'"
-        >
-          <Zap :size="13" />
-          WebSocket
-        </button>
+        <h2 class="config-title">WebSocket 调试</h2>
+        <p class="config-sub">WebSocket 双向连接调试</p>
       </div>
 
       <label class="field">
@@ -372,15 +380,11 @@ onBeforeUnmount(stopPolling)
           v-model="form.url"
           class="input mono"
           spellcheck="false"
-          :placeholder="isWebSocket ? 'ws://127.0.0.1:9001/ws' : 'http://127.0.0.1:8080/events'"
+          placeholder="ws://127.0.0.1:9001/ws"
           @keydown.enter.exact.prevent="start"
         />
         <span class="hint">
-          {{
-            isWebSocket
-              ? 'ws:// 与 http:// 都可填，后端会按协议归一'
-              : 'http(s):// 或 ws(s):// 均可，SSE 会走 HTTP 流'
-          }}
+          ws:// 或 wss:// WebSocket 地址
         </span>
       </label>
 
@@ -404,12 +408,12 @@ onBeforeUnmount(stopPolling)
         </button>
       </div>
 
-      <label v-if="isWebSocket" class="field">
+      <label class="field">
         <span class="field-label">子协议（逗号分隔）</span>
         <input v-model="form.subprotocols" class="input mono" placeholder="graphql-ws" />
       </label>
 
-      <label v-if="isWebSocket" class="field">
+      <label class="field">
         <span class="field-label">连接后自动发送（每行一条）</span>
         <textarea
           v-model="form.scheduled"
@@ -420,7 +424,7 @@ onBeforeUnmount(stopPolling)
         />
       </label>
 
-      <label v-if="isWebSocket" class="field">
+      <label class="field">
         <span class="field-label">发送间隔（毫秒）</span>
         <input v-model.number="form.sendIntervalMs" class="input" type="number" min="0" max="60000" step="50" />
       </label>
@@ -476,7 +480,7 @@ onBeforeUnmount(stopPolling)
         <div class="stage-title">
           <span class="stage-dot" :class="`dot-${statusTone}`" />
           <span>{{ statusLabel }}</span>
-          <span v-if="session" class="tag">{{ session.kind === 'sse' ? 'SSE' : 'WebSocket' }}</span>
+          <span v-if="session" class="tag">WebSocket</span>
           <span v-if="session?.subprotocol" class="tag tag-info">子协议 {{ session.subprotocol }}</span>
         </div>
         <div class="stage-stats" v-if="session">
@@ -491,12 +495,12 @@ onBeforeUnmount(stopPolling)
         </div>
       </div>
 
-      <div v-if="session?.error_message" class="stage-error">
-        <strong>{{ session.error_kind }}</strong>
-        <span>{{ session.error_message }}</span>
+      <div v-if="session?.error_kind" class="stage-error">
+        <strong>{{ presentResult(session).title }}<template v-if="resultCodeLabel(presentResult(session).resultStatus)"> · {{ resultCodeLabel(presentResult(session).resultStatus) }}</template></strong>
+        <span>{{ presentResult(session).message }}</span>
       </div>
 
-      <div v-if="session && isWebSocket && !session.finished" class="send-bar">
+      <div v-if="session && !session.finished" class="send-bar">
         <input
           v-model="outgoing"
           class="input mono"
@@ -541,8 +545,8 @@ onBeforeUnmount(stopPolling)
         <div v-if="!session" class="timeline-empty">
           <EmptyState
             :icon="Cable"
-            title="选择协议后开始连接"
-            description="SSE 会逐条记录 data/event 字段与注释行；WebSocket 记录每一帧、关闭码与协商到的子协议。收尾原因会区分「目标关闭」和「本服务按上限停止」。"
+            title="开始 WebSocket 调试"
+            description="记录每一帧、关闭码与协商到的子协议。收尾原因会区分目标主动关闭和本服务按上限停止。"
           />
         </div>
         <div v-else-if="!filteredEvents.length" class="timeline-empty">
@@ -640,36 +644,6 @@ onBeforeUnmount(stopPolling)
   margin: 0;
   font-size: 11.5px;
   color: var(--text-tertiary);
-}
-
-.segmented {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 3px;
-  padding: 3px;
-  border-radius: var(--radius-md);
-  background: var(--bg-subtle);
-}
-
-.segment {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  height: 27px;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 500;
-}
-
-.segment-active {
-  background: var(--bg-surface);
-  color: var(--text-primary);
-  font-weight: 600;
-  box-shadow: var(--shadow-sm);
 }
 
 .header-list {

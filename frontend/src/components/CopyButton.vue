@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 复制按钮：接收待复制文本和反馈文案，依赖浏览器剪贴板与临时 textarea 回退。点击后短暂显示已复制状态；回退通道也异常时会向调用环境传播。 */
+
 import { computed, ref } from 'vue'
 import { Check, Copy } from 'lucide-vue-next'
 
@@ -13,7 +15,7 @@ const props = withDefaults(
 )
 
 const copied = ref(false)
-// 用 token 保证连续点击时只显示最后一次的反馈。
+// 连续点击会清理旧计时器，使反馈从最后一次复制起计时。
 let timer: number | undefined
 
 /** 优先用 Clipboard API；它需要安全上下文，失败时回退到临时 textarea。 */
@@ -35,6 +37,7 @@ async function copy() {
   timer = window.setTimeout(() => (copied.value = false), 1600)
 }
 
+/** 按当前复制反馈状态选择复制或勾选图标；不读取剪贴板确认实际内容。 */
 const icon = computed(() => (copied.value ? Check : Copy))
 </script>
 

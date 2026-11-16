@@ -33,9 +33,9 @@ async def test_shutdown_awaits_terminal_stream_still_finalizing(settings, monkey
             await release.wait()
         await original_flush(stream, final=final)
 
-    monkeypatch.setattr(manager, "_run_sse", terminal_but_still_owns_resources)
+    monkeypatch.setattr(manager, "_run_websocket", terminal_but_still_owns_resources)
     monkeypatch.setattr(manager, "_flush", delayed_flush)
-    stream = await manager.start(StreamStart(kind="sse", url="http://127.0.0.1:9"), [])
+    stream = await manager.start(StreamStart(kind="websocket", url="http://127.0.0.1:9"), [])
     shutdown = None
     try:
         await asyncio.wait_for(finalizing.wait(), 2)
@@ -59,8 +59,8 @@ async def test_failed_flush_retries_original_events_before_new_events(settings, 
     database = Database(settings)
     await database.migrate_async()
     manager = StreamManager(database, settings)
-    stream = ActiveStream(id="fixture-stream", kind="sse", url="http://127.0.0.1:9")
-    await manager._persist_new(stream, StreamStart(kind="sse", url=stream.url), stream.url)
+    stream = ActiveStream(id="fixture-stream", kind="websocket", url="http://127.0.0.1:9")
+    await manager._persist_new(stream, StreamStart(kind="websocket", url=stream.url), stream.url)
     stream.append("message", "first")
     original = database.session
 

@@ -47,125 +47,6 @@ async def collect(client, session_id, *, until_finished=True, timeout=8.0, wait_
     return session, events
 
 
-async def test_sse_records_events_and_reports_target_close(client, target):
-    """SSE：应记录 open/message/close，并把结束原因归为「目标关闭」。
-
-    实现：``/sse`` 发 4 条带事件名的消息后正常结束；
-    断言事件类型齐全、多行 data 被拼接、结束原因是 target_closed
-    而不是 limits_exceeded（那是本服务主动停止）。
-    """
-    response = await client.post(
-        "/api/streams",
-        json={"kind": "sse", "url": f"{target.base_url}/sse", "max_duration_ms": 8000},
-    )
-    assert response.status_code == 202, response.text
-    session_id = response.json()["id"]
-
-    session, events = await collect(client, session_id)
-    assert session["finished"] is True
-    assert session["status"] == "closed"
-    assert session["stop_reason"] == "target_closed"
-    assert session["http_status"] == 200
-    kinds = [event["kind"] for event in events]
-    assert kinds[0] == "open"
-    assert "comment" in kinds
-    assert kinds.count("message") == 5
-    assert kinds[-1] == "close"
-    messages = [event for event in events if event["kind"] == "message"]
-    assert [event["event_name"] for event in messages[:4]] == ["tick"] * 4
-    assert messages[-1]["data"] == "line one\nline two"
-
-
-async def test_sse_stream_can_be_stopped_and_is_persisted(client, target):
-    """SSE：客户端停止后应落 cancelled，并且事件已持久化可回查。
-
-    实现：连 ``/sse-forever``，收够几条后调用 stop；
-    随后用同一个 ID 再读一次（此时会话已从内存移出），
-    验证它能从数据库回放出同一个时间线，并标记 ``finished=True``。
-    """
-    response = await client.post(
-        "/api/streams",
-        json={"kind": "sse", "url": f"{target.base_url}/sse-forever", "max_duration_ms": 30_000},
-    )
-    session_id = response.json()["id"]
-
-    cursor = 0
-    for _ in range(200):
-        page = (await client.get(f"/api/streams/{session_id}", params={"after": cursor})).json()
-        cursor = page["next_cursor"]
-        if len([e for e in page["events"] if e["kind"] == "message"]) >= 2:
-            break
-        await asyncio.sleep(0.02)
-    assert cursor >= 2
-
-    stopped = await client.post(f"/api/streams/{session_id}/stop")
-    assert stopped.status_code == 200
-    assert stopped.json()["finished"] is True
-
-    # 等后台任务完成收尾落库，再确认内存副本已移入历史。
-    await asyncio.sleep(0.2)
-    replay = await client.get(f"/api/streams/{session_id}", params={"after": 0, "wait_ms": 0})
-    assert replay.status_code == 200
-    body = replay.json()
-    assert body["session"]["finished"] is True
-    assert body["session"]["status"] in {"cancelled", "closed"}
-    assert body["session"]["stop_reason"] == "client_stopped"
-    assert len(body["events"]) >= 2
-
-    history = await client.get("/api/streams")
-    assert any(item["id"] == session_id for item in history.json()["items"])
-
-
-async def test_sse_duration_limit_is_reported_as_deadline(client, target):
-    """SSE：总时长到点应归为 deadline_exceeded，而不是目标关闭。
-
-    实现：上限设为最短的 1 秒，断言收尾原因与 ``closed`` 状态。
-    """
-    response = await client.post(
-        "/api/streams",
-        json={"kind": "sse", "url": f"{target.base_url}/sse-forever", "max_duration_ms": 1000},
-    )
-    session_id = response.json()["id"]
-    session, _events = await collect(client, session_id, timeout=6.0)
-    assert session["finished"] is True
-    assert session["stop_reason"] == "deadline_exceeded"
-
-
-async def test_sse_event_limit_counts_and_stops(client, target):
-    """SSE：达到 max_events 就停止，并把原因记为 limits_exceeded。
-
-    实现：上限设 3 条，断言最终事件数不超过上限+1（并发写入的收尾标记）。
-    """
-    response = await client.post(
-        "/api/streams",
-        json={
-            "kind": "sse",
-            "url": f"{target.base_url}/sse-forever",
-            "max_events": 3,
-            "max_duration_ms": 30_000,
-        },
-    )
-    session_id = response.json()["id"]
-    session, events = await collect(client, session_id, timeout=6.0)
-    assert session["stop_reason"] == "limits_exceeded"
-    assert len(events) <= 4
-
-
-async def test_sse_handshake_rejection_is_not_a_stream_failure(client, target):
-    """SSE：目标返回 401 应归类为握手被拒，而不是流读取失败。
-
-    实现：``/sse-reject`` 返回 401，断言 http_status 与 error_kind 都如实记录。
-    """
-    response = await client.post(
-        "/api/streams", json={"kind": "sse", "url": f"{target.base_url}/sse-reject"}
-    )
-    session_id = response.json()["id"]
-    session, _events = await collect(client, session_id, timeout=5.0)
-    assert session["status"] == "error"
-    assert session["error_kind"] == "handshake_rejected"
-    assert session["http_status"] == 401
-
-
 async def test_websocket_echo_roundtrip_records_both_directions(client, target):
     """WebSocket：握手、接收问候、发送并收到回显，收发都要记入时间线。
 
@@ -303,29 +184,70 @@ async def test_websocket_rejection_is_recorded(client, target):
     )
 
 
-async def test_stream_rejects_non_loopback_and_sse_send_misuse(client, target):
-    """长连接入口必须拒绝越界目标与不可能生效的组合。
-
-    实现：公网地址、以及“SSE 上带待发消息”都应在提交阶段就被拒（400/422）。
-    """
+async def test_stream_rejects_non_loopback_and_sse(client, target):
     remote = await client.post(
-        "/api/streams", json={"kind": "sse", "url": "http://example.com/events"}
+        "/api/streams", json={"kind": "websocket", "url": "ws://example.com/ws"}
     )
     assert remote.status_code == 400
-    assert remote.json()["error"]["code"] == "target_not_loopback"
-
-    misuse = await client.post(
-        "/api/streams",
-        json={"kind": "sse", "url": f"{target.base_url}/sse", "send": ["nope"]},
+    rejected = await client.post(
+        "/api/streams", json={"kind": "sse", "url": f"{target.base_url}/sse"}
     )
-    assert misuse.status_code == 422
+    assert rejected.status_code == 422
 
-    wrong_send = await client.post(
-        "/api/streams",
-        json={"kind": "sse", "url": f"{target.base_url}/sse", "max_duration_ms": 1000},
+
+async def test_stopped_session_can_be_deleted_with_its_events(client, target):
+    """已结束的会话应可删除，事件时间线随会话一起消失。
+
+    实现：连一个会正常结束的 SSE，等它落库后 ``DELETE``；
+    断言 204、历史列表不再出现该 ID、再读该会话变 404（事件已随 CASCADE 删除）。
+    """
+    response = await client.post(
+        "/api/streams", json={"kind": "websocket", "url": f"{target.ws_url}/ws-close"}
     )
-    session_id = wrong_send.json()["id"]
-    await asyncio.sleep(0.1)
-    rejected = await client.post(f"/api/streams/{session_id}/send", json={"message": "x"})
-    assert rejected.status_code == 409
-    assert rejected.json()["error"]["code"] == "stream_not_sendable"
+    session_id = response.json()["id"]
+    for _ in range(200):
+        page = (await client.get(f"/api/streams/{session_id}", params={"after": 0})).json()
+        if page["session"]["finished"]:
+            break
+        await asyncio.sleep(0.02)
+    assert page["session"]["finished"] is True
+
+    assert (await client.delete(f"/api/streams/{session_id}")).status_code == 204
+
+    history = await client.get("/api/streams")
+    assert all(item["id"] != session_id for item in history.json()["items"])
+    replay = await client.get(f"/api/streams/{session_id}", params={"after": 0, "wait_ms": 0})
+    assert replay.status_code == 404
+
+
+async def test_deleting_a_running_session_stops_it_first(client, target):
+    """删除在跑的会话必须先收尾，不能留下继续写入的后台任务。
+
+    实现：连 ``/sse-forever``（不会自己结束），确认它在跑后直接 ``DELETE``；
+    断言 204、历史里没有它、再读为 404。若实现直接删数据库行，
+    内存任务仍会继续写事件并把记录“写回来”，本用例就会失败。
+    """
+    response = await client.post(
+        "/api/streams",
+        json={"kind": "websocket", "url": f"{target.ws_url}/ws", "max_duration_ms": 30_000},
+    )
+    session_id = response.json()["id"]
+    for _ in range(200):
+        page = (await client.get(f"/api/streams/{session_id}", params={"after": 0})).json()
+        if page["events"]:
+            break
+        await asyncio.sleep(0.02)
+    assert page["session"]["finished"] is False
+
+    assert (await client.delete(f"/api/streams/{session_id}")).status_code == 204
+
+    history = await client.get("/api/streams")
+    assert all(item["id"] != session_id for item in history.json()["items"])
+    assert (
+        await client.get(f"/api/streams/{session_id}", params={"after": 0, "wait_ms": 0})
+    ).status_code == 404
+
+
+async def test_deleting_an_unknown_session_is_404(client):
+    """删除不存在的会话返回 404，不伪装成功。"""
+    assert (await client.delete("/api/streams/missing")).status_code == 404

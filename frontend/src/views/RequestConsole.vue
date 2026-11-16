@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** HTTP 调试页面：依赖控制台 API、请求头行模型及共享工作台，发送表单请求、显示响应并恢复历史。目标请求由后端执行；历史正文是预览，管理接口错误与目标响应分别展示。 */
+
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import {
   ArrowUpRight,
@@ -15,7 +17,7 @@ import ResizableSplit from '@/components/ResizableSplit.vue'
 import TestWorkspace from '@/components/TestWorkspace.vue'
 import { useHeaderRows } from '@/composables/useHeaderRows'
 import EmptyState from '@/components/EmptyState.vue'
-import { describeError } from '@/api/client'
+import { ApiError, describeError } from '@/api/client'
 import {
   clearConsoleHistory,
   deleteConsoleHistory,
@@ -29,6 +31,7 @@ import type {
   HttpMethod,
 } from '@/api/types'
 import {
+  describeRedirect,
   formatBytes,
   formatDuration,
   formatRelative,
@@ -37,6 +40,7 @@ import {
   statusTone,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
+import { presentManagementError, presentResult, resultCodeLabel, type ResultPresentation } from '@/lib/results'
 
 const METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 const BODY_MODES: { value: BodyMode; label: string }[] = [
@@ -66,6 +70,8 @@ const form = reactive({
   body: '',
   timeoutMs: 10_000,
   followRedirects: false,
+  sseMaxEvents: 50,
+  sseDurationMs: 3000,
 })
 
 /** 头以「行」的形式编辑（Postman/Apifox 的心智模型），折叠规则与长连接页共用一份。 */
@@ -80,10 +86,13 @@ const {
 const tab = ref<'params' | 'headers' | 'body' | 'meta'>('body')
 const sending = ref(false)
 const result = ref<ConsoleResult | null>(null)
+/** 页面管理链路失败仅保留本地提示，不写入目标结果或历史。 */
+const localFailure = ref<ResultPresentation | null>(null)
 const history = ref<ConsoleHistory[]>([])
 const historyLoading = ref(false)
 const activeHistoryId = ref<string | null>(null)
 
+/** 根据所选方法判断是否展示正文能力；GET、HEAD 与 OPTIONS 不允许发送正文。 */
 const hasBody = computed(() => !['GET', 'HEAD', 'OPTIONS'].includes(form.method))
 
 /** GET/HEAD/OPTIONS 不允许携带请求体（后端会 422），所以切到这些方法时自动收敛。 */
@@ -107,8 +116,27 @@ const responseBodyText = computed(() => {
   return looksLikeJson(body) ? prettyJson(body) : body
 })
 
+/** 仅按已返回目标响应的 HTTP 状态计算色调；没有响应时为 neutral。 */
 const responseTone = computed(() => statusTone(result.value?.response?.status))
+/** 即时与历史结果共用分类，不把本地 504 写进目标响应。 */
+const resultInfo = computed(() => result.value ? presentResult(result.value, result.value.response?.status) : null)
 
+/**
+ * 目标返回 3xx 且没有跟随时，提取它的 Location 供界面提示。
+ *
+ * 作用：默认不跟随跳转是安全设计（避免被带到授权范围外），但用户只看到一个
+ * 302 会以为请求失败或没生效。这里明确告诉他“跳转被刻意拦下了、指向哪里”。
+ * 实现：只在响应状态是 3xx 且 ``redirects`` 为空（即未跟随）时返回；否则为 null。
+ */
+const blockedRedirect = computed(() => {
+  const response = result.value?.response
+  if (!response || response.status < 300 || response.status >= 400) return null
+  if (response.redirects.length) return null
+  const location = response.headers['location']?.[0] ?? null
+  return { status: response.status, reason: response.reason, location }
+})
+
+/** 将示例方法和地址填入表单；仅示例包含正文时切换为 JSON 并覆盖正文，不自动发送。 */
 function applySample(sample: (typeof SAMPLES)[number]) {
   form.method = sample.method
   form.url = sample.url
@@ -119,6 +147,7 @@ function applySample(sample: (typeof SAMPLES)[number]) {
   }
 }
 
+/** 对合法 JSON 正文进行美化；非法文本保留原状并给出提示。 */
 function formatBody() {
   if (!looksLikeJson(form.body)) {
     useToastStore().push('warning', '当前内容不是合法 JSON', '格式化只在内容是 JSON 时可用')
@@ -127,6 +156,7 @@ function formatBody() {
   form.body = prettyJson(form.body)
 }
 
+/** 将表单和折叠后的头提交给后端控制台，显示响应并刷新历史；空地址拦截，目标传输失败与管理接口拒绝分别提示，始终解除 sending。 */
 async function send() {
   if (!form.url.trim()) {
     useToastStore().push('warning', '请先填写请求地址')
@@ -134,6 +164,8 @@ async function send() {
   }
   sending.value = true
   activeHistoryId.value = null
+  result.value = null
+  localFailure.value = null
   try {
     result.value = await sendConsoleRequest({
       method: form.method,
@@ -142,25 +174,29 @@ async function send() {
       body_mode: form.bodyMode,
       body: form.bodyMode === 'none' ? null : form.body,
       timeout_ms: form.timeoutMs,
+      sse_max_events: form.sseMaxEvents,
+      sse_duration_ms: form.sseDurationMs,
       follow_redirects: form.followRedirects,
     })
     if (result.value.ok) {
       tab.value = 'body'
     } else {
       useToastStore().push(
-        result.value.error_kind === 'request_timeout' ? 'warning' : 'danger',
-        result.value.error_kind === 'request_timeout' ? '请求超时' : '请求未送达',
-        result.value.error_message ?? undefined,
+        presentResult(result.value).tone === 'warning' ? 'warning' : 'danger',
+        presentResult(result.value).title,
+        presentResult(result.value).message,
       )
     }
     await loadHistory()
   } catch (error) {
-    useToastStore().push('danger', '请求被拒绝', describeError(error))
+    localFailure.value = presentManagementError(error instanceof ApiError ? error.code : '', error instanceof ApiError ? error.status : 0)
+    useToastStore().push(localFailure.value.tone === 'neutral' ? 'info' : localFailure.value.tone, localFailure.value.title, describeError(error))
   } finally {
     sending.value = false
   }
 }
 
+/** 读取最近 HTTP 历史并更新加载态；失败清空列表但不影响主请求流程。 */
 async function loadHistory() {
   historyLoading.value = true
   try {
@@ -176,6 +212,7 @@ async function loadHistory() {
 
 /** 点击历史把当时的请求参数回填到表单（只回填脱敏后的头）。 */
 function restore(record: ConsoleHistory) {
+  localFailure.value = null
   activeHistoryId.value = record.id
   form.method = record.method as HttpMethod
   form.url = record.url
@@ -214,9 +251,12 @@ function restore(record: ConsoleHistory) {
         error_message: record.error_message,
         elapsed_ms: record.elapsed_ms,
       }
+  result.value.result_code = record.result_code
+  result.value.result_status = record.result_status
   useToastStore().push('info', '已回填历史请求', '响应来自历史记录（正文为预览片段）')
 }
 
+/** 删除指定 HTTP 历史，成功后移除本地条目并清理相关选中项；失败提示并保留列表。 */
 async function removeHistory(record: ConsoleHistory) {
   try {
     await deleteConsoleHistory(record.id)
@@ -227,6 +267,7 @@ async function removeHistory(record: ConsoleHistory) {
   }
 }
 
+/** 清空服务端 HTTP 历史后同步清理本页列表和选中项；失败提示，不清理当前响应。 */
 async function clearAll() {
   try {
     await clearConsoleHistory()
@@ -241,6 +282,7 @@ async function clearAll() {
 /** 响应区高度：上下分栏的受控尺寸，持久化到本页专属 key。 */
 const responseHeight = ref(320)
 
+/** 读取响应区已保存的正数高度；缺失、非法或存储失败时回退 320 像素。 */
 function restoreResponseHeight(): number {
   try {
     const saved = Number(window.localStorage.getItem('api-agent.layout.console.response'))
@@ -257,18 +299,20 @@ const historyEntries = computed<HistoryEntry[]>(() =>
   history.value.map((record) => ({
     id: record.id,
     label: record.url,
-    status: record.ok ? String(record.status_code) : record.error_kind ?? 'error',
-    tone: statusTone(record.status_code),
+    status: record.ok ? String(record.status_code) : presentResult(record).title,
+    tone: record.ok ? statusTone(record.status_code) : presentResult(record).tone,
     meta: `${formatRelative(record.created_at)} · ${formatDuration(record.elapsed_ms)}`,
     raw: record,
   })),
 )
 
+/** 按共享历史列表提供的 ID 恢复已加载记录；ID 不存在时不做处理。 */
 function restoreById(id: string): void {
   const target = history.value.find((item) => item.id === id)
   if (target) restore(target)
 }
 
+/** 按共享历史列表提供的 ID 发起删除；记录未加载时忽略，异步失败由 removeHistory 提示。 */
 function removeHistoryById(id: string): void {
   const target = history.value.find((item) => item.id === id)
   if (target) removeHistory(target)
@@ -286,31 +330,13 @@ onMounted(loadHistory)
         :items="historyEntries"
         :active-id="activeHistoryId"
         empty-text="还没有请求记录。发送一次请求后，这里会保留脱敏摘要。"
+        :on-delete="removeHistoryById"
+        :on-clear="clearAll"
         @select="restoreById"
       >
-        <template #head-actions>
-          <button
-            type="button"
-            class="btn btn-ghost btn-sm"
-            :disabled="history.length === 0"
-            title="清空全部历史"
-            @click="clearAll"
-          >
-            <Trash2 :size="13" />
-          </button>
-        </template>
         <template #prefix="{ item }">
           <span class="method" :class="`method-${String((item.raw as ConsoleHistory | undefined)?.method ?? '').toLowerCase()}`">
             {{ (item.raw as ConsoleHistory | undefined)?.method }}
-          </span>
-        </template>
-        <template #actions="{ item }">
-          <span
-            class="history-delete"
-            title="删除这条记录"
-            @click.stop="removeHistoryById(item.id)"
-          >
-            <Trash2 :size="12" />
           </span>
         </template>
       </HistoryList>
@@ -434,6 +460,14 @@ onMounted(loadHistory)
 
       <div v-else class="tab-body meta-grid">
         <label class="field">
+          <span class="field-label">SSE 观察时长（毫秒）</span>
+          <input v-model.number="form.sseDurationMs" class="input" type="number" min="100" max="30000" />
+        </label>
+        <label class="field">
+          <span class="field-label">SSE 最多事件</span>
+          <input v-model.number="form.sseMaxEvents" class="input" type="number" min="1" max="1000" />
+        </label>
+        <label class="field">
           <span class="field-label">超时（毫秒）</span>
           <input v-model.number="form.timeoutMs" class="input" type="number" min="100" max="60000" step="100" />
           <span class="hint">100 – 60000，超时会被归类为 request_timeout</span>
@@ -469,16 +503,24 @@ onMounted(loadHistory)
             <span v-if="result.response" class="tag" :class="`tag-${responseTone === 'neutral' ? '' : responseTone}`">
               {{ result.response.status }} {{ result.response.reason ?? '' }}
             </span>
-            <span v-else class="tag tag-danger">{{ result.error_kind }}</span>
+            <span v-else class="tag" :class="`tag-${resultInfo?.tone}`">
+              {{ resultInfo?.title }}<template v-if="resultCodeLabel(resultInfo?.resultStatus)"> · {{ resultCodeLabel(resultInfo?.resultStatus) }}</template>
+            </span>
             <span class="tag">{{ formatDuration(result.elapsed_ms) }}</span>
             <span v-if="result.response" class="tag">
               {{ formatBytes(result.response.body_bytes) }}
             </span>
+            <span v-if="result?.response?.sse" class="tag">SSE · {{ result.response.sse.events.length }} 事件 · {{ result.response.sse.stop_reason }}</span>
             <CopyButton v-if="responseBodyText" :text="responseBodyText" label="复制响应" />
           </div>
         </div>
 
-        <div v-if="!result" class="response-empty">
+        <div v-if="localFailure" class="response-error">
+          <div class="error-title">{{ localFailure.title }}</div>
+          <p class="error-detail">{{ localFailure.message }}</p>
+          <p class="hint">结果码：<code>{{ localFailure.code }}</code><template v-if="localFailure.resultStatus != null">；管理接口 HTTP {{ localFailure.resultStatus }}</template></p>
+        </div>
+        <div v-else-if="!result" class="response-empty">
           <EmptyState
             :icon="FileCode2"
             title="还没有响应"
@@ -487,10 +529,11 @@ onMounted(loadHistory)
         </div>
 
         <div v-else-if="!result.response" class="response-error">
-          <div class="error-title">请求未送达目标</div>
-          <p class="error-detail">{{ result.error_message }}</p>
+          <div class="error-title">{{ resultInfo?.title }}</div>
+          <p class="error-detail">{{ resultInfo?.message }}</p>
           <p class="hint">
-            错误类别：<code>{{ result.error_kind }}</code>。这表示本服务没能拿到 HTTP 回包，
+            结果码：<code>{{ resultInfo?.code }}</code>；错误类别：<code>{{ result.error_kind }}</code>。
+            这表示本服务没能取得完整、可评估的 HTTP 响应，
             不代表目标返回了某个错误状态码。
           </p>
         </div>
@@ -499,11 +542,38 @@ onMounted(loadHistory)
           <div v-if="result.response.body_truncated" class="truncated-note">
             响应体已截断展示（显示前 1,000,000 字符）。
           </div>
+          <div v-if="blockedRedirect" class="redirect-blocked">
+            <div class="redirect-head">
+              <ArrowUpRight :size="12" />
+              目标返回 <strong>{{ describeRedirect(blockedRedirect.status, blockedRedirect.reason) }}</strong>，默认不跟随跳转
+            </div>
+            <div v-if="blockedRedirect.location" class="redirect-hop">
+              <span class="tag tag-info">{{ blockedRedirect.status }}</span>
+              <span class="hop-arrow">→</span>
+              <span class="hop-url">{{ blockedRedirect.location }}</span>
+            </div>
+            <div class="redirect-hint">如需跟随，在「设置」中开启「跟随重定向」；跳转仍会逐跳校验目标范围。</div>
+          </div>
           <div v-if="result.response.redirects.length" class="redirect-note">
-            已跟随跳转：
-            <span v-for="(hop, index) in result.response.redirects" :key="index" class="hop">
-              {{ hop }}<ArrowUpRight :size="11" />
-            </span>
+            <div class="redirect-head">已跟随跳转：</div>
+            <div
+              v-for="(hop, index) in result.response.redirects"
+              :key="index"
+              class="redirect-hop"
+            >
+              <span class="tag" :class="`tag-${statusTone(hop.status)}`">
+                {{ describeRedirect(hop.status, hop.reason) }}
+              </span>
+              <span class="hop-arrow">→</span>
+              <span class="hop-url">{{ hop.url }}</span>
+              <span v-if="hop.cross_origin" class="tag tag-warning">跨源 · 已剥离凭据</span>
+            </div>
+            <div class="redirect-hop">
+              <span class="tag" :class="`tag-${statusTone(result.response.status)}`">
+                {{ describeRedirect(result.response.status, result.response.reason) }}
+              </span>
+              <span class="hop-final">最终响应</span>
+            </div>
           </div>
           <div class="response-split">
             <pre class="code-block scroll-y">{{ responseBodyText || '（空响应体）' }}</pre>
@@ -851,9 +921,58 @@ onMounted(loadHistory)
   background: var(--info-soft);
   color: var(--info);
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+/* 未跟随的 3xx：独立提示，说明跳转被刻意拦下而不是失败。 */
+.redirect-blocked {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--info-soft);
+  color: var(--info);
+  font-size: 11.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-left: 2px solid var(--info);
+}
+
+.redirect-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 600;
+}
+
+.redirect-hint {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.redirect-hop {
+  display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  font-size: 11.5px;
+}
+
+.hop-arrow {
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+}
+
+.hop-url {
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.hop-final {
+  color: var(--text-tertiary);
+  font-size: 11px;
 }
 
 .hop {

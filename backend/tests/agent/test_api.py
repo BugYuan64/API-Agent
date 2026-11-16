@@ -109,3 +109,57 @@ async def test_manager_shutdown_cancels_and_persists_active_job(client, app, mon
     await app.state.agents.shutdown()
     assert app.state.agents.store.read(run_id)["status"] == "cancelled"
     assert not app.state.agents.tasks
+
+
+async def test_completed_run_can_be_deleted(client, app, monkeypatch):
+    """终态运行应可删除证据文件，删除后查询与报告都变 404。
+
+    实现：跑一次会被立即取消的运行（终态），``DELETE`` 后断言 204，
+    再 GET 记录与报告均为 404；重复删除同样 404。
+    """
+    app.state.settings.target_allowed_origins = ["http://127.0.0.1:9100"]
+    await enable(client)
+
+    class Slow(ScriptedModel):
+        async def chat_completion(self, request):
+            await asyncio.sleep(30)
+
+    install_model(monkeypatch, Slow())
+    created = await client.post(
+        "/api/agent/runs", json=request_for("http://127.0.0.1:9100").model_dump()
+    )
+    run_id = created.json()["id"]
+    await asyncio.sleep(0.02)
+    await client.post(f"/api/agent/runs/{run_id}/cancel")
+
+    assert (await client.delete(f"/api/agent/runs/{run_id}")).status_code == 204
+    assert (await client.get(f"/api/agent/runs/{run_id}")).status_code == 404
+    assert (await client.get(f"/api/agent/runs/{run_id}/report")).status_code == 404
+    assert (await client.delete(f"/api/agent/runs/{run_id}")).status_code == 404
+
+
+async def test_active_run_must_be_cancelled_before_deleting(client, app, monkeypatch):
+    """运行中的记录不能直接删：后台任务仍在写同一文件，删除会与写入竞争。
+
+    实现：起一个卡在模型调用里的运行，确认 ``DELETE`` 返回 409 且记录仍在。
+    """
+    app.state.settings.target_allowed_origins = ["http://127.0.0.1:9100"]
+    await enable(client)
+
+    class Slow(ScriptedModel):
+        async def chat_completion(self, request):
+            await asyncio.sleep(30)
+
+    install_model(monkeypatch, Slow())
+    created = await client.post(
+        "/api/agent/runs", json=request_for("http://127.0.0.1:9100").model_dump()
+    )
+    run_id = created.json()["id"]
+    await asyncio.sleep(0.02)
+
+    blocked = await client.delete(f"/api/agent/runs/{run_id}")
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "agent_run_active"
+    assert (await client.get(f"/api/agent/runs/{run_id}")).status_code == 200
+
+    await client.post(f"/api/agent/runs/{run_id}/cancel")

@@ -1,4 +1,8 @@
-"""Bounded feedback loop; every dispatch is reserved durably before sending."""
+"""执行有预算和总时限的生成、执行、诊断及补测闭环。
+
+依赖 AgentService 调用模型与执行层、AgentStore 保存记录；发送前持久化预留，
+执行事实与模型解释分别记录，不自行发起目标 HTTP 请求。
+"""
 
 import asyncio
 import hashlib
@@ -21,16 +25,24 @@ from api_agent.execution.schemas import RunResult, empty_result
 
 
 def now():
+    """返回带 UTC 时区的 ISO 时间文本，用于持久化事件而非计算经过时长。"""
     return datetime.now(UTC).isoformat()
 
 
 class AgentRuntime:
+    """编排单次后台运行，将状态变化、保守预算结算和降级结果写入存储。"""
+
     def __init__(self, agent: AgentService, store: AgentStore):
+        """绑定本次运行的模型/执行服务与产物存储，不创建后台任务。"""
         self.agent = agent
         self.store = store
 
     def create(self, request: AgentRunRequest) -> dict:
         # Creation validates scope/engine before accepting a background task.
+        """验证引擎和目标后冻结脱敏请求，创建并保存 queued 运行记录。
+
+        不发送模型或目标请求；范围、引擎及持久化错误直接上抛给接收入口。
+        """
         self.agent.execution.resolve_engine(request.engine)
         if request.scope.origin not in self.agent.settings.target_allowed_origins:
             raise AgentError("origin_not_allowed")
@@ -77,11 +89,16 @@ class AgentRuntime:
     def save(self, record):
         # The initial snapshot was scrubbed before hashing. Later discoveries must
         # never rewrite it; only newly appended evidence is scrubbed with new secrets.
+        """清洗可追加字段并保存记录，保持初始快照及其哈希不随新发现改写。
+
+        存储失败直接上抛，避免把未持久化状态描述为已落盘。
+        """
         safe = self.agent.context.clean({k: v for k, v in record.items() if k != "snapshot"})
         safe["snapshot"] = record["snapshot"]
         self.store.save(safe)
 
     def event(self, record, node, status, reason=""):
+        """追加带顺序号、UTC 时间与脱敏原因的事件，并立即持久化整条记录。"""
         record["events"].append(
             {
                 "sequence": len(record["events"]) + 1,
@@ -94,6 +111,7 @@ class AgentRuntime:
         self.save(record)
 
     def degrade(self, record, code):
+        """去重记录退化原因，将模型与报告标为退化/部分完成并保存事件。"""
         if code not in record["degradation_reasons"]:
             record["degradation_reasons"].append(code)
         record["actual_llm_status"] = "degraded"
@@ -101,9 +119,15 @@ class AgentRuntime:
         self.event(record, "analyze", "degraded", code)
 
     async def run(self, record: dict, request: AgentRunRequest):
+        """在总时限内执行闭环并尝试生成概述，最终保存状态、时长和报告事件。
+
+        超时与业务错误写入停止原因；取消写入状态后继续传播 CancelledError，
+        其他运行异常转换为安全错误码，最终持久化失败仍可向任务管理器传播。
+        """
         budget = CallBudget(request.limits.model_calls)
 
         async def update():
+            """将共享模型预算及调用轨迹同步到记录并落盘，供预留与结算回调使用。"""
             record["model_calls"] = [asdict(call) for call in budget.calls]
             record["budget"]["model_call"].update(
                 reserved=budget.reserved,
@@ -160,6 +184,11 @@ class AgentRuntime:
             self.event(record, "report", record["report_status"], record["stop_reason"] or "")
 
     async def loop(self, record, request, budget):
+        """生成首轮计划，逐轮执行、形成证据、诊断并筛选补测，直至停止条件。
+
+        派发前预留目标预算，中断时按未知结果保守结算；每轮仅向后续模型
+        传递规范证据，保留取消信号，执行或校验异常由外层 run 处理。
+        """
         initial = await self.agent.generate(
             GenerateRequest(
                 contract=request.contract,

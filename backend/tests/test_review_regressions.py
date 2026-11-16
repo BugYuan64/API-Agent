@@ -4,7 +4,6 @@ import asyncio
 import gzip
 import sys
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -19,12 +18,7 @@ from api_agent.console.service import ConsoleRequest, send
 from api_agent.execution.report import normalize_report
 from api_agent.execution.schemas import ExecutionPlan
 from api_agent.infrastructure.config import load_settings
-from api_agent.infrastructure.orm import utc_now
 from api_agent.infrastructure.targets import TargetError
-from api_agent.runs.models import Run
-from api_agent.runs.repository import RunRepository
-from api_agent.runs.schemas import RunCreate
-from api_agent.runs.service import RunService
 from api_agent.streams.models import StreamEventRecord, StreamSessionRecord
 from api_agent.streams.service import StreamStart
 from api_agent.tools import client as mcp_client
@@ -177,44 +171,40 @@ async def sse_target(parts, extra_headers=""):
     ids=["unfinished-line", "unfinished-event"],
 )
 async def test_sse_bounds_unfinished_lines_and_events(app, body):
-    app.state.settings.stream_max_bytes = 1024
+    app.state.settings.response_max_bytes = 1024
     async with sse_target([body]) as url:
-        stream = await app.state.streams.start(StreamStart(kind="sse", url=url), [])
-        await asyncio.wait_for(stream.task, 5)
-    assert stream.stop_reason == "limits_exceeded"
-    assert stream.byte_count <= 1024
+        result = await send(app.state.settings, ConsoleRequest(url=url))
+    assert result.response.sse["stop_reason"] == "byte_limit"
+    assert result.response.body_bytes <= 1024
 
 
 async def test_sse_preserves_split_utf8_crlf_and_data_spaces(app):
     body = ": hello\r\ndata:   中文\r\ndata: second\r\n\r\n".encode()
     async with sse_target([bytes([b]) for b in body]) as url:
-        stream = await app.state.streams.start(StreamStart(kind="sse", url=url), [])
-        await asyncio.wait_for(stream.task, 5)
-    messages = [e.data for e in stream.events if e.kind == "message"]
+        result = await send(app.state.settings, ConsoleRequest(url=url))
+    messages = [event["data"] for event in result.response.sse["events"]]
     assert messages == ["  中文\nsecond"]
-    assert stream.byte_count == len(body)
+    assert result.response.body_bytes == len(body)
 
 
 async def test_sse_retains_complete_event_at_exact_byte_limit(app):
-    app.state.settings.stream_max_bytes = 1024
+    app.state.settings.response_max_bytes = 1024
     body = b"data: " + b"X" * 1016 + b"\n\n"
     assert len(body) == 1024
     async with sse_target([body]) as url:
-        stream = await app.state.streams.start(StreamStart(kind="sse", url=url), [])
-        await asyncio.wait_for(stream.task, 5)
-    assert [e.data for e in stream.events if e.kind == "message"] == ["X" * 1016]
-    assert stream.stop_reason == "limits_exceeded"
-    assert stream.byte_count == 1024
+        result = await send(app.state.settings, ConsoleRequest(url=url))
+    assert [event["data"] for event in result.response.sse["events"]] == ["X" * 1016]
+    assert result.response.sse["stop_reason"] == "byte_limit"
+    assert result.response.body_bytes == 1024
 
 
 async def test_sse_rejects_compressed_payload_before_decompression(app):
-    app.state.settings.stream_max_bytes = 1024
+    app.state.settings.response_max_bytes = 1024
     body = gzip.compress(b"data: " + b"X" * 100_000 + b"\n\n")
     async with sse_target([body], "Content-Encoding: gzip\r\n") as url:
-        stream = await app.state.streams.start(StreamStart(kind="sse", url=url), [])
-        await asyncio.wait_for(stream.task, 5)
-    assert stream.error_kind == "unsupported_content_encoding"
-    assert stream.byte_count == 0
+        result = await send(app.state.settings, ConsoleRequest(url=url))
+    assert result.error_kind == "response_encoding_not_supported"
+    assert result.response is None
 
 
 @pytest.mark.parametrize("fragments", [["X" * 2048], ["X" * 600, "Y" * 600]])
@@ -317,7 +307,10 @@ async def test_stream_start_atomically_reserves_slots(app, monkeypatch):
     monkeypatch.setattr(manager, "_persist_new", delayed_persist)
     monkeypatch.setattr(manager, "_run", hold)
     results = await asyncio.gather(
-        *(manager.start(StreamStart(kind="sse", url="http://127.0.0.1:1/"), []) for _ in range(3)),
+        *(
+            manager.start(StreamStart(kind="websocket", url="http://127.0.0.1:1/"), [])
+            for _ in range(3)
+        ),
         return_exceptions=True,
     )
     try:
@@ -337,10 +330,10 @@ async def test_stream_start_releases_slot_on_persistence_failure(app, monkeypatc
 
     monkeypatch.setattr(manager, "_persist_new", fail)
     with pytest.raises(RuntimeError):
-        await manager.start(StreamStart(kind="sse", url="http://127.0.0.1:1/"), [])
+        await manager.start(StreamStart(kind="websocket", url="http://127.0.0.1:1/"), [])
     assert not manager.active
     monkeypatch.setattr(manager, "_persist_new", persist)
-    stream = await manager.start(StreamStart(kind="sse", url="http://127.0.0.1:1/"), [])
+    stream = await manager.start(StreamStart(kind="websocket", url="http://127.0.0.1:1/"), [])
     await asyncio.wait_for(stream.task, 5)
 
 
@@ -355,7 +348,7 @@ async def test_stream_start_releases_slot_when_cancelled_during_persistence(app,
 
     monkeypatch.setattr(manager, "_persist_new", persist)
     task = asyncio.create_task(
-        manager.start(StreamStart(kind="sse", url="http://127.0.0.1:1/"), [])
+        manager.start(StreamStart(kind="websocket", url="http://127.0.0.1:1/"), [])
     )
     await entered.wait()
     task.cancel()
@@ -366,38 +359,11 @@ async def test_stream_start_releases_slot_when_cancelled_during_persistence(app,
 
 async def test_immediate_stop_releases_reserved_slot(app):
     manager = app.state.streams
-    stream = await manager.start(StreamStart(kind="sse", url="http://127.0.0.1:1/"), [])
+    stream = await manager.start(StreamStart(kind="websocket", url="http://127.0.0.1:1/"), [])
     stopped = await manager.stop(stream.id)
     assert stopped.finished
     assert stopped.stop_reason == "client_stopped"
     assert stream.id not in manager.active
-
-
-@pytest.mark.parametrize(
-    "initial,concurrent,expected",
-    [("running", "completed", "completed"), ("queued", "running", "cancelling")],
-)
-async def test_cancel_uses_database_state_instead_of_stale_identity(
-    app, project_id, initial, concurrent, expected
-):
-    await app.state.worker.stop()
-    async with app.state.database.session() as db:
-        run = await RunService(db).create(RunCreate(project_id=project_id, actions=[]))
-        if initial == "running":
-            await RunRepository(db).claim(run.id, utc_now() + timedelta(seconds=30))
-    async with app.state.database.session() as cancel_db:
-        stale = await cancel_db.get(Run, run.id)
-        assert stale.status == initial
-        async with app.state.database.session() as worker_db:
-            repo = RunRepository(worker_db)
-            if concurrent == "completed":
-                await repo.finish(run.id, "completed", "completed")
-            else:
-                await repo.claim(run.id, utc_now() + timedelta(seconds=30))
-        result = await RunRepository(cancel_db).request_cancel(run.id)
-        assert result.status == expected
-    async with app.state.database.session() as db:
-        assert (await db.get(Run, run.id)).status == expected
 
 
 async def test_execution_validates_project_before_running(client, monkeypatch):

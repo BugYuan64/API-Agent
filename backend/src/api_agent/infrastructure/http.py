@@ -13,10 +13,14 @@ MAX_BODY_CHARS = 1_000_000
 
 
 class ResponseLimitError(ValueError):
+    """响应原始或解码字节超过预算；调用方保留未知断言，不伪造目标状态码。"""
+
     pass
 
 
 class ResponseEncodingError(ValueError):
+    """响应编码不支持或解压不完整，表示传输不可评估而非已确认业务失败。"""
+
     pass
 
 
@@ -50,10 +54,19 @@ def decode_text(raw: bytes, limit: int = MAX_BODY_CHARS) -> tuple[str | None, bo
 
 
 async def bounded_send(
-    client: httpx.AsyncClient, request: httpx.Request, max_bytes: int
+    client: httpx.AsyncClient,
+    request: httpx.Request,
+    max_bytes: int,
+    *,
+    sse_options: tuple[int, int] | None = None,
 ) -> httpx.Response:
+    """发送已构造请求，读取与解压时检查字节预算并始终关闭原始流。返回有界缓冲响应；不自动重定向，超限和编码失败抛专门异常。"""
     response = await client.send(request, stream=True, follow_redirects=False)
     try:
+        if sse_options and "text/event-stream" in response.headers.get("content-type", "").lower():
+            from api_agent.console.sse import observe_sse
+
+            return await observe_sse(response, max_bytes, *sse_options)
         # In-memory transports may supply an already-consumed response.
         if response.is_stream_consumed:
             if len(response.content) > max_bytes:

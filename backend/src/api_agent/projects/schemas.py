@@ -18,11 +18,15 @@ SENSITIVE_POINTER = re.compile(r"^/(?:[^/~]|~[01])+(?:/(?:[^/~]|~[01])*)*$")
 
 
 class ProjectCreate(ApiInput):
+    """创建项目的名称与说明；限制长度，沿用管理输入的未知字段拒绝规则。"""
+
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=500)
 
 
 class ProjectResponse(ApiModel):
+    """项目公开元信息，不包含环境凭据或运行证据。"""
+
     id: str
     name: str
     description: str
@@ -201,14 +205,20 @@ class EnvironmentInput(ApiInput):
 
 
 class EnvironmentCreate(EnvironmentInput):
+    """创建命名环境及第一版配置；目标、鉴权引用与重放边界沿用父类校验。"""
+
     name: str = Field(min_length=1, max_length=80)
 
 
 class EnvironmentUpdate(EnvironmentInput):
+    """追加配置版本的输入；expected_version 用于乐观锁，拒绝并发覆盖。"""
+
     expected_version: int = Field(ge=1)
 
 
 class EnvironmentVersionResponse(ApiModel):
+    """不可变环境版本快照，仅公开凭据引用而非 token。"""
+
     id: str
     environment_id: str
     version: int
@@ -222,6 +232,8 @@ class EnvironmentVersionResponse(ApiModel):
 
 
 class EnvironmentResponse(ApiModel):
+    """环境身份、当前版本号及对应配置，用于编辑和版本冲突检查。"""
+
     id: str
     project_id: str
     name: str
@@ -231,6 +243,8 @@ class EnvironmentResponse(ApiModel):
 
 
 class EnvironmentHistoryResponse(ApiModel):
+    """按版本顺序返回只读历史，不代表历史目标请求可直接重放。"""
+
     id: str
     project_id: str
     name: str

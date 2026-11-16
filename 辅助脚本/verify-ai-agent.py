@@ -27,10 +27,12 @@ from api_agent.llm.service import LLMSettingService  # noqa: E402
 
 
 async def main():
+    """用已有模型配置验证有预算的 AI 闭环；需显式 --live，退出时清理无状态目标。"""
     app = FastAPI()
 
     @app.post("/register")
     async def register(request: Request):
+        """校验合成注册输入并保留一个故意的 12 位手机号缺陷，供诊断测试，不创建账号。"""
         body = await request.json()
         phone, password = body.get("phone"), body.get("password")
         # Intentional contract defect: the 12-digit branch produces 500, not 400.
@@ -87,7 +89,10 @@ async def main():
                                                     "type": "string",
                                                     "pattern": "^[0-9]{11}$",
                                                 },
-                                                "password": {"type": "string", "minLength": 8},
+                                                "password": {
+                                                    "type": "string",
+                                                    "minLength": 8,
+                                                },
                                             },
                                         }
                                     }
@@ -131,7 +136,11 @@ async def main():
                     "rounds": len(record["rounds"]),
                     "budget": record["budget"],
                     "model_stages": [
-                        {"stage": c["stage"], "status": c["status"], "error_kind": c["error_kind"]}
+                        {
+                            "stage": c["stage"],
+                            "status": c["status"],
+                            "error_kind": c["error_kind"],
+                        }
                         for c in record["model_calls"]
                     ],
                     "http_statuses": [

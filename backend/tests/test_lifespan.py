@@ -5,7 +5,6 @@ import pytest
 from api_agent.agent.manager import AgentManager
 from api_agent.infrastructure.database import Database
 from api_agent.main import create_app
-from api_agent.runs.worker import RunWorker
 from api_agent.streams.models import StreamSessionRecord
 from api_agent.streams.service import StreamManager
 
@@ -57,9 +56,6 @@ async def test_shutdown_failure_still_closes_other_resources(settings, monkeypat
     async def streams():
         closed.append("streams")
 
-    async def worker():
-        closed.append("worker")
-
     async def database():
         closed.append("database")
 
@@ -67,7 +63,6 @@ async def test_shutdown_failure_still_closes_other_resources(settings, monkeypat
     for owner, name, replacement in (
         (AgentManager, "shutdown", fail),
         (StreamManager, "shutdown", streams),
-        (RunWorker, "stop", worker),
         (Database, "dispose", database),
     ):
         original = getattr(owner, name)
@@ -80,4 +75,4 @@ async def test_shutdown_failure_still_closes_other_resources(settings, monkeypat
     with pytest.raises(RuntimeError, match="fixture agent shutdown failure"):
         async with app.router.lifespan_context(app):
             pass
-    assert closed == ["streams", "worker", "database"]
+    assert closed == ["streams", "database"]

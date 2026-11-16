@@ -127,6 +127,6 @@ async def test_stream_start_rejects_reserved_headers(manager):
             StreamStart(kind="websocket", url="ws://127.0.0.1:9/ws", headers={reserved: "x"})
     # 合法鉴权头仍然放行
     accepted = StreamStart(
-        kind="sse", url="http://127.0.0.1:9/events", headers={"Authorization": "Bearer token"}
+        kind="websocket", url="http://127.0.0.1:9/events", headers={"Authorization": "Bearer token"}
     )
     assert accepted.headers["Authorization"] == "Bearer token"

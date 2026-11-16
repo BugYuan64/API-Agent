@@ -1,4 +1,8 @@
-"""Endpoints for dynamic LLM settings management and tool-enabled completions."""
+"""暴露模型配置、状态、预览探测、模型列表及非流式对话接口。
+
+依赖 FastAPI、配置服务和客户端；配置响应隐藏密钥，对话异常映射
+为 HTTP 错误，探测失败在结果体中返回，不负责执行模型工具。
+"""
 
 import time
 from typing import Annotated
@@ -35,7 +39,7 @@ Session = Annotated[AsyncSession, Depends(session_for)]
 @router.get("/settings/llm", response_model=LLMConfigResponse)
 @router.get("/llm/config", response_model=LLMConfigResponse)
 async def get_llm_settings(session: Session, request: Request) -> LLMConfigResponse:
-    """获取通过前端控制台配置的大模型设置（脱敏展示）。"""
+    """返回当前有效配置的脱敏展示，未保存时回退环境默认，不创建数据库记录。"""
     return await LLMSettingService(session, request.app.state.settings).get_response()
 
 
@@ -44,7 +48,7 @@ async def get_llm_settings(session: Session, request: Request) -> LLMConfigRespo
 async def update_llm_settings(
     payload: LLMConfigUpdate, session: Session, request: Request
 ) -> LLMConfigResponse:
-    """更新大模型配置并持久化至 SQLite 数据库（由前端控制台调用，代替 .env 注入）。"""
+    """保存显式配置覆盖并返回脱敏结果；同源密钥复用规则由配置服务执行。"""
     return await LLMSettingService(session, request.app.state.settings).update(payload)
 
 
@@ -53,11 +57,10 @@ async def update_llm_settings(
 async def ping_llm(
     session: Session, request: Request, payload: LLMPingRequest | None = None
 ) -> LLMPingResponse:
-    """测试大模型接口连通性。
+    """使用预览或有效配置发起真实模型探测，返回成功标志、耗时与说明。
 
-    实现：
-    - 若传入待验证的 base_url、api_key、model，则直接基于传入值测连通性（用于保存前验证）；
-    - 未传字段使用有效配置；密钥仅同源复用，显式空字符串表示无认证。
+    未传字段沿用有效配置，隐式密钥仅同源复用；缺地址返回 400，
+    其他探测异常转为 ok=False 的结果，不保存预览配置。
     """
     service = LLMSettingService(session, request.app.state.settings)
     client = await service.get_preview_client(
@@ -90,7 +93,10 @@ async def ping_llm(
 async def list_llm_models(
     session: Session, request: Request, payload: LLMModelListRequest | None = None
 ) -> LLMModelListResponse:
-    """获取指定 Base URL（或已保存配置）下的可用模型清单（通过 GET /models）。"""
+    """通过预览或有效配置获取模型列表，返回去重模型和数量，不保存配置。
+
+    缺地址返回 400，其他查询异常转为 ok=False 的空列表结果；不逐个试调模型。
+    """
     service = LLMSettingService(session, request.app.state.settings)
     client = await service.get_preview_client(
         base_url=payload.base_url if payload else None,
@@ -118,7 +124,7 @@ async def list_llm_models(
 
 @router.get("/llm/status", response_model=LLMStatusResponse)
 async def get_llm_status(session: Session, request: Request) -> LLMStatusResponse:
-    """查询模型当前运行模式与就绪状态。"""
+    """根据启用开关和有效地址返回本地就绪状态，不发起网络健康检查。"""
     config = await LLMSettingService(session, request.app.state.settings).get_response()
     mode = "openai" if (config.enabled and config.base_url) else "disabled"
     return LLMStatusResponse(
@@ -134,7 +140,10 @@ async def get_llm_status(session: Session, request: Request) -> LLMStatusRespons
 async def chat_completion(
     payload: ChatCompletionRequest, session: Session, request: Request
 ) -> ChatCompletionResponse:
-    """向配置的 OpenAI 兼容接口发起单次请求（支持工具/函数调用）。"""
+    """向有效配置发起单次对话并返回规范化响应，工具调用仅作为数据返回。
+
+    未配置返回 400，鉴权失败返回 401，超时返回 504，连接或响应错误返回 502。
+    """
     client = await LLMSettingService(session, request.app.state.settings).get_client()
     if not client.is_configured:
         raise ApiError(

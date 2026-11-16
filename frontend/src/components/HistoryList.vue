@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 共享历史列表组件：接收统一条目、标题与当前选中 ID，输出 select/delete/clear 事件并暴露列表元素。业务记录转换与恢复由父级负责；列表不访问后端或裁定执行结果。 */
+
 /**
  * 测试工作台的左侧历史列（手动/自动两种模式共用）。
  *
@@ -9,9 +11,17 @@
  *
  * 条目形状刻意保持扁平（id / label / tone / meta），
  * 让各模式自己决定如何把领域数据映射进来，组件不感知执行或运行的差异。
+ *
+ * 删除与清空由**可选回调**启用，而不是外抛插槽：
+ * 此前删除按钮写在某个父组件的插槽里，导致 ① 组件里那套 `.history-delete`
+ * 样式要求父组件必须使用特定类名才有行为配套；② `@click.stop` 防止
+ * “点删除顺带选中”的约束完全靠调用方自觉；③ 三个页面能力不一致（只有请求历史能删）。
+ * 收进组件后，样式与行为绑定、冒泡由组件保证，调用方只需决定是否传回调。
  */
 import { ref } from 'vue'
+import { Trash2 } from 'lucide-vue-next'
 
+/** 共享历史展示条目；source 用于父级分派，raw 仅供插槽访问，列表不感知领域数据结构。 */
 export interface HistoryEntry {
   id: string
   label: string
@@ -29,22 +39,44 @@ export interface HistoryEntry {
   source?: string
 }
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
     title: string
     items: HistoryEntry[]
     emptyText: string
     activeId?: string | null
+    /** 传入即显示行内删除按钮；不传则完全不渲染。 */
+    onDelete?: ((id: string) => void) | null
+    /** 传入即显示「清空全部」按钮；不传则完全不渲染。 */
+    onClear?: (() => void) | null
+    /** 清空按钮的提示文案，默认「清空全部历史」。 */
+    clearLabel?: string
+    /** 列表非空但正在删除时置灰清空按钮，避免重复点击。 */
+    clearDisabled?: boolean
   }>(),
-  { activeId: null },
+  { activeId: null, onDelete: null, onClear: null, clearLabel: '清空全部历史', clearDisabled: false },
 )
 
 const emit = defineEmits<{
   (event: 'select', id: string): void
+  (event: 'delete', id: string): void
+  (event: 'clear'): void
 }>()
 
 const listRef = ref<HTMLElement | null>(null)
 defineExpose({ listRef })
+
+/** 行内删除：阻止冒泡，否则点击会连带触发整行的 select。 */
+function requestDelete(id: string): void {
+  emit('delete', id)
+  props.onDelete?.(id)
+}
+
+/** 清空全部：只读回调存在性决定是否渲染，点击统一从这里发出。 */
+function requestClear(): void {
+  emit('clear')
+  props.onClear?.()
+}
 </script>
 
 <template>
@@ -52,6 +84,16 @@ defineExpose({ listRef })
     <div class="history-head">
       <span class="history-title">{{ title }}</span>
       <span class="history-count">{{ items.length }}</span>
+      <button
+        v-if="onClear"
+        type="button"
+        class="btn btn-ghost btn-sm"
+        :disabled="clearDisabled || !items.length"
+        :title="clearLabel"
+        @click="requestClear"
+      >
+        <Trash2 :size="13" />
+      </button>
       <slot name="head-actions" />
     </div>
     <div ref="listRef" class="history-list scroll-y">
@@ -67,7 +109,19 @@ defineExpose({ listRef })
           <!-- 行首可选标记（如 HTTP 方法色标）；不传则不占位 -->
           <slot name="prefix" :item="item" />
           <span class="history-label truncate" :title="item.label">{{ item.label }}</span>
-          <!-- 行尾可选操作（如删除）；不传则不占位 -->
+          <!-- 行尾删除：由组件渲染，保证 stop 冒泡与样式绑定 -->
+          <span
+            v-if="onDelete"
+            class="history-delete"
+            role="button"
+            tabindex="0"
+            title="删除这条记录"
+            @click.stop="requestDelete(item.id)"
+            @keydown.stop.prevent.enter="requestDelete(item.id)"
+            @keydown.stop.prevent.space="requestDelete(item.id)"
+          >
+            <Trash2 :size="12" />
+          </span>
           <slot name="actions" :item="item" />
         </div>
         <div class="history-line history-sub">
@@ -176,10 +230,13 @@ defineExpose({ listRef })
   line-height: 1.7;
 }
 
-/* 行内操作（如删除）：默认隐藏，悬浮该行才出现，避免列表噪声。
-   通过 actions 插槽传入的内容套用此类即可获得一致行为。 */
-.history-item :deep(.history-delete) {
-  display: none;
+/* 行内删除：始终显示。
+   刻意不用“悬浮才出现”——那样会让 display: none ↔ grid 来回切换，
+   而按钮自身高 18px 高于文字行高（约 15.3px），一旦参与 flex 布局就把首行
+   从 15.3px 撑到 18px，整条记录随之跳动 2.7px。常驻后高度恒定、行间对齐。
+   默认低对比度以免干扰扫读，悬浮整行或按钮本身时才提亮。 */
+.history-delete {
+  display: grid;
   place-items: center;
   width: 18px;
   height: 18px;
@@ -187,14 +244,24 @@ defineExpose({ listRef })
   color: var(--text-tertiary);
   cursor: pointer;
   flex: none;
+  /* 常驻但弱化：不抢目标地址的视觉权重。 */
+  opacity: 0.45;
+  transition: opacity 0.14s ease, background 0.14s ease, color 0.14s ease;
 }
 
-.history-item:hover :deep(.history-delete) {
-  display: grid;
+.history-item:hover .history-delete,
+.history-item:focus-within .history-delete {
+  opacity: 1;
 }
 
-.history-item :deep(.history-delete:hover) {
+.history-delete:hover {
   background: var(--bg-subtle);
   color: var(--danger);
+  opacity: 1;
+}
+
+.history-delete:focus-visible {
+  outline: 2px solid var(--accent-border);
+  outline-offset: 1px;
 }
 </style>

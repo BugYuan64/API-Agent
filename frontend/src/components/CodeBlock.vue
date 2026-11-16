@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 只读代码展示组件：接收可空文本、限高和复制选项，依赖 CopyButton 提供复制。空文本显示为空串；格式化由调用方完成，不解析或执行文本内容。 */
+
 /**
  * 只读代码块：等宽、可换行、可限高，右上角可选复制按钮。
  *
@@ -22,7 +24,9 @@ const props = withDefaults(
   { maxHeight: '', copyable: false, inline: false },
 )
 
+/** 将可空输入归一化为空串供只读展示；不改变非空文本。 */
 const content = computed(() => props.text ?? '')
+/** 仅在给定 maxHeight 时产生限高样式；未给定时返回 undefined 由布局自然展开。 */
 const style = computed(() => (props.maxHeight ? { maxHeight: props.maxHeight } : undefined))
 </script>
 

@@ -15,6 +15,8 @@ class ConfigurationError(ValueError):
 
 
 class Settings(BaseSettings):
+    """应用配置契约：校验路径、目标白名单和预算；秘密使用 SecretStr，构造时不联网。"""
+
     model_config = SettingsConfigDict(
         extra="ignore",
         case_sensitive=False,

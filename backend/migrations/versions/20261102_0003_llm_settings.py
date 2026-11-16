@@ -17,6 +17,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    """新增本机模型设置表，默认禁用；不在迁移中写入真实供应商或凭据。"""
     op.create_table(
         "llm_settings",
         sa.Column("provider", sa.String(length=40), nullable=False, server_default="openai"),
@@ -33,4 +34,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """删除模型设置表及配置数据；不会自动撤销外部模型调用。"""
     op.drop_table("llm_settings")

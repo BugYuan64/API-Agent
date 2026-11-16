@@ -3,7 +3,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api_agent.infrastructure.api import (
@@ -183,6 +183,30 @@ async def stop_session(session_id: str, request: Request, session: Session):
             raise not_found("Stream session")
         return StreamSessionResponse.model_validate(_stored_state(record))
     return StreamSessionResponse.model_validate(serialize_stream(stream))
+
+
+@router.delete("/{session_id}", status_code=204)
+async def delete_session(session_id: str, request: Request, session: Session):
+    """删除一条长连接会话及其事件时间线。
+
+    作用：让历史和其它两类记录一样可以清理，而不是只能越积越多。
+    实现：先 ``manager.stop`` 让在跑的会话收尾——直接删数据库行会让内存里的
+    活动任务继续写入，造成“删了又回来”和未关闭的连接泄漏；停稳后再删行。
+    ``stream_events`` 对 ``stream_sessions`` 是 ``ondelete="CASCADE"``，
+    因此事件随会话一并删除，无需单独处理。会话既不在内存也不在库里时返回 404。
+    """
+    manager = _manager(request)
+    stream = await manager.stop(session_id)
+    record = await session.get(StreamSessionRecord, session_id)
+    if record is None and stream is None:
+        raise not_found("Stream session")
+    if record is not None:
+        await session.execute(
+            delete(StreamSessionRecord).where(StreamSessionRecord.id == session_id)
+        )
+        await session.commit()
+    # 停稳定后从内存历史中移除，避免列表仍能读到已删记录。
+    manager.forget(session_id)
 
 
 def _stored_state(record: StreamSessionRecord) -> dict:

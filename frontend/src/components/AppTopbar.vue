@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 应用顶栏：依赖健康检查 API、引擎共享选择和图标组件，分别显示管理后端及执行引擎状态。探测失败显示未知或异常状态，不替代各页面的业务错误提示。 */
+
 import { computed, onMounted, ref } from 'vue'
 import { Activity, RefreshCw, ServerCog, Settings as SettingsIcon } from 'lucide-vue-next'
 import { engineStatus, getHealth } from '@/api/endpoints'
@@ -15,6 +17,7 @@ const loading = ref(false)
 /** 顶栏显示“当前选中的引擎”及其状态，而不是写死某一个引擎名称。 */
 const { selected: selectedEngine, refresh: refreshEngineList } = useEngineSelection()
 
+/** 刷新引擎列表后并行探测管理后端和所选引擎；探测失败各自映射为异常或未知。列表初始化错误向上传播，但始终解除 loading。 */
 async function refresh() {
   loading.value = true
   try {
@@ -32,6 +35,7 @@ async function refresh() {
   }
 }
 
+/** 结合当前引擎元信息与探测结果生成名称、不可用或未知标签；只在已有版本时追加版本号。 */
 const engineLabel = computed(() => {
   const name = engineMeta(selectedEngine.value).name
   if (!engine.value) return `${name} 状态未知`
@@ -39,6 +43,7 @@ const engineLabel = computed(() => {
   return engine.value.version ? `${name} v${engine.value.version}` : name
 })
 
+/** 将当前引擎探测结果转换为展示色调；没有结果为 neutral，不可用为 warning。 */
 const engineTone = computed(() => {
   if (!engine.value) return 'neutral'
   return engine.value.available ? 'success' : 'warning'

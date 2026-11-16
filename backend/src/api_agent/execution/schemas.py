@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from api_agent.infrastructure.json_pointer import is_valid as is_valid_pointer
+from api_agent.infrastructure.outcomes import OutcomeFields
 from api_agent.projects.schemas import AuthReference
 
 Method = Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
@@ -21,6 +22,8 @@ TEMPLATE = re.compile(
 
 
 class Input(BaseModel):
+    """受控计划输入基类：严格类型、拒绝额外字段，校验错误不回显原始输入。"""
+
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True, strict=True)
 
 
@@ -285,10 +288,10 @@ def validate_scope(
 
 
 class AssertionResult(BaseModel):
-    """单条断言的观察结果（只暴露元信息，不含响应内容）。
+    """单条断言的判定及有界、脱敏后的观察值。
 
-    作用：让上层知道“第几条、什么类型、是否通过”，但拿不到响应体的任何片段，
-    从结构上避免把目标数据或错误文案带出。
+    作用：区分已通过、已失败和未评估；actual 允许保留非敏感业务字段，
+    不包含完整响应正文。敏感值保护与大小限制由引擎记录证据时实施。
     实现：``passed`` 允许为 None（无法判定时），``index`` 与计划中的断言顺序一一对应；
     ``message`` 仅在断言失败时携带引擎给出的差异说明，正常通过时为 None。
     """
@@ -309,8 +312,8 @@ class ResponseCapture(BaseModel):
 
     作用：让调用方能看到目标真实返回了什么，而不是只有“通过/失败”一个布尔值。
     实现：``headers`` 保留引擎给出的键值对顺序（多值头合并为列表），
-    ``body`` 是解码后的文本；解码失败时 ``body`` 为 None 并置 ``body_truncated``，
-    以免二进制响应把整个结果撑爆。``omitted`` 为 True 表示本次运行关闭了捕获。
+    ``body`` 是解码后的有界文本；具体引擎可能用替换字符处理非 UTF-8 字节，
+    ``body_truncated`` 表示截断或无法完整还原。``omitted`` 表示关闭了捕获。
     """
 
     status_text: str | None = None
@@ -321,17 +324,17 @@ class ResponseCapture(BaseModel):
     omitted: bool = False
 
 
-class CaseResult(BaseModel):
+class CaseResult(OutcomeFields):
     """单个用例的执行结果。
 
     实现：默认 ``status="unknown"``——只有确实观察到证据才会被改成
-    passed/failed/error，避免把“没跑到”误报成“通过”；
+    passed/failed/error/timed_out/cancelled，避免把“没跑到”误报成“通过”；
     ``error_kind`` 用固定码描述失败类别（如 request_error、missing_assertions）；
     ``response`` 在开启响应捕获时携带目标回包，关闭时为 None。
     """
 
     id: str
-    status: Literal["passed", "failed", "error", "unknown"] = "unknown"
+    status: Literal["passed", "failed", "error", "timed_out", "cancelled", "unknown"] = "unknown"
     http_status: int | None = None
     response_time_ms: float | None = None
     error_kind: str | None = None
@@ -339,12 +342,12 @@ class CaseResult(BaseModel):
     response: ResponseCapture | None = None
 
 
-class RunResult(BaseModel):
+class RunResult(OutcomeFields):
     """一次执行的最终汇总。
 
     实现：``reserved_requests`` 是预算口径（计划里声明了多少），
     ``observed_attempts`` 是实际观察到报告里有多少条，``unknown_requests`` 是差额，
-    三者的关系让上层能判断“预算是全部用掉了，还是部分根本没发出”。
+    差额表示缺少结果证据，不能据此断言请求未发送或没有产生副作用。
     """
 
     schema_version: Literal["1"] = "1"
@@ -356,6 +359,20 @@ class RunResult(BaseModel):
     observed_attempts: int = 0
     unknown_requests: int = 0
     executions: list[CaseResult]
+
+
+def unevaluated_assertions(case: RequestCase) -> list[AssertionResult]:
+    """为未取得完整可评估响应的用例保留断言序号和指针，不推断通过或失败。"""
+    return [
+        AssertionResult(
+            index=index,
+            kind=assertion.kind,
+            pointer=assertion.pointer,
+            passed=None,
+            message="Response could not be evaluated",
+        )
+        for index, assertion in enumerate(case.assertions)
+    ]
 
 
 def empty_result(plan: ExecutionPlan, status: Status, error_kind: str) -> RunResult:
@@ -373,5 +390,8 @@ def empty_result(plan: ExecutionPlan, status: Status, error_kind: str) -> RunRes
         error_kind=error_kind,
         reserved_requests=len(plan.requests),
         unknown_requests=len(plan.requests),
-        executions=[CaseResult(id=case.id) for case in plan.requests],
+        executions=[
+            CaseResult(id=case.id, assertions=unevaluated_assertions(case))
+            for case in plan.requests
+        ],
     )

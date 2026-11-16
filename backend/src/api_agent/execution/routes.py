@@ -5,7 +5,7 @@ import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api_agent.execution.api_schemas import ExecutionHistoryResponse, ExecutionRunRequest
@@ -161,3 +161,19 @@ async def get_execution(execution_id: str, session: Session):
     if record is None:
         raise not_found("Execution")
     return ExecutionHistoryResponse.model_validate(record)
+
+
+@router.delete("/{execution_id}", status_code=204)
+async def delete_execution(execution_id: str, session: Session):
+    """删除一条执行历史。
+
+    作用：执行记录只用于回看证据，删除它不影响任何目标状态，
+    也不影响已保存的 AI 编排证据（后者在 ``ARTIFACT_DIR`` 下按自己的 ID 存）。
+    实现：先确认存在（否则 404，避免“删掉了”和“本来就没有”被混为一谈），
+    再按主键删除并提交；返回 204 无正文。
+    """
+    record = await session.get(ExecutionRecord, execution_id)
+    if record is None:
+        raise not_found("Execution")
+    await session.execute(delete(ExecutionRecord).where(ExecutionRecord.id == execution_id))
+    await session.commit()

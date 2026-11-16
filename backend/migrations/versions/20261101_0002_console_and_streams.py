@@ -17,6 +17,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    """新增控制台历史、执行记录和长连接证据表，保留既有项目与模拟运行。"""
     op.create_table(
         "console_requests",
         sa.Column("project_id", sa.String(length=36), nullable=True),
@@ -107,5 +108,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """删除本版新增表及其中记录；仅供明确选择的迁移回退调用。"""
     for table in ("stream_events", "stream_sessions", "executions", "console_requests"):
         op.drop_table(table)

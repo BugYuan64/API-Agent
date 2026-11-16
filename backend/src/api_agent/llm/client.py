@@ -1,4 +1,8 @@
-"""OpenAI-compatible client with function/tool-calling and customizable base_url."""
+"""通过 httpx 调用 OpenAI 兼容的 Chat Completions 与模型列表接口。
+
+依赖配置、共享错误和响应解析器；仅支持非流式传输及工具调用数据，
+不执行返回的工具、不自动重试，也不验证供应商具备全部 OpenAI 能力。
+"""
 
 import json
 import logging
@@ -26,11 +30,10 @@ logger = logging.getLogger("api_agent.llm")
 
 
 class OpenAIClient:
-    """与 OpenAI 协议兼容的大模型客户端，支持自定义 Base URL、模型与工具调用。
+    """封装可配置的 OpenAI 兼容 HTTP 客户端，传输后统一校验供应商响应。
 
-    作用：提供非流式 Response 模式的模型调用管道，能自动序列化 tools 定义
-    并解析模型返回的 tool_calls；不受第三方 SDK 锁定，支持任何兼容 OpenAI 规范的端点。
-    支持直接传入配置（前端动态配置）或基于 Settings 初始化。
+    支持 Settings 或直接传入配置；工具调用只做序列化和解析，不执行函数，
+    使用 Chat Completions 协议，不保证任意供应商扩展字段兼容。
     """
 
     def __init__(
@@ -42,6 +45,7 @@ class OpenAIClient:
         enabled: bool = True,
         settings: Settings | None = None,
     ):
+        """保存连接参数；提供 Settings 时优先采用其中配置，此处不探测服务。"""
         if settings is not None:
             self.base_url = settings.llm_base_url
             self.api_key = settings.llm_api_key.get_secret_value() if settings.llm_api_key else None
@@ -57,11 +61,11 @@ class OpenAIClient:
 
     @property
     def is_configured(self) -> bool:
-        """判断是否已配置 Base URL 并处于启用状态。"""
+        """返回启用且 Base URL 非空的本地配置状态，不证明端点可达或模型可用。"""
         return bool(self.enabled and self.base_url and self.base_url.strip())
 
     def _get_base_url(self) -> str:
-        """获取并校验已配置的 Base URL，未配置时抛出可读的配置异常。"""
+        """返回去除末尾斜杠的配置地址；缺失时抛 LLMConfigError。"""
         if not self.base_url:
             raise LLMConfigError(
                 "大模型 Base URL 尚未配置。请在前端控制台「系统设置」中配置服务地址。"
@@ -69,7 +73,7 @@ class OpenAIClient:
         return self.base_url.rstrip("/")
 
     def _build_url(self, path: str = "/chat/completions") -> str:
-        """按规范拼接 Base URL 与路径。"""
+        """拼接接口路径，兼容配置到 /chat/completions 的地址；缺配置沿用配置错误。"""
         base = self._get_base_url()
         # Accept a configured completion endpoint for both chat and model listing.
         if base.endswith("/chat/completions"):
@@ -77,14 +81,14 @@ class OpenAIClient:
         return f"{base}{path}"
 
     def _build_headers(self) -> dict[str, str]:
-        """构造调用请求头，按规范注入 Bearer 密钥（若已配置）。"""
+        """返回 JSON 请求头；仅在非空密钥存在时加入 Bearer 鉴权。"""
         headers = {"Content-Type": "application/json"}
         if self.api_key and self.api_key.strip():
             headers["Authorization"] = f"Bearer {self.api_key.strip()}"
         return headers
 
     def _format_messages(self, messages) -> list[dict[str, Any]]:
-        """把内部 ChatMessage 模型转为 OpenAI API 接收的 JSON 列表。"""
+        """把 ChatMessage 序列转换为对话 JSON 列表，将工具参数字典编码为 JSON 字符串。"""
         payload_messages = []
         for msg in messages:
             item: dict[str, Any] = {"role": msg.role}
@@ -115,13 +119,10 @@ class OpenAIClient:
         return payload_messages
 
     async def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        """执行一次完整的对话请求（非流式 Response 模式，支持工具调用）。
+        """发送非流式 Chat Completions 请求并返回规范化文本、工具调用和 usage。
 
-        实现：
-        1. 组装符合 OpenAI 规范的 payload，明确指定 ``stream=False``；
-        2. 若传入 ``tools``，组装 ``tools`` 与 ``tool_choice`` 字段；
-        3. 发起异步 HTTP POST，捕获连接、超时与非 2xx 异常；
-        4. 解析 ``choices[0].message``，若包含 ``tool_calls`` 则将其参数解析为 Python 字典。
+        请求模型优先于默认模型；工具仅传递定义，参数解析不等于执行，
+        配置、传输及响应结构错误由对应 LLMError 子类向外传播。
         """
         url = self._build_url("/chat/completions")
         model_name = request.model or self.model
@@ -156,7 +157,11 @@ class OpenAIClient:
         return parse_completion(raw, model_name)
 
     async def _request(self, method: str, path: str, *, payload=None) -> Any:
-        """One transport/error boundary for chat and model discovery."""
+        """对指定路径发送一次异步 HTTP 请求并返回解码后的 JSON。
+
+        禁用环境代理，模型列表超时最多 15 秒；仅接受 HTTP 200，鉴权、
+        连接、超时及非法 JSON 转为稳定 LLM 错误，不附带供应商响应正文。
+        """
         url = self._build_url(path)
         timeout = min(15.0, self.timeout_seconds) if path == "/models" else self.timeout_seconds
         try:
@@ -184,7 +189,10 @@ class OpenAIClient:
             raise LLMResponseError("LLM response is not a valid JSON document") from None
 
     async def ping(self) -> dict[str, Any]:
-        """快速探测 Base URL 与密钥的连通性。"""
+        """发送最多生成一个 token 的真实对话请求，返回成功状态、耗时及响应模型。
+
+        探测会消耗模型额度；失败沿用对话请求错误，不证明工具调用可用。
+        """
         started = time.monotonic()
         # 发送最小化的 1 Token 探测请求
         request = ChatCompletionRequest(
@@ -202,7 +210,7 @@ class OpenAIClient:
         }
 
     async def list_models(self) -> list[str]:
-        """Fetch, validate and normalize the configured supplier's model IDs."""
+        """获取并返回去重排序的供应商模型 ID；传输或列表结构错误向外传播。"""
         return parse_models(await self._request("GET", "/models"))
 
 

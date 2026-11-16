@@ -1,15 +1,17 @@
-"""Own bounded SSE/WebSocket probes and coordinate their lifecycle and evidence."""
+"""Own bounded WebSocket sessions and coordinate their lifecycle and evidence."""
 
 import asyncio
 import base64
 
+import httpx
+
 from api_agent.infrastructure.orm import new_id, utc_now
+from api_agent.infrastructure.outcomes import outcome_for, transport_error_kind
 from api_agent.streams.repository import StreamRepository
 from api_agent.streams.schemas import StreamStart
 from api_agent.streams.state import (
     MAX_EVENT_CHARS,
     ActiveStream,
-    Kind,
     StreamEvent,
     serialize_event,
     serialize_stream,
@@ -17,14 +19,13 @@ from api_agent.streams.state import (
 from api_agent.streams.transport import (
     NoRedirectConnect,
     StreamLimitExceeded,
-    bounded_sse_lines,
 )
 
 
 class StreamManager:
     """管理本进程内的长连接会话：启动、停止、增量读取与落库。
 
-    作用：SSE/WebSocket 是长时间运行的异步任务，不能挂在单个 HTTP 请求上；
+    作用：WebSocket 是长时间运行的异步任务，不能挂在单个 HTTP 请求上；
     本类持有它们并把事件暴露成可轮询的时间线，使界面刷新后仍可回看。
     实现：``active`` 保存未结束会话，``history`` 保存已结束但仍在内存中的会话
     （供刚结束时的快速回看），超过容量的历史会话只从数据库读取。
@@ -56,7 +57,7 @@ class StreamManager:
 
         schemes = frozenset({"http", "https", "ws", "wss"})
         parsed, origin = validate_target(payload.url, allowed_origins, schemes)
-        url = _canonical_stream_url(parsed, payload.kind)
+        url = _canonical_stream_url(parsed)
         stream = ActiveStream(
             id=new_id(), kind=payload.kind, url=url, max_events=payload.max_events
         )
@@ -133,6 +134,17 @@ class StreamManager:
     async def recover(self) -> int:
         """Close persisted connections lost with the previous process."""
         return await self.repository.recover()
+
+    def forget(self, session_id: str) -> None:
+        """把已删除的会话从内存索引中移除。
+
+        作用：删除接口在数据库里删掉记录后，若内存的 ``history`` 还留着同一 ID，
+        列表与详情仍会读到一条“已删除”的会话，用户会以为删除没生效。
+        实现：只清索引，不碰任务——调用方必须已先 ``stop`` 完成收尾；
+        这里即便某条仍在跑也直接丢弃引用，避免删除后继续被读到。
+        """
+        self.active.pop(session_id, None)
+        self.history.pop(session_id, None)
 
     def find(self, session_id: str) -> ActiveStream | None:
         """按 ID 在活跃与近期历史中查找会话。
@@ -239,7 +251,7 @@ class StreamManager:
     async def _run(self, stream: ActiveStream, payload: StreamStart, url: str) -> None:
         """会话主体：按类型连接、读事件、按上限收尾并落库。
 
-        实现：把 SSE 与 WebSocket 分派到各自实现；
+        实现：连接 WebSocket 并记录逐帧证据；
         用独立任务在 ``max_duration_ms`` 后取消本任务，实现总时长上限；
         ``finally`` 统一做收尾——结束状态、落库、移入历史，
         保证无论成功、异常还是被取消，证据都不会丢。
@@ -250,10 +262,7 @@ class StreamManager:
                 _cancel_after(stream, payload.max_duration_ms / 1000),
                 name=f"stream-limit-{stream.id[:8]}",
             )
-            if payload.kind == "sse":
-                await self._run_sse(stream, payload, url)
-            else:
-                await self._run_websocket(stream, payload, url)
+            await self._run_websocket(stream, payload, url)
         except StreamLimitExceeded:
             stream.finish("closed", "limits_exceeded")
         except asyncio.CancelledError:
@@ -266,8 +275,14 @@ class StreamManager:
             else:
                 stream.finish("cancelled", "cancelled")
         except Exception as error:  # noqa: BLE001 - 会话异常必须落成证据而不是 500
-            stream.error_message = str(error)[:300] or type(error).__name__
-            stream.error_kind = stream.error_kind or "stream_failed"
+            if not stream.error_kind:
+                if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+                    stream.error_kind = "request_timeout"
+                elif isinstance(error, (httpx.HTTPError, OSError)):
+                    stream.error_kind = transport_error_kind(error)
+                else:
+                    stream.error_kind = "stream_failed"
+            stream.error_message = outcome_for("error", stream.error_kind).message
             stream.finish(
                 "error", stream.stop_reason or "stream_failed", error_kind=stream.error_kind
             )
@@ -280,96 +295,6 @@ class StreamManager:
             self.active.pop(stream.id, None)
             self.history[stream.id] = stream
             self._trim_history()
-
-    async def _run_sse(self, stream: ActiveStream, payload: StreamStart, url: str) -> None:
-        """读取一次 SSE 流并逐事件记录。
-
-        实现：用 ``httpx`` 流式 GET，``read=None`` 表示允许长时间静默
-        （由总时长上限兜底）；首包到达后读取状态码与 Content-Type：
-        非 2xx 判为握手被拒，Content-Type 不是 ``text/event-stream`` 仍继续尝试解析
-        （部分服务端不设该头），但把实际类型记进会话，便于用户判断是否选错。
-        逐行解析符合 WHATWG 的 SSE 语法：``data:``/``event:``/``id:``/``retry:``
-        与 ``:`` 注释，空行派发事件；多行 ``data`` 用换行拼接。
-        """
-        import httpx
-
-        headers = dict(payload.headers)
-        # Automatic decompression would allocate before the byte-budget check.
-        headers = {
-            name: value for name, value in headers.items() if name.lower() != "accept-encoding"
-        }
-        headers["Accept-Encoding"] = "identity"
-        if not any(name.lower() == "accept" for name in headers):
-            headers["Accept"] = "text/event-stream"
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=payload.connect_timeout_ms / 1000,
-                read=None,
-                write=payload.connect_timeout_ms / 1000,
-                pool=payload.connect_timeout_ms / 1000,
-            ),
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                stream.http_status = response.status_code
-                stream.content_type = response.headers.get("content-type")
-                if not 200 <= response.status_code < 300:
-                    stream.append(
-                        "error",
-                        f"Target rejected the stream with HTTP {response.status_code}",
-                    )
-                    stream.error_kind = "handshake_rejected"
-                    stream.finish("error", "handshake_rejected")
-                    return
-                if (
-                    response.headers.get("content-encoding", "identity").lower().strip()
-                    != "identity"
-                ):
-                    stream.error_kind = "unsupported_content_encoding"
-                    stream.finish("error", "unsupported_content_encoding")
-                    return
-                stream.status = "open"
-                stream.opened_at = utc_now()
-                stream.append("open", f"HTTP {response.status_code}")
-                self._notify_status(stream)
-                if stream.event_count >= payload.max_events:
-                    stream.finish("closed", "limits_exceeded")
-                    return
-                data_lines: list[str] = []
-                event_name: str | None = None
-                async for line in bounded_sse_lines(
-                    response, stream, self.settings.stream_max_bytes
-                ):
-                    if line == "":
-                        if data_lines or event_name:
-                            stream.append(
-                                "message",
-                                "\n".join(data_lines),
-                                event_name=event_name,
-                            )
-                            data_lines, event_name = [], None
-                        if stream.event_count >= payload.max_events:
-                            stream.finish("closed", "limits_exceeded")
-                            return
-                        await self._flush(stream)
-                        continue
-                    if line.startswith(":"):
-                        stream.append("comment", line[1:].lstrip())
-                    elif line.startswith("data:"):
-                        data_lines.append(line[6:] if line[5:6] == " " else line[5:])
-                    elif line.startswith("event:"):
-                        event_name = line[6:].strip()
-                    elif line.startswith("id:") or line.startswith("retry:"):
-                        continue
-                    else:
-                        # 非标准续行：按原文记录，避免静默丢数据。
-                        stream.append("raw", line)
-                    if stream.event_count >= payload.max_events:
-                        stream.finish("closed", "limits_exceeded")
-                        return
-                stream.append("close", "Target ended the stream")
-                stream.finish("closed", "target_closed")
 
     async def _run_websocket(self, stream: ActiveStream, payload: StreamStart, url: str) -> None:
         """建立 WebSocket 连接并逐帧记录。
@@ -404,9 +329,9 @@ class StreamManager:
             stream.error_kind = "handshake_rejected"
             stream.finish("error", "handshake_rejected")
             return
-        except (InvalidURI, ValueError) as error:
+        except (InvalidURI, ValueError):
             stream.error_kind = "invalid_url"
-            stream.error_message = str(error)[:300]
+            stream.error_message = outcome_for("error", "invalid_url").message
             stream.finish("error", "connect_failed", error_kind="invalid_url")
             return
         except TimeoutError:
@@ -415,9 +340,11 @@ class StreamManager:
             stream.finish("error", "connect_timeout", error_kind="connect_timeout")
             return
         except Exception as error:  # noqa: BLE001 - 连接失败必须落成证据
-            stream.error_kind = "connect_failed"
-            stream.error_message = str(error)[:300] or type(error).__name__
-            stream.finish("error", "connect_failed", error_kind="connect_failed")
+            stream.error_kind = (
+                "tls_error" if transport_error_kind(error) == "tls_error" else "connect_failed"
+            )
+            stream.error_message = outcome_for("error", stream.error_kind).message
+            stream.finish("error", "connect_failed", error_kind=stream.error_kind)
             return
 
         stream.websocket = connection
@@ -567,6 +494,7 @@ class StreamManager:
         """
 
         async def close() -> None:
+            """在有界任务中关闭 socket；关闭错误不覆盖已有结束原因。"""
             try:
                 await asyncio.wait_for(connection.close(), timeout=5)
             except (TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
@@ -586,9 +514,11 @@ class StreamManager:
             self.history.pop(oldest, None)
 
     async def _persist_new(self, stream: ActiveStream, payload: StreamStart, origin: str) -> None:
+        """委托存储层预写会话；持久化失败时不得开始目标连接。"""
         await self.repository.create(stream, payload, origin)
 
     async def _flush(self, stream: ActiveStream, *, final: bool = False) -> None:
+        """委托事务写入；final=True 在无新事件时也提交终态。"""
         await self.repository.flush(stream, final=final)
 
 
@@ -607,23 +537,15 @@ async def _cancel_after(stream: ActiveStream, seconds: float) -> None:
         stream.task.cancel()
 
 
-def _canonical_stream_url(parsed, kind: Kind) -> str:
-    """把用户输入规范成实际请求的 URL（协议按 kind 归一）。
-
-    实现：SSE 一律走 http(s)；WebSocket 一律走 ws(s)——
-    用户填 ``http://127.0.0.1:8080/events`` 也能测 SSE，
-    填 ``ws://`` 或 ``http://`` 都能测 WebSocket，少一个必踩的坑。
-    """
+def _canonical_stream_url(parsed) -> str:
+    """Normalize an authorized HTTP/WS address into its WebSocket transport URL."""
     from ipaddress import ip_address
 
     address = ip_address(parsed.hostname or "")
     literal = f"[{address.compressed}]" if address.version == 6 else address.compressed
     netloc = literal + (f":{parsed.port}" if parsed.port is not None else "")
     scheme = parsed.scheme
-    if kind == "sse":
-        scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
-    else:
-        scheme = {"http": "ws", "https": "wss"}.get(scheme, scheme)
+    scheme = {"http": "ws", "https": "wss"}.get(scheme, scheme)
     return f"{scheme}://{netloc}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
 
 

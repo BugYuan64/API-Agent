@@ -40,7 +40,9 @@ async def test_project_environment_versions_survive_restart(client, app, setting
     assert response.json()["current_version"] == 2
     assert response.json()["config"]["origin"] == "http://127.0.0.1:9001"
 
-    await app.state.worker.stop()
+    # Simulate a restart: drop every connection the running app holds, then
+    # build a fresh app over the same database file. No background worker
+    # needs stopping — the simulation run module was removed.
     await app.state.database.dispose()
     from api_agent.main import create_app
 

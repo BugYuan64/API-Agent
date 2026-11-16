@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 应用根组件：组合侧栏、顶栏、路由内容与全局提示。依赖路由及共享布局组件；业务请求、页面状态和错误处理由各子组件负责。 */
+
 import AppSidebar from '@/components/AppSidebar.vue'
 import AppTopbar from '@/components/AppTopbar.vue'
 import ToastHost from '@/components/ToastHost.vue'

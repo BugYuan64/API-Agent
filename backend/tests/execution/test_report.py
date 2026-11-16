@@ -137,7 +137,9 @@ def test_network_error_is_not_an_assertion_failure(plan):
     result = normalize_report(data, plan, 1)
     assert result.status == "error"
     assert result.executions[0].error_kind == "request_error"
-    assert result.executions[0].response.body == "connect ECONNREFUSED"
+    assert result.executions[0].result_code == "CONNECTION_FAILED"
+    assert result.executions[0].response.body == "未能完成目标连接或传输"
+    assert "ECONNREFUSED" not in result.model_dump_json()
 
 
 def test_nonzero_exit_with_all_passed_assertions_is_tool_error(plan):

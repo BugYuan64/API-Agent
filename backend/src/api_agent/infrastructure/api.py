@@ -17,21 +17,29 @@ UtcDatetime = Annotated[datetime, BeforeValidator(as_utc)]
 
 
 class ApiModel(BaseModel):
+    """公开响应基类：支持读取 ORM 属性并附带版本；序列化不自动授予敏感字段输出权限。"""
+
     model_config = ConfigDict(from_attributes=True, hide_input_in_errors=True)
     schema_version: str = "1"
 
 
 class ApiInput(BaseModel):
+    """管理输入基类：拒绝未知字段并清理首尾空白，领域约束由具体模型负责。"""
+
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True, str_strip_whitespace=True)
 
 
 class ErrorDetail(ApiModel):
+    """一项安全校验摘要，只包含字段路径和原因码。"""
+
     model_config = ConfigDict(extra="ignore")
     field: str
     reason: str
 
 
 class ErrorBody(ApiModel):
+    """统一错误体，包含稳定码、展示消息和请求 ID，不存原始敏感输入。"""
+
     code: str
     message: str
     details: list[ErrorDetail] = Field(default_factory=list)
@@ -39,16 +47,22 @@ class ErrorBody(ApiModel):
 
 
 class ErrorResponse(ApiModel):
+    """把安全错误体封装为统一管理响应。"""
+
     error: ErrorBody
 
 
 class PageInfo(ApiModel):
+    """分页元数据：实际 limit、offset 和总数；数据库排序另由仓储决定。"""
+
     limit: int
     offset: int
     total: int
 
 
 class Page[ResponseItem](ApiModel):
+    """泛型实体列表及分页信息的公开信封。"""
+
     items: list[ResponseItem]
     page: PageInfo
 

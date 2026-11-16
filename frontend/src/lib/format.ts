@@ -1,7 +1,6 @@
+/** 展示层格式化与状态翻译：使用浏览器日期和 JSON 标准能力，不发起请求或修改领域数据。缺失、非法值按各函数约定回退；未知状态保留原值，避免隐藏新服务端状态。 */
 /** 展示层的小工具：时间、字节、时长、截断与高亮。
  *  都保持纯函数，方便在模板里直接用，也便于单测。 */
-
-/** 把后端的 UTC ISO 字符串格式化成 HH:MM:SS（本地时区）。 */
 
 /** 带日期的完整时间，用于历史列表。 */
 export function formatDateTime(value: string | null | undefined): string {
@@ -52,6 +51,11 @@ export function statusTone(status: number | null | undefined): 'success' | 'info
   return 'neutral'
 }
 
+/** 一跳重定向 → 展示标签。只描述目标真实回包，不推断跳转结果。 */
+export function describeRedirect(status: number, reason: string | null | undefined): string {
+  return reason ? `${status} ${reason}` : String(status)
+}
+
 /** 把 JSON 文本美化；解析失败时原样返回，避免把非 JSON 内容吃掉。 */
 export function prettyJson(text: string | null | undefined): string {
   if (!text) return ''
@@ -74,8 +78,6 @@ export function looksLikeJson(text: string | null | undefined): boolean {
     return false
   }
 }
-
-/** Content-Type 是否可当文本展示。 */
 
 /** 长连接结束原因 → 中文说明。保留原始值作为回退，避免新原因被隐藏。 */
 export function describeStopReason(reason: string | null | undefined): string {
@@ -111,20 +113,6 @@ export function describeStopReason(reason: string | null | undefined): string {
   }
 }
 
-/** 运行状态 → 中文标签。 */
-export function describeRunStatus(status: string): string {
-  const labels: Record<string, string> = {
-    queued: '排队中',
-    running: '运行中',
-    cancelling: '取消中',
-    completed: '已完成',
-    failed: '失败',
-    cancelled: '已取消',
-    interrupted: '已中断',
-  }
-  return labels[status] ?? status
-}
-
 /** 执行结果 → 中文标签。 */
 export function describeExecutionStatus(status: string): string {
   const labels: Record<string, string> = {
@@ -148,5 +136,3 @@ export function describeAssertionKind(kind: string): string {
   }
   return labels[kind] ?? kind
 }
-
-/** 深拷贝一个普通对象，用于给表单重置默认值。 */

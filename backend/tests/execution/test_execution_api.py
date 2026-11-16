@@ -59,6 +59,9 @@ def plan_for(base_url: str) -> dict:
     """
     return {
         "origin": base_url,
+        # 这里验证 API 落库而非截止时间；为 Windows 真实 CLI 冷启动留出余量。
+        # 请求本身仍沿用 3 秒上限，专门的超时回归另外使用显式短预算。
+        "timeout_ms": 90_000,
         "allowed_methods": ["GET"],
         "path_templates": ["/json"],
         "requests": [
@@ -229,3 +232,27 @@ async def test_execution_history_is_paginated_and_ordered(client):
     assert body["page"]["offset"] == 0
     assert body["page"]["total"] == len(body["items"])
     json.dumps(body)  # 确保整体可序列化（无 datetime/bytes 泄漏）
+
+
+async def test_execution_history_can_be_deleted(cli_client, target):
+    """执行历史应可删除，且删除后按 ID 查询返回 404。
+
+    实现：先用 native 引擎跑一份最小计划拿到 ID，再 ``DELETE``；
+    断言 204、列表里不再出现该条、单条查询变 404，重复删除同样 404
+    （区分“删掉了”与“本来就没有”）。
+    """
+    created = await cli_client.post(
+        "/api/executions", json={"plan": plan_for(target.base_url), "engine": "native"}
+    )
+    assert created.status_code == 201, created.text
+    execution_id = created.json()["id"]
+    assert (await cli_client.get(f"/api/executions/{execution_id}")).status_code == 200
+
+    deleted = await cli_client.delete(f"/api/executions/{execution_id}")
+    assert deleted.status_code == 204
+
+    assert (await cli_client.get(f"/api/executions/{execution_id}")).status_code == 404
+    listing = (await cli_client.get("/api/executions")).json()
+    assert all(item["id"] != execution_id for item in listing["items"])
+
+    assert (await cli_client.delete(f"/api/executions/{execution_id}")).status_code == 404

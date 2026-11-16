@@ -15,10 +15,14 @@ logger = logging.getLogger("api_agent")
 
 
 class StreamRepository:
+    """长连接证据的事务存储边界，依赖独立数据库会话，不持有 socket 或裁定终态。"""
+
     def __init__(self, database: Database):
+        """保存所属 Database，每次创建、恢复或写入使用短事务。"""
         self.database = database
 
     async def create(self, stream: ActiveStream, payload: StreamStart, origin: str) -> None:
+        """连接前提交初始会话和脱敏头；失败抛出，由管理器释放预留名额。"""
         async with self.database.session() as session:
             session.add(
                 StreamSessionRecord(
@@ -42,6 +46,7 @@ class StreamRepository:
             await session.commit()
 
     async def recover(self) -> int:
+        """关闭上一进程遗留的 connecting/open 行并返回行数；不重连或重发。"""
         async with self.database.session() as session:
             result = await session.execute(
                 update(StreamSessionRecord)
@@ -54,6 +59,7 @@ class StreamRepository:
     async def flush(self, stream: ActiveStream, *, final: bool = False) -> None:
         # Serialize commits, not event capture. A send/receive can append while
         # SQLite awaits IO; only the committed prefix may be removed afterward.
+        """在锁内提交事件与状态快照，成功才删除已提交前缀；失败保留有界待写队列并告警，最终持续失败不保证断电恢复。"""
         async with stream.flush_lock:
             if not stream.pending and not final:
                 return

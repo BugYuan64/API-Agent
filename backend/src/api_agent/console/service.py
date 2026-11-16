@@ -1,5 +1,6 @@
 """Validated HTTP sends issued by the local console (loopback targets only)."""
 
+import asyncio
 import json
 import time
 from typing import Literal
@@ -17,6 +18,7 @@ from api_agent.infrastructure.http import (
     decode_text,
     group_headers,
 )
+from api_agent.infrastructure.outcomes import OutcomeFields, outcome_for, transport_error_kind
 from api_agent.infrastructure.targets import validate_headers, validate_target
 
 
@@ -37,6 +39,8 @@ class ConsoleRequest(ApiInput):
     body: str | None = Field(default=None, max_length=MAX_BODY_CHARS)
     timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
     follow_redirects: bool = False
+    sse_max_events: int = Field(default=50, ge=1, le=1000)
+    sse_duration_ms: int = Field(default=3000, ge=100, le=30_000)
 
     @field_validator("headers")
     @classmethod
@@ -69,6 +73,21 @@ class ConsoleRequest(ApiInput):
         return self
 
 
+class RedirectHop(ApiInput):
+    """重定向链路的一跳：全部取自目标真实回包，不由本项目推断。
+
+    作用：让界面能显示 ``301 → 302 → 200`` 的完整经过，而不是一串看不出结果的地址。
+    实现：``status``/``reason`` 是这一跳响应自身的状态；``url`` 是它 ``Location``
+    指向的下一跳请求地址；``cross_origin`` 记录跨源跳转——该跳发生时凭据头已被剥离，
+    界面据此提示用户“跳转后不再携带鉴权”，与实际发送行为一致。
+    """
+
+    status: int
+    reason: str | None = None
+    url: str
+    cross_origin: bool = False
+
+
 class ConsoleResponse(ApiInput):
     """控制台的即时回包：原样保留，供本机界面核对。
 
@@ -86,10 +105,11 @@ class ConsoleResponse(ApiInput):
     body_truncated: bool = False
     body_encoding: str | None = None
     elapsed_ms: float = 0
-    redirects: list[str] = Field(default_factory=list)
+    redirects: list[RedirectHop] = Field(default_factory=list)
+    sse: dict | None = None
 
 
-class ConsoleResult(ApiInput):
+class ConsoleResult(ApiInput, OutcomeFields):
     """一次控制台请求的结果：成功与失败走同一结构。
 
     实现：``ok`` 表示是否拿到了 HTTP 回包；连接失败时 ``error_kind`` 给出固定类别，
@@ -122,7 +142,7 @@ def build_url(parsed) -> str:
     )
 
 
-async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
+async def _send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
     """发出一次受控 HTTP 请求并返回结构化结果。
 
     作用：这是界面“发送”按钮的实现，也是本项目里第一条由用户界面触发真实请求的路径，
@@ -150,14 +170,27 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
     started = time.monotonic()
     request_summary = {"method": payload.method, "url": url, "at": None}
     try:
-        async with httpx.AsyncClient(
-            timeout=payload.timeout_ms / 1000,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
+        # 所有跳转及完整正文共享挂钟预算，不能靠持续小片数据重置读超时。
+        async with (
+            asyncio.timeout(payload.timeout_ms / 1000),
+            httpx.AsyncClient(
+                timeout=payload.timeout_ms / 1000,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client,
+        ):
             request = client.build_request(payload.method, url, headers=headers, content=content)
-            response = await bounded_send(client, request, settings.response_max_bytes)
+            response = await bounded_send(
+                client,
+                request,
+                settings.response_max_bytes,
+                sse_options=(
+                    payload.sse_max_events,
+                    min(payload.sse_duration_ms, payload.timeout_ms // 2),
+                ),
+            )
             history = []
+            hops: list[RedirectHop] = []
             while payload.follow_redirects and response.next_request is not None:
                 if len(history) >= client.max_redirects:
                     raise httpx.TooManyRedirects(
@@ -167,7 +200,8 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
                 _parsed, next_origin = validate_target(
                     str(next_request.url), settings.target_allowed_origins
                 )
-                if next_origin != _origin:
+                cross_origin = next_origin != _origin
+                if cross_origin:
                     # Custom headers may carry credentials under arbitrary names.
                     for name in {
                         *payload.headers,
@@ -178,31 +212,60 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
                         next_request.headers.pop(name, None)
                     client.cookies.clear()
                 history.append(response)
+                # 记录这一跳的真实回包：状态、原因与它指向的下一跳地址。
+                hops.append(
+                    RedirectHop(
+                        status=response.status_code,
+                        reason=response.reason_phrase or None,
+                        url=str(next_request.url),
+                        cross_origin=cross_origin,
+                    )
+                )
                 next_request.headers["Accept-Encoding"] = "identity"
-                response = await bounded_send(client, next_request, settings.response_max_bytes)
+                response = await bounded_send(
+                    client,
+                    next_request,
+                    settings.response_max_bytes,
+                    sse_options=(
+                        payload.sse_max_events,
+                        min(payload.sse_duration_ms, payload.timeout_ms // 2),
+                    ),
+                )
                 _origin = next_origin
             response.history = history
     except (ResponseLimitError, ResponseEncodingError) as error:
         return ConsoleResult(
             ok=False,
             request=request_summary,
-            error_kind=str(error),
-            error_message="Response exceeded the supported transport limits",
+            error_kind=(
+                "response_limit_exceeded"
+                if isinstance(error, ResponseLimitError)
+                else "response_encoding_not_supported"
+                if str(error) == "response_encoding_not_supported"
+                else "response_decode_error"
+            ),
+            error_message=outcome_for(
+                error_kind=(
+                    "response_limit_exceeded"
+                    if isinstance(error, ResponseLimitError)
+                    else "response_decode_error"
+                )
+            ).message,
             elapsed_ms=round((time.monotonic() - started) * 1000, 2),
         )
-    except httpx.TimeoutException:
+    except (TimeoutError, httpx.TimeoutException):
         return ConsoleResult(
             ok=False,
             request=request_summary,
             error_kind="request_timeout",
-            error_message=f"No response within {payload.timeout_ms} ms",
+            error_message=outcome_for(error_kind="request_timeout").message,
             elapsed_ms=round((time.monotonic() - started) * 1000, 2),
         )
     except (httpx.HTTPError, OSError) as error:
         return ConsoleResult(
             ok=False,
             request=request_summary,
-            error_kind="request_failed",
+            error_kind=transport_error_kind(error),
             error_message=safe_message(error),
             elapsed_ms=round((time.monotonic() - started) * 1000, 2),
         )
@@ -220,20 +283,35 @@ async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
             headers=group_headers(response.headers.multi_items()),
             body=text,
             body_bytes=len(raw),
-            body_truncated=truncated,
+            body_truncated=truncated
+            or response.extensions.get("sse", {}).get("stop_reason")
+            in {"byte_limit", "event_limit", "observation_complete"},
             body_encoding=response.encoding,
             elapsed_ms=elapsed,
-            redirects=[str(item.url) for item in response.history],
+            redirects=hops,
+            sse=response.extensions.get("sse"),
         ),
         elapsed_ms=elapsed,
     )
 
 
 def safe_message(error: Exception) -> str:
-    """把传输层异常压缩成一行、不含本机路径的说明。
+    """根据传输异常类型返回固定安全说明，不读取异常原文或本机连接细节。"""
+    return outcome_for(error_kind=transport_error_kind(error)).message
 
-    实现：只取首行并截断到 200 字符，避免把文件路径、代理细节
-    或第三方库堆栈带到界面与日志之外的地方。
-    """
-    text = str(error).splitlines()[0] if str(error) else type(error).__name__
-    return text[:200]
+
+class HttpTestClient:
+    """Single HTTP execution class used by interactive requests and document tasks."""
+
+    def __init__(self, settings: Settings):
+        """Keep local target and response budgets; do not open connections."""
+        self.settings = settings
+
+    async def execute(self, payload: ConsoleRequest) -> ConsoleResult:
+        """Execute a validated request and return bounded transport evidence."""
+        return await _send(self.settings, payload)
+
+
+async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
+    """Compatibility entry for existing console callers, sharing the execution class."""
+    return await HttpTestClient(settings).execute(payload)

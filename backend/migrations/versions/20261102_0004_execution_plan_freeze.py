@@ -23,5 +23,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """移除执行计划冻结列，回退后失去按历史计划诊断的溯源能力。"""
     op.drop_column("executions", "plan_sha256")
     op.drop_column("executions", "plan")

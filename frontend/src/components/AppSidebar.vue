@@ -1,4 +1,6 @@
 <script setup lang="ts">
+/** 侧边导航组件：依赖 Vue Router 和 Lucide icons，根据当前路径推导激活项与标签。 */
+
 import { computed } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
@@ -10,25 +12,24 @@ import {
   Plus,
   Settings as SettingsIcon,
   Terminal,
-  Waypoints,
 } from 'lucide-vue-next'
 
-/** 侧边栏分组：与 apifox 的「接口管理 / 自动化测试 / 请求历史 / 项目设置」结构对应。 */
+/** 侧边栏分组：接口测试、任务测试、项目、记录和设置。 */
 const groups = [
   {
     label: '接口管理',
     items: [
-      { to: '/request', label: '接口调试', icon: Braces },
-      { to: '/testcases', label: '用例测试', icon: ListTree },
+      { to: '/request', label: '接口测试', icon: Braces },
       { to: '/long-connection', label: '长连接测试', icon: Cable },
     ],
   },
   {
+    label: '任务测试',
+    items: [{ to: '/testcases', label: '用例测试', icon: ListTree }],
+  },
+  {
     label: '项目',
-    items: [
-      { to: '/projects', label: '项目与环境', icon: FolderKanban },
-      { to: '/runs', label: '模拟任务', icon: Waypoints },
-    ],
+    items: [{ to: '/projects', label: '项目与环境', icon: FolderKanban }],
   },
   {
     label: '记录',
@@ -46,8 +47,10 @@ const groups = [
 ]
 
 const route = useRoute()
+/** 按当前路径判断入口是否激活：完全匹配或入口子路径均返回 true；不执行导航。 */
 const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
 
+/** 根据当前路由的首个匹配入口计算导航标签；未知页面回退“控制台”，不触发跳转。 */
 const activeLabel = computed(() => {
   for (const group of groups) {
     const hit = group.items.find((item) => isActive(item.to))

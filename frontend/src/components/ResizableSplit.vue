@@ -5,9 +5,11 @@
  * 只负责布局，不知道两个插槽里是什么业务。尺寸以像素计算并夹在
  * `[min, available - minOther]` 内，因此拖到阈值后继续移动不会
  * 把另一侧挤没。resize 时也会重新夹紧，避免窗口缩小后留下旧的大尺寸。
+ * size/update:size 是受控首栏宽度；workspacePane 显式启用末栏锚定，
+ * 通过工作台上下文保留中栏最小值与末栏宽度，不接触插槽里的业务状态。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { clampSize, readStoredSize, writeStoredSize } from '@/lib/split'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { clampSize, readStoredSize, workspaceSplitKey, writeStoredSize } from '@/lib/split'
 
 /** 长按阈值：按住这么久才真正进入拖动，避免“碰到边界就误改布局”。 */
 const HOLD_MS = 260
@@ -21,6 +23,8 @@ const props = withDefaults(
     minOther?: number
     persistKey?: string
     label?: string
+    workspacePane?: string
+    fitOther?: number
   }>(),
   { direction: 'horizontal', min: 220, minOther: 360, label: '调整区域大小' },
 )
@@ -31,6 +35,11 @@ const dragging = ref(false)
 /** 已按下但尚未满足长按阈值。 */
 const holding = ref(false)
 const available = ref(0)
+/** 请求宽度与临时显示宽度分离，避免ResizeObserver回写把窗口压缩变成新偏好。 */
+const requestedSize = ref(props.size)
+const workspace = inject(workspaceSplitKey, null)
+/** 末栏偏好独立于首栏受控值；容器暂时变窄不覆盖偏好，恢复时可还原。 */
+const secondSize = ref<number | undefined>()
 let pointerId: number | null = null
 let holdTimer: number | undefined
 let startX = 0
@@ -39,11 +48,13 @@ let sessionCleanup: (() => void) | null = null
 
 const currentSize = computed(() =>
   clampSize({
-    size: props.size,
+    size: requestedSize.value,
     min: props.min,
     max: props.max,
     minOther: props.minOther,
     available: available.value,
+    second: secondSize.value,
+    fitOther: props.fitOther,
   }),
 )
 
@@ -60,12 +71,30 @@ const handleStyle = computed(() => {
   return props.direction === 'horizontal' ? { left: basis } : { top: basis }
 })
 
-function readAvailable(): void {
+/** 隐藏的 v-show 面板宽度为0，不能用它覆盖末栏偏好或工作台保留量。 */
+function readAvailable(initialSize = props.size): void {
   const rect = root.value?.getBoundingClientRect()
   if (!rect) return
-  available.value = props.direction === 'horizontal' ? rect.width : rect.height
+  const measured = props.direction === 'horizontal' ? rect.width : rect.height
+  if (measured <= 0) return
+  available.value = measured
+  if (props.workspacePane && secondSize.value === undefined) {
+    const first = clampSize({ size: initialSize, min: props.min, max: props.max, minOther: props.minOther, available: measured })
+    secondSize.value = readStoredSize(
+      props.persistKey ? `${props.persistKey}.second` : undefined,
+      Math.max(props.minOther, measured - first),
+    )
+    writeStoredSize(props.persistKey ? `${props.persistKey}.second` : undefined, secondSize.value)
+  }
 }
 
+/** 同步实际首栏尺寸；尺寸观察产生的回写不改变末栏偏好。 */
+function publishSize(next: number, persist = false): void {
+  emit('update:size', next)
+  if (persist) writeStoredSize(props.persistKey, next)
+}
+
+/** 接收拖动或键盘期望尺寸，夹紧后通知父级；只在空间足够时保存新偏好。 */
 function emitSize(value: number): void {
   // 先夹紧再外发与持久化：拖到阈值外时，存储和父级状态都不应记录越界值。
   const next = clampSize({
@@ -74,9 +103,16 @@ function emitSize(value: number): void {
     max: props.max,
     minOther: props.minOther,
     available: available.value,
+    fitOther: props.fitOther ?? (props.workspacePane ? props.minOther : undefined),
   })
-  emit('update:size', next)
-  writeStoredSize(props.persistKey, next)
+  // 只有用户拖动/键盘调整中间边界才建立新的末栏宽度。
+  // 物理空间不足时只更新当前显示值，避免临时压缩覆盖正常窗口的末栏偏好。
+  if (props.workspacePane && available.value >= props.min + props.minOther) {
+    secondSize.value = available.value - next
+    writeStoredSize(props.persistKey ? `${props.persistKey}.second` : undefined, secondSize.value)
+  }
+  if (available.value >= props.min + (props.fitOther ?? props.minOther)) requestedSize.value = next
+  publishSize(next, available.value >= props.min + (props.fitOther ?? props.minOther))
 }
 
 /**
@@ -118,16 +154,18 @@ function bindSession(id: number): void {
   }
 }
 
+/** 幂等清理长按计时、全局监听与拖动态，释放/取消/卸载共用。 */
 function endSession(id: number): void {
   window.clearTimeout(holdTimer)
   holdTimer = undefined
   holding.value = false
   dragging.value = false
   if (pointerId === id) pointerId = null
-  document.body.classList.remove('split-dragging')
+  document.body.classList.remove('split-dragging', 'split-dragging-vertical')
   sessionCleanup?.()
 }
 
+/** 主键按下后登记长按会话；阈值内漂移取消，未达到阈值不改变布局。 */
 function start(event: PointerEvent): void {
   if (event.button !== 0) return
   event.preventDefault()
@@ -144,9 +182,14 @@ function start(event: PointerEvent): void {
     dragging.value = true
     holding.value = false
     document.body.classList.add('split-dragging')
+    // 垂直分栏用上下箭头光标；类名只在拖动期间存在，结束即移除。
+    if (props.direction !== 'horizontal') {
+      document.body.classList.add('split-dragging-vertical')
+    }
   }, HOLD_MS)
 }
 
+/** Home/End 到阈值，方向键微调；Shift 使用40px步长。 */
 function keydown(event: KeyboardEvent): void {
   const step = event.shiftKey ? 40 : 10
   if (event.key === 'Home') {
@@ -167,29 +210,50 @@ function keydown(event: KeyboardEvent): void {
 
 let observer: ResizeObserver | undefined
 onMounted(() => {
-  readAvailable()
-  observer = new ResizeObserver(readAvailable)
+  const saved = readStoredSize(props.persistKey, props.size)
+  requestedSize.value = saved
+  readAvailable(saved)
+  observer = new ResizeObserver(() => readAvailable())
   if (root.value) observer.observe(root.value)
   // 持久化尺寸可能大于当前窗口，挂载后先夹紧一次再使用。
   if (props.persistKey) {
-    const saved = readStoredSize(props.persistKey, props.size)
-    if (saved !== props.size) emit('update:size', clampSize({
+    if (saved !== props.size) publishSize(clampSize({
       size: saved,
       min: props.min,
       max: props.max,
       minOther: props.minOther,
       available: available.value,
+      second: secondSize.value,
+      fitOther: props.fitOther,
     }))
   }
 })
 
 watch(currentSize, () => {
   // 外部传入的尺寸也可能越界（例如窗口缩小后旧持久化值），同步回父级。
-  if (currentSize.value !== props.size) emitSize(currentSize.value)
+  if (currentSize.value !== props.size) publishSize(currentSize.value)
+})
+
+/** 接收真正的外部受控修改；自身发布的显示尺寸与currentSize相等，无须覆盖偏好。 */
+watch(() => props.size, value => {
+  if (value !== currentSize.value) {
+    requestedSize.value = value
+    if (props.workspacePane && available.value > 0) {
+      secondSize.value = Math.max(props.minOther, available.value - value)
+    }
+  }
+})
+
+// 一次单向报告即可约束外层边界；隐藏面板各自保存偏好，由工作台选择当前模式。
+watch([secondSize, () => props.min, () => props.minOther], () => {
+  if (props.workspacePane && secondSize.value !== undefined) {
+    workspace?.reserve(props.workspacePane, props.min + secondSize.value, props.min + props.minOther)
+  }
 })
 
 onBeforeUnmount(() => {
   observer?.disconnect()
+  if (props.workspacePane) workspace?.reserve(props.workspacePane, null)
   if (pointerId !== null) endSession(pointerId)
   document.body.classList.remove('split-dragging')
 })
@@ -210,20 +274,13 @@ onBeforeUnmount(() => {
       :aria-label="label"
       :aria-orientation="direction === 'horizontal' ? 'vertical' : 'horizontal'"
       :aria-valuenow="currentSize"
-      :aria-valuemin="min"
+      :aria-valuemin="Math.min(min, currentSize)"
       :aria-valuemax="Math.max(min, available - minOther)"
       :style="handleStyle"
       @pointerdown="start"
       @keydown="keydown"
     >
-      <span class="split-grip" aria-hidden="true">
-        <svg class="grip-arrow" v-if="direction === 'horizontal'" viewBox="0 0 16 12" width="16" height="12">
-          <path d="M1 6h14M1 6l4-4M1 6l4 4M15 6l-4-4M15 6l-4 4" />
-        </svg>
-        <svg class="grip-arrow" v-else viewBox="0 0 12 16" width="12" height="16">
-          <path d="M6 1v14M6 1l-4 4M6 1l4 4M6 15l-4-4M6 15l4-4" />
-        </svg>
-      </span>
+      <span class="split-grip" aria-hidden="true" />
     </button>
     <div class="split-pane split-second"><slot name="second" /></div>
   </div>
@@ -255,6 +312,10 @@ onBeforeUnmount(() => {
   min-height: 0;
 }
 
+/* 方向光标用自定义 SVG 而非系统 col-resize/row-resize：
+   系统光标本身没有描边，在浅色界面上对比偏弱。这里画成白色双向箭头配
+   1px 黑描边，任何底色下都清晰。data URI 内联，不额外产生资源文件与构建配置。
+   末尾的 col-resize/row-resize 是图像不可用时的回退，语义保持不变。 */
 .split-handle {
   position: absolute;
   z-index: 5;
@@ -264,27 +325,34 @@ onBeforeUnmount(() => {
   border: 0;
   background: transparent;
   touch-action: none;
-  /* 自定义双向箭头光标：部分宿主（含内嵌 webview）不渲染系统 resize 光标，
-     用内联 SVG 保证形态一致。末尾保留 col-resize 作为加载失败时的回退。 */
-  cursor: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g fill='none' stroke='%2317171a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M7 12h10'/><path d='M7 12l3-3M7 12l3 3'/><path d='M17 12l-3-3M17 12l-3 3'/></g></svg>") 12 12, col-resize;
+  /* 悬停命中带时的光标；拖动期间由 body.split-dragging 整页锁定同一光标，
+     指针移出这 16px 范围也不会退化成普通箭头。 */
+  cursor:
+    url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Cg%20fill='%23fff'%20stroke='%23000'%20stroke-width='1'%20stroke-linejoin='round'%3E%3Cpolygon%20points='1,8%205,4%205,6%2011,6%2011,4%2015,8%2011,12%2011,10%205,10%205,12'/%3E%3C/g%3E%3C/svg%3E")
+      8 8,
+    col-resize;
 }
 
 .split-vertical > .split-handle {
-  cursor: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g fill='none' stroke='%2317171a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 7v10'/><path d='M12 7l-3 3M12 7l3 3'/><path d='M12 17l-3-3M12 17l3-3'/></g></svg>") 12 12, row-resize;
+  cursor:
+    url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Cg%20fill='%23fff'%20stroke='%23000'%20stroke-width='1'%20stroke-linejoin='round'%3E%3Cpolygon%20points='8,1%204,5%206,5%206,11%204,11%208,15%2012,11%2010,11%2010,5%2012,5'/%3E%3C/g%3E%3C/svg%3E")
+      8 8,
+    row-resize;
 }
 
 .split-horizontal > .split-handle {
   top: 0;
   bottom: 0;
-  /* 命中带覆盖整条边界；14px 足够宽，鼠标靠近即命中，同时不遮挡内容。 */
-  width: 14px;
+  /* 命中带覆盖整条边界；宽度兼顾“靠近即命中”与“不遮挡内容”。
+     16px 配合拖动期整页光标锁定，指针略微移出也仍可操作。 */
+  width: 16px;
   transform: translateX(-50%);
 }
 
 .split-vertical > .split-handle {
   left: 0;
   right: 0;
-  height: 14px;
+  height: 16px;
   transform: translateY(-50%);
 }
 
@@ -293,7 +361,7 @@ onBeforeUnmount(() => {
 .split-grip {
   display: block;
   background: transparent;
-  transition: background 0.14s ease;
+  transition: background 0.14s ease, width 0.14s ease, height 0.14s ease;
 }
 
 .split-horizontal .split-grip {
@@ -306,64 +374,76 @@ onBeforeUnmount(() => {
   height: 1px;
 }
 
-/* 悬浮：边界线加深，提示此处可调。 */
+/* 悬浮：只加粗分隔线本身并转为主题紫，不给命中带铺底色。
+   此前额外画过一条 16px 宽的浅紫底，视觉上像一根粗紫条，
+   与“细线提示”的意图不符，已移除；命中仍由整条 16px 区域负责。 */
 .split-handle:hover .split-grip,
 .split-handle:focus-visible .split-grip {
-  background: var(--border-strong);
-}
-
-/* 长按待命：边界线转为强调色，提示“继续按住即可拖动”。 */
-.holding .split-grip {
   background: var(--accent);
 }
 
-/* 拖动中：保持强调色并加一点外发光。 */
-.dragging .split-grip {
+.split-horizontal .split-handle:hover .split-grip,
+.split-horizontal .split-handle:focus-visible .split-grip {
+  width: 2px;
+}
+
+.split-vertical .split-handle:hover .split-grip,
+.split-vertical .split-handle:focus-visible .split-grip {
+  height: 2px;
+}
+
+/* 长按待命与拖动：线条保持紫并加粗（hover 已是同样状态），
+   拖动时再叠一圈柔和外发光，作为“正在改变尺寸”的额外确认。
+   选择器从根元素出发并带 .split-handle，才能压过上方 hover 规则的特异性
+   （.split-handle:hover .split-grip 为 (0,2,1)，裸 .holding 只有 (0,2,0)）。 */
+.holding .split-handle .split-grip,
+.dragging .split-handle .split-grip {
   background: var(--accent);
+}
+
+.split-horizontal.holding .split-grip,
+.split-horizontal.dragging .split-grip {
+  width: 2px;
+}
+
+.split-vertical.holding .split-grip,
+.split-vertical.dragging .split-grip {
+  height: 2px;
+}
+
+.dragging .split-handle .split-grip {
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
 
-/* 边界中央的双向箭头：悬浮、长按待命、拖动时显现。
-   它既是视觉提示，也弥补了部分宿主不绘制自定义光标的场景。 */
-.grip-arrow {
-  fill: none;
-  stroke: var(--text-secondary);
-  stroke-width: 1.6;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  /* 常驻可见（淡），保证用户一眼看到“这里可以调”；悬浮/待命时变实。 */
-  opacity: 0.45;
-  transition: opacity 0.14s ease, stroke 0.14s ease;
-  position: absolute;
-  pointer-events: none;
-  background: var(--bg-surface);
-  border-radius: 3px;
-  padding: 1px;
-  /* 压在边界正中央：handle 是 place-items:center 的 grid，
-     绝对定位元素需要显式居中才不会跑到左上角。 */
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-}
-
-.split-handle:hover .grip-arrow,
-.split-handle:focus-visible .grip-arrow,
-.holding .grip-arrow,
-.dragging .grip-arrow {
-  opacity: 1;
-}
-
-.holding .grip-arrow,
-.dragging .grip-arrow {
-  stroke: var(--accent);
-}
-
 :global(body.split-dragging) {
-  cursor: col-resize;
   user-select: none !important;
 }
 
 :global(body.split-dragging *) {
   user-select: none !important;
+}
+
+/* 拖动中的光标锁定。
+   原因：手柄命中带只有 16px 宽，鼠标一旦拖出这段区域，浏览器会把光标
+   回退成普通箭头，用户就失去了“还在拖动”的反馈。拖动期间在 body 上
+   强制整页保持同一光标，指针移到任何位置都仍是双向箭头。
+   body 与后代都覆盖：子元素各自的 cursor 声明（如按钮的 pointer）
+   优先级更高，只写 body 会被它们盖掉。
+   这里必须重复同一张自定义光标图——CSS 无法从别处继承“图像 + 热点”，
+   只写关键字会退回无描边的系统光标。 */
+:global(body.split-dragging),
+:global(body.split-dragging *) {
+  cursor:
+    url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Cg%20fill='%23fff'%20stroke='%23000'%20stroke-width='1'%20stroke-linejoin='round'%3E%3Cpolygon%20points='1,8%205,4%205,6%2011,6%2011,4%2015,8%2011,12%2011,10%205,10%205,12'/%3E%3C/g%3E%3C/svg%3E")
+      8 8,
+    col-resize !important;
+}
+
+:global(body.split-dragging.split-dragging-vertical),
+:global(body.split-dragging.split-dragging-vertical *) {
+  cursor:
+    url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='16'%20height='16'%20viewBox='0%200%2016%2016'%3E%3Cg%20fill='%23fff'%20stroke='%23000'%20stroke-width='1'%20stroke-linejoin='round'%3E%3Cpolygon%20points='8,1%204,5%206,5%206,11%204,11%208,15%2012,11%2010,11%2010,5%2012,5'/%3E%3C/g%3E%3C/svg%3E")
+      8 8,
+    row-resize !important;
 }
 </style>

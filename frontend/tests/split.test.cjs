@@ -9,6 +9,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const ts = require('typescript')
+const vue = require('vue')
 
 function loadSplit(storage) {
   const source = fs.readFileSync(path.join(__dirname, '../src/lib/split.ts'), 'utf8')
@@ -31,6 +32,64 @@ const memoryStorage = () => {
 const throwingStorage = () => ({
   getItem: () => { throw new Error('denied') },
   setItem: () => { throw new Error('denied') },
+})
+
+/** 使用真实Vue计算/观察器，只替换浏览器测量和生命周期，直接执行生产SFC。 */
+function mountSplit(input, storage = memoryStorage()) {
+  const file = fs.readFileSync(path.join(__dirname, '../src/components/ResizableSplit.vue'), 'utf8')
+  const script = file.split('<script setup lang="ts">')[1].split('</script>')[0]
+    .replace(/import[^\n]+from[^\n]+\r?\n/g, '')
+  const js = ts.transpileModule(script, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText
+  const props = vue.reactive({ direction: 'horizontal', min: 220, minOther: 360, ...input })
+  const mounts = [], cleanup = [], reserved = []
+  const scope = vue.effectScope()
+  let width = 1200
+  const env = {
+    ...vue, ...loadSplit(storage),
+    defineProps: () => props, withDefaults: p => p,
+    defineEmits: () => (_, size) => { props.size = size },
+    onMounted: fn => mounts.push(fn), onBeforeUnmount: fn => cleanup.push(fn),
+    inject: () => ({ reserve: (...args) => reserved.push(args) }),
+    ResizeObserver: class { observe() {} disconnect() {} },
+    window: { localStorage: storage },
+    document: { body: { classList: { remove() {} } } },
+  }
+  const api = scope.run(() => new Function(...Object.keys(env), `${js};return {root,currentSize,readAvailable,emitSize,secondSize}`)(...Object.values(env)))
+  api.root.value = { getBoundingClientRect: () => ({ width, height: 800 }) }
+  mounts.forEach(fn => fn())
+  return {
+    ...api, props, reserved, storage,
+    resize: async value => { width = value; api.readAvailable(); await vue.nextTick() },
+    dispose: () => { cleanup.forEach(fn => fn()); scope.stop() },
+  }
+}
+
+test('temporary viewport compression preserves saved widths and restores the history preference', async () => {
+  const pane = mountSplit({ size: 278, min: 200, minOther: 910, fitOther: 620, persistKey: 'history' })
+  pane.storage.setItem('history', '278')
+  await pane.resize(418)
+  assert.equal(pane.currentSize.value, 102)
+  assert.equal(pane.storage.getItem('history'), '278')
+  await pane.resize(1368)
+  assert.equal(pane.currentSize.value, 278)
+  pane.dispose()
+})
+
+test('hidden measurements cannot corrupt a mode result preference or its workspace reservation', async () => {
+  const pane = mountSplit({ size: 460, min: 320, minOther: 300, workspacePane: 'manual', persistKey: 'editor' })
+  await vue.nextTick()
+  assert.equal(pane.secondSize.value, 740)
+  assert.deepEqual(pane.reserved.at(-1), ['manual', 1060, 620])
+  await pane.resize(0)
+  assert.equal(pane.secondSize.value, 740)
+  await pane.resize(250)
+  assert.equal(pane.currentSize.value, 129)
+  assert.equal(pane.storage.getItem('editor.second'), '740')
+  await pane.resize(1200)
+  assert.equal(pane.currentSize.value, 460)
+  pane.dispose()
 })
 
 test('a drag past the lower threshold stops at the minimum', () => {
@@ -60,6 +119,54 @@ test('a container too small for both minimums still respects the primary minimum
 test('unmeasured container applies only min/max, not the other-pane limit', () => {
   const { clampSize } = loadSplit(memoryStorage())
   assert.equal(clampSize({ size: 500, min: 220, minOther: 360, available: 0 }), 500)
+})
+
+test('moving history exchanges width with the editor while preserving the result', () => {
+  const { clampSize } = loadSplit(memoryStorage())
+  // 总宽1200，初始历史268/编辑460/结果472；历史向右移动100。
+  const history = clampSize({ size: 368, min: 200, minOther: 320 + 472, available: 1200 })
+  const editor = clampSize({ size: 460, second: 472, min: 320, minOther: 300, available: 1200 - history })
+  assert.equal(history, 368)
+  assert.equal(editor, 360)
+  assert.equal(1200 - history - editor, 472)
+})
+
+test('history reaches the editor minimum before it can squeeze the result', () => {
+  const { clampSize } = loadSplit(memoryStorage())
+  for (const requested of [800, 10000]) {
+    const history = clampSize({ size: requested, min: 200, minOther: 320 + 472, available: 1200 })
+    const editor = clampSize({ size: 460, second: 472, min: 320, minOther: 300, available: 1200 - history })
+    assert.equal(history, 408)
+    assert.equal(editor, 320)
+    assert.equal(1200 - history - editor, 472)
+  }
+})
+
+test('second-anchored layout fits a narrow viewport and restores the result on expansion', () => {
+  const { clampSize } = loadSplit(memoryStorage())
+  // 临时不足两侧最小值时，按最小值比例降级，两侧仍可见；保留偏好供恢复。
+  assert.equal(clampSize({ size: 9999, second: 472, min: 320, minOther: 300, available: 250 }), 129)
+  assert.equal(clampSize({ size: 129, second: 472, min: 320, minOther: 300, available: 600 }), 310)
+  assert.equal(clampSize({ size: 320, second: 472, min: 320, minOther: 300, available: 1000 }), 528)
+})
+
+test('only a physically undersized three-column workspace compresses the history minimum', () => {
+  const { clampSize } = loadSplit(memoryStorage())
+  const history = clampSize({ size: 268, min: 200, minOther: 320 + 590, fitOther: 620, available: 418 })
+  const editor = clampSize({ size: 460, min: 320, minOther: 300, second: 590, available: 418 - history })
+  assert.equal(history, 102)
+  assert.equal(editor, 163)
+  assert.equal(418 - history - editor, 153)
+  // 仍放得下三栏最小值时，历史200px保底不可因结果偏好较宽而被压缩。
+  assert.equal(clampSize({ size: 268, min: 200, minOther: 910, fitOther: 620, available: 900 }), 200)
+})
+
+test('an editor drag establishes a new result width for subsequent history movement', () => {
+  const { clampSize } = loadSplit(memoryStorage())
+  const editor = clampSize({ size: 500, min: 320, minOther: 300, available: 932 })
+  const result = 932 - editor
+  assert.equal(result, 432)
+  assert.equal(clampSize({ size: editor, second: result, min: 320, minOther: 300, available: 832 }), 400)
 })
 
 test('saved size is restored, and missing or invalid values fall back', () => {
@@ -127,42 +234,64 @@ test('a drag session always ends even if the pointer leaves the handle', () => {
   assert.match(source, /window\.addEventListener\('pointercancel'/)
   const end = source.slice(source.indexOf('function endSession('), source.indexOf('function start('))
   assert.match(end, /dragging\.value = false/)
-  assert.match(end, /document\.body\.classList\.remove\('split-dragging'\)/)
+  // 拖动期两个类都要清掉：split-dragging 负责锁光标与禁选，垂直方向另有自己的类。
+  assert.match(end, /classList\.remove\('split-dragging', 'split-dragging-vertical'\)/)
   assert.match(end, /sessionCleanup\?\.\(\)/)
   // 模板上不能再挂 move/up（会被 capture 重定向吞掉）。
   const template = source.slice(source.indexOf('<template>'))
   assert.ok(!/@pointermove|@pointerup/.test(template), 'session events must live on window, not the handle')
 })
 
-test('the separator uses resize cursors and a visible arrow affordance', () => {
+test('the separator uses outlined resize cursors and a plain line without arrow artwork', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '../src/components/ResizableSplit.vue'), 'utf8')
 
-  // 光标：自定义 SVG 双向箭头（部分宿主不渲染系统 resize 光标），保留系统值作回退。
-  assert.match(source, /cursor: url\("data:image\/svg\+xml,/)
+  // 光标负责方向提示；分隔线不能残留SVG箭头或已不用的图案样式。
+  // 光标改用内联 SVG 自定义图（白箭头 + 黑描边），关键字只作回退。
   assert.match(source, /col-resize/)
   assert.match(source, /row-resize/)
+  assert.match(source, /url\("data:image\/svg\+xml,/)
+  assert.match(source, /stroke='%23000'/, 'cursor artwork must carry a black outline')
+  assert.match(source, /fill='%23fff'/, 'cursor artwork must stay light inside the outline')
+  assert.ok(!/grip-arrow|data:image\/svg/.test(source.replace(/cursor:\s*\n?\s*url\("data:image\/svg\+xml,[^"]+"\)/g, '')),
+    'the separator must not use arrow artwork beyond the cursor image')
+  assert.match(source, /\.split-handle:hover \.split-grip/)
 
-  // 同时保留边界中央的可见箭头：即使宿主不绘制自定义光标，用户也能看到。
-  assert.match(source, /class="grip-arrow"/)
-  // 箭头常驻可见（淡显），悬浮/待命/拖动时变实。
-  assert.match(source, /opacity: 0\.45/)
-  assert.match(source, /\.split-handle:hover \.grip-arrow/)
-
-  // 边界是一条 1px 细线，始终可见，用来分隔两个模块。
+  // 静止时是一条 1px 细线，不绘制箭头图案。
   assert.match(source, /\.split-horizontal \.split-grip \{[\s\S]*?width: 1px;/)
+
+  // 悬浮只加粗线条本身，不再给命中带铺一条宽的浅紫底。
+  assert.ok(!/\.split-handle:hover::before/.test(source),
+    'hover must not paint a wide background band over the hit area')
+  assert.ok(!/\.split-handle:focus-visible::before/.test(source))
 
   // 不用抓手光标。
   assert.ok(!/cursor: (grab|grabbing)/.test(source), 'must not use grab cursors')
 })
 
-test('manual pane has an independent editor|result split', () => {
+test('the resize cursor stays locked for the whole drag, not just over the handle', () => {
   const source = fs.readFileSync(
-    path.join(__dirname, '../src/views/ManualPane.vue'), 'utf8')
-  assert.match(source, /persist-key="api-agent\.layout\.manual\.editor"/)
-  assert.match(source, /:min="320"/)
-  assert.match(source, /:min-other="300"/)
+    path.join(__dirname, '../src/components/ResizableSplit.vue'), 'utf8')
+
+  // 回归来源：命中带只有十几像素宽，指针拖出该区域后浏览器把光标退回普通箭头，
+  // 用户失去“仍在拖动”的反馈。修复约定：拖动期在 body 上强制整页同一光标。
+  // 光标是自定义 SVG（无描边的系统关键字对比太弱），关键字只作回退。
+  const draggingRule = source.slice(source.indexOf('body.split-dragging),'))
+  assert.match(draggingRule, /col-resize !important/, 'drag must lock the horizontal cursor page-wide')
+  assert.match(draggingRule, /row-resize !important/, 'vertical splits need the row-resize variant')
+  assert.match(draggingRule, /url\("data:image\/svg\+xml,/,
+    'the locked cursor must reuse the outlined artwork, not the bare keyword')
+
+  // 只写 body 不够：子元素自身的 cursor（如 button 的 pointer）优先级更高，
+  // 必须同时覆盖后代，否则指针停在按钮上仍会变回手型。
+  assert.match(source, /body\.split-dragging \*\)[\s\S]{0,400}col-resize !important/)
+
+  // 垂直方向靠独立类区分，且拖动开始时按方向挂上。
+  assert.match(source, /split-dragging-vertical/)
+  const start = source.slice(source.indexOf('holdTimer = window.setTimeout'), source.indexOf('function keydown('))
+  assert.match(start, /props\.direction !== 'horizontal'/)
 })
+
 
 test('long connection has an independent config|stage split', () => {
   const source = fs.readFileSync(
@@ -172,70 +301,6 @@ test('long connection has an independent config|stage split', () => {
   assert.match(source, /:min-other="360"/)
 })
 
-test('the case-test page owns a single shared history column for both modes', () => {
-  const read = (name) => fs.readFileSync(path.join(__dirname, '../src/views', name), 'utf8')
-  const shell = read('TestCasesView.vue')
-  const manual = read('ManualPane.vue')
-  const auto = read('AutoPane.vue')
-  const shared = fs.readFileSync(
-    path.join(__dirname, '../src/components/HistoryList.vue'), 'utf8')
-
-  // 外壳持有唯一的工作台与历史列：切换模式只替换右侧内容。
-  assert.match(shell, /<TestWorkspace[^>]*persist-key="api-agent\.layout\.cases\.history"/)
-  assert.match(shell, /<template #history>/)
-  assert.equal((shell.match(/<HistoryList/g) ?? []).length, 1,
-    'history column must be rendered exactly once')
-
-  // 两个面板不再自己带工作台或历史列，只上报条目。
-  for (const [name, src] of [['manual', manual], ['auto', auto]]) {
-    assert.ok(!/<TestWorkspace/.test(src), `${name} must not nest its own workspace`)
-    assert.ok(!/<HistoryList/.test(src), `${name} must not render its own history`)
-    assert.match(src, /defineEmits/, `${name} must emit history entries`)
-    assert.match(src, /defineExpose\(\{ openHistory \}\)/, `${name} must expose openHistory`)
-  }
-
-  // 排版与尺寸只有一份定义。
-  assert.match(shared, /\.history-column \{[\s\S]*?border-right: 1px solid/)
-  assert.match(shared, /\.history-title \{[\s\S]*?font-size: 10\.5px;/)
-})
-
-test('the history width is shared across modes, not per-mode state', () => {
-  const shell = fs.readFileSync(
-    path.join(__dirname, '../src/views/TestCasesView.vue'), 'utf8')
-  // 只有外壳持有布局键；面板不得再声明自己的 history 键（否则拖动不共享）。
-  assert.match(shell, /api-agent\.layout\.cases\.history/)
-  for (const name of ['ManualPane.vue', 'AutoPane.vue']) {
-    const src = fs.readFileSync(path.join(__dirname, '../src/views', name), 'utf8')
-    assert.ok(!/layout\.manual\.history|layout\.auto\.history/.test(src),
-      `${name} must not keep a per-mode history layout key`)
-  }
-})
-
-
-test('case-test history is one merged list, not per-mode state', () => {
-  const shell = fs.readFileSync(
-    path.join(__dirname, '../src/views/TestCasesView.vue'), 'utf8')
-
-  // 标题与空状态必须是固定文案，不能按模式分支——
-  // 否则同一个历史列在两种模式下会显示不同文字，违背“一份历史”。
-  assert.ok(!/historyTitle/.test(shell), 'title must not be mode-dependent')
-  assert.ok(!/historyEmptyText/.test(shell), 'empty text must not be mode-dependent')
-  assert.match(shell, /title="测试历史"/)
-
-  // 两个来源合并成一个按时间倒序的列表。
-  assert.match(shell, /\[\.\.\.manualEntries\.value, \.\.\.autoEntries\.value\]/)
-  assert.match(shell, /\.sort\(/)
-
-  // 点击按 source 分派回对应面板。
-  assert.match(shell, /entry\.source === 'auto'/)
-})
-
-test('each pane tags its entries with a source discriminator', () => {
-  const manual = fs.readFileSync(path.join(__dirname, '../src/views/ManualPane.vue'), 'utf8')
-  const auto = fs.readFileSync(path.join(__dirname, '../src/views/AutoPane.vue'), 'utf8')
-  assert.match(manual, /source: 'manual'/)
-  assert.match(auto, /source: 'auto'/)
-})
 
 test('the settings page is a scrollable long form', () => {
   const src = fs.readFileSync(
