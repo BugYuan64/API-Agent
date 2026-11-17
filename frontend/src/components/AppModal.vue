@@ -117,7 +117,7 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgb(23 23 26 / 42%);
+  background: var(--modal-backdrop);
 }
 
 .modal {
@@ -126,7 +126,8 @@ onBeforeUnmount(() => {
   max-width: 100%;
   max-height: calc(100vh - 48px);
   border-radius: var(--radius-lg);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
+  border: 1px solid var(--border-default);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
@@ -138,6 +139,7 @@ onBeforeUnmount(() => {
   gap: 16px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--border-subtle);
+  background: var(--panel-header-gradient);
   flex: none;
 }
 
@@ -161,7 +163,7 @@ onBeforeUnmount(() => {
   width: 26px;
   height: 26px;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-tertiary);
   cursor: pointer;

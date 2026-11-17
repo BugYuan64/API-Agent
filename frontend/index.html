@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>API-Agent 控制台</title>
+    <script>
+      // 样式加载前恢复主题，避免首次绘制采用错误的亮暗配色。
+      (() => {
+        try {
+          const theme = localStorage.getItem('api-agent.theme')
+          document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark'
+        } catch {
+          document.documentElement.dataset.theme = 'dark'
+        }
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

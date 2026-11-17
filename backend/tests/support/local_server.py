@@ -56,6 +56,7 @@ def build_app() -> FastAPI:
         return JSONResponse({"moved": True}, status_code=302, headers={"Location": "/json"})
 
     @app.get("/sse")
+    @app.post("/sse")
     async def sse(request: Request):
         """发出 4 条带事件名与多行数据的 SSE 事件，然后正常结束。"""
 

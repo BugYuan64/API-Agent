@@ -2,7 +2,7 @@
 /** 应用顶栏：依赖健康检查 API、引擎共享选择和图标组件，分别显示管理后端及执行引擎状态。探测失败显示未知或异常状态，不替代各页面的业务错误提示。 */
 
 import { computed, onMounted, ref } from 'vue'
-import { Activity, RefreshCw, ServerCog, Settings as SettingsIcon } from 'lucide-vue-next'
+import { Activity, ChevronRight, RefreshCw, ServerCog, Settings as SettingsIcon } from 'lucide-vue-next'
 import { engineStatus, getHealth } from '@/api/endpoints'
 import type { EngineStatus } from '@/api/types'
 import { engineMeta } from '@/lib/engines'
@@ -56,16 +56,16 @@ onMounted(refresh)
   <header class="topbar">
     <div class="crumbs">
       <span class="crumb-root">API-Agent</span>
-      <span class="crumb-sep">/</span>
+      <ChevronRight class="crumb-sep" :size="13" aria-hidden="true" />
       <span class="crumb-current">{{ $route.meta.title ?? '控制台' }}</span>
     </div>
 
     <div class="status">
-      <div class="pill" :class="healthError ? 'pill-danger' : 'pill-success'">
+      <div class="pill" :class="healthError ? 'pill-danger' : 'pill-success'" :title="healthError ? '后端未连接' : '后端在线'" :aria-label="healthError ? '后端未连接' : '后端在线'">
         <Activity :size="12" />
         <span>{{ healthError ? '后端未连接' : '后端在线' }}</span>
       </div>
-      <div class="pill" :class="`pill-${engineTone}`">
+      <div class="pill" :class="`pill-${engineTone}`" :title="engineLabel" :aria-label="engineLabel">
         <ServerCog :size="12" />
         <span>{{ engineLabel }}</span>
       </div>
@@ -88,7 +88,7 @@ onMounted(refresh)
   height: var(--topbar-height);
   flex: none;
   padding: 0 16px;
-  background: var(--bg-surface);
+  background: var(--bg-sidebar);
   border-bottom: 1px solid var(--border-subtle);
 }
 
@@ -101,6 +101,7 @@ onMounted(refresh)
 }
 
 .crumb-root {
+  white-space: nowrap;
   color: var(--text-tertiary);
 }
 
@@ -111,12 +112,16 @@ onMounted(refresh)
 .crumb-current {
   font-weight: 600;
   color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .status {
   display: flex;
   align-items: center;
   gap: 7px;
+  flex: none;
 }
 
 .pill {
@@ -125,7 +130,7 @@ onMounted(refresh)
   gap: 5px;
   height: 25px;
   padding: 0 9px;
-  border-radius: 99px;
+  border-radius: var(--radius-sm);
   font-size: 11.5px;
   font-weight: 500;
   border: 1px solid transparent;
@@ -134,19 +139,19 @@ onMounted(refresh)
 .pill-success {
   background: var(--success-soft);
   color: var(--success);
-  border-color: #cfeee2;
+  border-color: var(--success-border);
 }
 
 .pill-warning {
   background: var(--warning-soft);
   color: var(--warning);
-  border-color: #f3e0bd;
+  border-color: var(--warning-border);
 }
 
 .pill-danger {
   background: var(--danger-soft);
   color: var(--danger);
-  border-color: #f5d0d0;
+  border-color: var(--danger-border);
 }
 
 .pill-neutral {
@@ -163,5 +168,17 @@ onMounted(refresh)
   to {
     transform: rotate(360deg);
   }
+}
+
+@media (max-width: 800px) {
+  .topbar { padding: 0 12px; gap: 8px; }
+  .crumb-root, .crumb-sep { display: none; }
+  .status { gap: 4px; }
+  .pill { padding: 0 6px; font-size: 10.5px; }
+}
+
+@media (max-width: 600px) {
+  .pill span { display: none; }
+  .pill { width: 26px; justify-content: center; }
 }
 </style>

@@ -1,7 +1,9 @@
 <script setup lang="ts">
-/** 侧边导航组件：依赖 Vue Router 和 Lucide icons，根据当前路径推导激活项与标签。 */
-
-import { computed } from 'vue'
+/**
+ * 侧边导航统一承载路由入口、主题与折叠偏好。
+ * 折叠只收窄外壳并隐藏文字，保留导航分组与每行高度，保证所有图标纵向位置一致。
+ */
+import { ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   Braces,
@@ -9,12 +11,19 @@ import {
   FolderKanban,
   History,
   ListTree,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   Settings as SettingsIcon,
+  Sun,
   Terminal,
 } from 'lucide-vue-next'
+import {
+  applyTheme, readSidebarCollapsed, readTheme, writeSidebarCollapsed, writeTheme,
+} from '@/lib/appearance'
 
-/** 侧边栏分组：接口测试、任务测试、项目、记录和设置。 */
+/** 页面分组同时用于展开标签和折叠后的可访问导航。 */
 const groups = [
   {
     label: '接口管理',
@@ -23,14 +32,8 @@ const groups = [
       { to: '/long-connection', label: '长连接测试', icon: Cable },
     ],
   },
-  {
-    label: '任务测试',
-    items: [{ to: '/testcases', label: '用例测试', icon: ListTree }],
-  },
-  {
-    label: '项目',
-    items: [{ to: '/projects', label: '项目与环境', icon: FolderKanban }],
-  },
+  { label: '任务测试', items: [{ to: '/testcases', label: '用例测试', icon: ListTree }] },
+  { label: '项目', items: [{ to: '/projects', label: '项目与环境', icon: FolderKanban }] },
   {
     label: '记录',
     items: [
@@ -38,66 +41,99 @@ const groups = [
       { to: '/executions', label: '执行结果', icon: Terminal },
     ],
   },
-  {
-    label: '设置',
-    items: [
-      { to: '/settings', label: '系统设置', icon: SettingsIcon },
-    ],
-  },
+  { label: '设置', items: [{ to: '/settings', label: '系统设置', icon: SettingsIcon }] },
 ]
 
 const route = useRoute()
-/** 按当前路径判断入口是否激活：完全匹配或入口子路径均返回 true；不执行导航。 */
+const theme = ref(readTheme())
+const collapsed = ref(readSidebarCollapsed())
+
+/** 按路径识别当前入口，导航子路径仍归属于对应主项。 */
 const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
 
-/** 根据当前路由的首个匹配入口计算导航标签；未知页面回退“控制台”，不触发跳转。 */
-const activeLabel = computed(() => {
-  for (const group of groups) {
-    const hit = group.items.find((item) => isActive(item.to))
-    if (hit) return hit.label
-  }
-  return '控制台'
+/** 主题仅修改全局设计令牌的选择属性，页面业务与输入状态继续保留。 */
+function toggleTheme(): void {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark'
+}
+
+/** 切换侧栏宽度，两个状态都保留相同路由链接与图标占位。 */
+function toggleCollapsed(): void {
+  collapsed.value = !collapsed.value
+}
+
+/** 偏好变动立即同步根节点与本地存储，失败由外观模块安全回退。 */
+watch(theme, (value) => {
+  applyTheme(value)
+  writeTheme(value)
 })
+watch(collapsed, writeSidebarCollapsed)
 </script>
 
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ 'sidebar-collapsed': collapsed }" aria-label="应用侧边栏">
     <div class="brand">
-      <div class="brand-mark">
-        <Braces :size="15" :stroke-width="2.4" />
-      </div>
-      <div class="brand-text">
+      <div class="brand-mark" aria-hidden="true"><Braces :size="17" :stroke-width="2.2" /></div>
+      <div class="brand-text sidebar-label">
         <span class="brand-name">API-Agent</span>
         <span class="brand-sub">本地测试控制台</span>
       </div>
     </div>
 
     <div class="quick">
-      <RouterLink to="/request" class="quick-action">
-        <Plus :size="14" />
-        <span>新建请求</span>
+      <RouterLink to="/request" class="quick-action" title="新建请求" aria-label="新建请求">
+        <span class="sidebar-icon" aria-hidden="true"><Plus :size="17" :stroke-width="2" /></span>
+        <span class="sidebar-label">新建请求</span>
       </RouterLink>
     </div>
 
-    <nav class="nav scroll-y">
+    <nav class="nav scroll-y" aria-label="主导航">
       <div v-for="group in groups" :key="group.label" class="nav-group">
-        <div class="nav-label">{{ group.label }}</div>
+        <div class="nav-label sidebar-label" :aria-hidden="collapsed">{{ group.label }}</div>
         <RouterLink
           v-for="item in group.items"
           :key="item.to"
           :to="item.to"
           class="nav-item"
           :class="{ 'nav-item-active': isActive(item.to) }"
+          :title="collapsed ? item.label : undefined"
+          :aria-label="item.label"
         >
-          <component :is="item.icon" :size="15" :stroke-width="1.9" />
-          <span>{{ item.label }}</span>
+          <span class="sidebar-icon" aria-hidden="true">
+            <component :is="item.icon" :size="17" :stroke-width="1.8" />
+          </span>
+          <span class="sidebar-label nav-text">{{ item.label }}</span>
         </RouterLink>
       </div>
     </nav>
 
     <div class="sidebar-foot">
-      <span class="foot-dot" />
-      <span class="truncate">{{ activeLabel }}</span>
+      <button
+        class="sidebar-control"
+        type="button"
+        :title="theme === 'dark' ? '切换亮色主题' : '切换暗色主题'"
+        :aria-label="theme === 'dark' ? '切换亮色主题' : '切换暗色主题'"
+        @click="toggleTheme"
+      >
+        <span class="sidebar-icon" aria-hidden="true">
+          <Sun v-if="theme === 'dark'" :size="17" :stroke-width="1.8" />
+          <Moon v-else :size="17" :stroke-width="1.8" />
+        </span>
+        <span class="sidebar-label">{{ theme === 'dark' ? '亮色主题' : '暗色主题' }}</span>
+      </button>
+      <button
+        class="sidebar-control"
+        type="button"
+        :title="collapsed ? '展开侧边栏' : '折叠侧边栏'"
+        :aria-label="collapsed ? '展开侧边栏' : '折叠侧边栏'"
+        :aria-expanded="!collapsed"
+        @click="toggleCollapsed"
+      >
+        <span class="sidebar-icon" aria-hidden="true">
+          <PanelLeftOpen v-if="collapsed" :size="17" :stroke-width="1.8" />
+          <PanelLeftClose v-else :size="17" :stroke-width="1.8" />
+        </span>
+        <span class="sidebar-label">{{ collapsed ? '展开侧边栏' : '折叠侧边栏' }}</span>
+      </button>
     </div>
   </aside>
 </template>
@@ -105,136 +141,114 @@ const activeLabel = computed(() => {
 <style scoped>
 .sidebar {
   display: flex;
-  flex-direction: column;
-  width: var(--sidebar-width);
   flex: none;
+  flex-direction: column;
+  width: var(--sidebar-width, 248px);
   height: 100%;
-  background: var(--bg-surface);
+  overflow: hidden;
+  color: var(--text-primary);
+  background: var(--bg-sidebar, var(--bg-surface));
   border-right: 1px solid var(--border-subtle);
+  transition: width var(--motion-normal, 220ms) ease;
 }
+
+.sidebar-collapsed { width: var(--sidebar-collapsed-width, 72px); }
 
 .brand {
   display: flex;
-  align-items: center;
-  gap: 9px;
-  height: var(--topbar-height);
-  padding: 0 14px;
   flex: none;
+  align-items: center;
+  gap: 11px;
+  height: var(--topbar-height);
+  padding: 0 22px;
 }
 
 .brand-mark {
   display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  background: var(--text-primary);
-  color: var(--text-inverse);
-}
-
-.brand-text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.2;
-  min-width: 0;
-}
-
-.brand-name {
-  font-size: 13px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-
-.brand-sub {
-  font-size: 10.5px;
-  color: var(--text-tertiary);
-}
-
-.quick {
-  padding: 2px 10px 10px;
   flex: none;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border: 1px solid var(--border-highlight, var(--border-default));
+  border-radius: 8px;
+  color: var(--text-on-accent, var(--text-primary));
+  background: var(--accent-gradient);
+  box-shadow: var(--shadow-sm);
 }
 
-.quick-action {
-  display: flex;
+.brand-text { line-height: 1.4; }
+.brand-name { display: block; font-size: 14px; font-weight: 650; letter-spacing: -0.025em; }
+.brand-sub { display: block; color: var(--text-tertiary); font-size: 10px; }
+
+/* 文本仍参与固定高度的行布局，只渐隐并由外壳裁剪。 */
+.sidebar-label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: opacity var(--motion-fast, 140ms) ease;
+}
+.sidebar-collapsed .sidebar-label { opacity: 0; pointer-events: none; }
+
+.quick { flex: none; padding: 5px 12px 16px; }
+.quick-action,
+.nav-item,
+.sidebar-control {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  height: 32px;
+  gap: 10px;
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
   border-radius: var(--radius-md);
-  background: var(--text-primary);
-  color: var(--text-inverse);
+  overflow: hidden;
+}
+
+.sidebar-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+}
+.sidebar-icon svg { flex: none; }
+.quick-action {
+  color: var(--text-on-accent, var(--text-primary));
+  background: var(--accent-gradient);
+  box-shadow: inset 0 0 0 1px var(--border-highlight, var(--border-default)), var(--shadow-sm);
   font-size: 12.5px;
-  font-weight: 550;
-}
-
-.quick-action:hover {
-  background: #2a2a30;
-}
-
-.nav {
-  flex: 1;
-  padding: 0 10px 12px;
-}
-
-.nav-group + .nav-group {
-  margin-top: 14px;
-}
-
-.nav-label {
-  padding: 0 6px 5px;
-  font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
+  transition: background var(--motion-fast, 140ms) ease;
 }
+.quick-action:hover { background: var(--accent-gradient-hover); }
 
-.nav-item {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  height: 31px;
-  padding: 0 8px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  font-size: 12.5px;
-  font-weight: 500;
-}
-
-.nav-item:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
-.nav-item-active {
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.nav-item-active:hover {
-  background: var(--accent-soft);
-  color: var(--accent);
-}
+.nav { flex: 1; padding: 0 12px 12px; overflow-x: hidden; scrollbar-gutter: auto; }
+.nav-group + .nav-group { margin-top: 13px; }
+.nav-label { height: 25px; padding: 2px 12px 0; color: var(--text-tertiary); font-size: 10px; font-weight: 550; letter-spacing: 0.045em; }
+.nav-item { color: var(--text-secondary); font-size: 12.5px; font-weight: 500; transition: color var(--motion-fast, 140ms) ease, background var(--motion-fast, 140ms) ease; }
+.nav-item:hover { color: var(--text-primary); background: var(--bg-hover); }
+.nav-item-active { color: var(--text-primary); font-weight: 600; background: var(--nav-active-gradient, var(--accent-soft)); box-shadow: inset 0 0 0 1px var(--border-highlight, var(--accent-border)); }
+.nav-item-active:hover { color: var(--text-primary); background: var(--nav-active-gradient, var(--accent-soft)); }
 
 .sidebar-foot {
   display: flex;
-  align-items: center;
-  gap: 7px;
   flex: none;
-  height: 34px;
-  padding: 0 16px;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
   border-top: 1px solid var(--border-subtle);
-  font-size: 11px;
-  color: var(--text-tertiary);
 }
+.sidebar-control { border: 0; color: var(--text-secondary); background: transparent; text-align: left; font-size: 12px; transition: color var(--motion-fast, 140ms) ease, background var(--motion-fast, 140ms) ease; }
+.sidebar-control:hover { color: var(--text-primary); background: var(--bg-hover); }
+.quick-action:focus-visible,
+.nav-item:focus-visible,
+.sidebar-control:focus-visible { outline: 2px solid var(--focus-ring, var(--accent)); outline-offset: -2px; }
 
-.foot-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--success);
-  flex: none;
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .sidebar-label,
+  .quick-action,
+  .nav-item,
+  .sidebar-control { transition: none; }
 }
 </style>

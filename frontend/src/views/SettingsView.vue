@@ -961,7 +961,7 @@ onMounted(() => {
   width: 36px;
   height: 36px;
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--control-gradient);
   border: 1px solid var(--border-default);
   color: var(--text-primary);
   flex: none;
@@ -985,7 +985,7 @@ onMounted(() => {
 .card {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
@@ -997,6 +997,7 @@ onMounted(() => {
   gap: 16px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--border-subtle);
+  background: var(--panel-header-gradient);
 }
 
 .card-title-group {
@@ -1245,13 +1246,13 @@ onMounted(() => {
 
 .ping-ok {
   background: var(--success-soft);
-  border: 1px solid #cceee0;
+  border: 1px solid var(--success-border);
   color: var(--success);
 }
 
 .ping-err {
   background: var(--danger-soft);
-  border: 1px solid #f9d3d3;
+  border: 1px solid var(--danger-border);
   color: var(--danger);
 }
 
@@ -1300,9 +1301,12 @@ onMounted(() => {
 
 /* 优雅原生样式的 Switch 开关 */
 .switch-control {
+  position: relative;
   display: inline-flex;
+  flex: none;
   align-items: center;
   gap: 8px;
+  white-space: nowrap;
   cursor: pointer;
   user-select: none;
 }
@@ -1314,7 +1318,10 @@ onMounted(() => {
 }
 
 .switch-input {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
 }
 
 .switch-slider {
@@ -1322,9 +1329,9 @@ onMounted(() => {
   display: inline-block;
   width: 36px;
   height: 20px;
-  background-color: var(--border-default);
+  background: var(--border-default);
   border-radius: 99px;
-  transition: background-color 0.2s;
+  transition: background var(--motion-normal);
 }
 
 .switch-slider::after {
@@ -1334,14 +1341,20 @@ onMounted(() => {
   left: 2px;
   width: 16px;
   height: 16px;
-  background-color: #ffffff;
+  background: var(--switch-thumb);
   border-radius: 50%;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+  box-shadow: var(--shadow-sm);
   transition: transform 0.2s;
 }
 
 .switch-input:checked + .switch-slider {
-  background-color: var(--accent);
+  background: var(--accent-gradient);
+}
+
+/* 保留原生复选框键盘交互，焦点投射到可见开关轨道。 */
+.switch-input:focus-visible + .switch-slider {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .switch-input:checked + .switch-slider::after {
@@ -1679,8 +1692,8 @@ onMounted(() => {
 }
 
 .tag-validate {
-  background: #eef2ff;
-  color: #4338ca;
+  background: var(--info-soft);
+  color: var(--info);
 }
 
 .tag-exec {

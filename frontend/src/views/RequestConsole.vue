@@ -616,7 +616,7 @@ onMounted(loadHistory)
   height: 100%;
   min-width: 0;
   min-height: 0;
-  /* 与手动用例的编辑区同底色：整块工作台是一个连续白面，不出现色差缝隙。 */
+  /* 请求编辑区使用统一主题表面，保持分栏边缘连续。 */
   background: var(--bg-surface);
 }
 
@@ -634,7 +634,7 @@ onMounted(loadHistory)
   height: 34px;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--bg-input);
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 700;
@@ -648,14 +648,14 @@ onMounted(loadHistory)
   height: 34px;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--bg-input);
   padding: 0 11px;
   outline: none;
 }
 
 .url-input:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 .url-bar .btn {
@@ -681,7 +681,7 @@ onMounted(loadHistory)
   padding: 0 9px;
   border: 1px solid var(--border-default);
   border-radius: 99px;
-  background: var(--bg-surface);
+  background: var(--control-gradient);
   color: var(--text-secondary);
   font-size: 11.5px;
 }
@@ -718,7 +718,6 @@ onMounted(loadHistory)
 
 .tab-active {
   color: var(--accent);
-  border-bottom-color: var(--accent);
   font-weight: 600;
 }
 
@@ -746,7 +745,7 @@ onMounted(loadHistory)
   padding: 0 10px;
   border: 1px solid var(--border-default);
   border-radius: 99px;
-  background: var(--bg-surface);
+  background: var(--control-gradient);
   color: var(--text-secondary);
   font-size: 11.5px;
 }
@@ -756,9 +755,9 @@ onMounted(loadHistory)
 }
 
 .mode-chip-active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--text-inverse);
+  background: var(--accent-gradient);
+  border-color: var(--accent-border);
+  color: var(--text-on-accent);
 }
 
 .mode-chip:disabled {
@@ -828,7 +827,7 @@ onMounted(loadHistory)
   gap: 9px;
   padding: 11px 13px;
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--bg-subtle);
   border: 1px solid var(--border-subtle);
   color: var(--text-secondary);
 }
@@ -861,6 +860,7 @@ onMounted(loadHistory)
   gap: 12px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--border-subtle);
+  background: var(--panel-header-gradient);
   flex: none;
 }
 

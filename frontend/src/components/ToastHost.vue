@@ -47,7 +47,7 @@ const items = computed(() => toastStore.items)
   gap: 9px;
   padding: 10px 11px;
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
   border: 1px solid var(--border-default);
   box-shadow: var(--shadow-lg);
 }

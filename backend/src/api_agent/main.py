@@ -21,6 +21,9 @@ from api_agent.infrastructure.database import Database
 from api_agent.infrastructure.history import sanitize_history
 from api_agent.infrastructure.logging import configure_logging
 from api_agent.llm.routes import router as llm_router
+from api_agent.projects.document_routes import router as documents_router
+from api_agent.projects.document_store import DocumentStore
+from api_agent.projects.documents import DocumentManager
 from api_agent.projects.routes import router as projects_router
 from api_agent.streams.routes import router as streams_router
 from api_agent.streams.service import StreamManager
@@ -104,10 +107,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.tasks = tasks
             resources.push_async_callback(tasks.shutdown)
             tasks.recover()
+            documents = DocumentManager(DocumentStore(settings.artifact_dir / "projects"))
+            app.state.documents = documents
+            resources.push_async_callback(documents.shutdown)
+            documents.store.recover()
             yield
 
     app.router.lifespan_context = lifespan
     app.include_router(projects_router)
+    app.include_router(documents_router)
     app.include_router(console_router)
     app.include_router(streams_router)
     app.include_router(executions_router)

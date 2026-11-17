@@ -362,7 +362,6 @@ onMounted(load)
 
 .tab-active {
   color: var(--accent);
-  border-bottom-color: var(--accent);
   font-weight: 600;
 }
 

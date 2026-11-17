@@ -685,6 +685,7 @@ onBeforeUnmount(stopPolling)
   gap: 8px;
   padding: 10px 11px;
   border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
   background: var(--bg-subtle);
   color: var(--text-tertiary);
 }
@@ -707,7 +708,7 @@ onBeforeUnmount(stopPolling)
   flex: 1;
   min-width: 0;
   min-height: 0;
-  /* 与另两个测试页一致的连续白面。 */
+  /* 与其他测试页保持一致的主题表面。 */
   background: var(--bg-surface);
 }
 
@@ -717,7 +718,7 @@ onBeforeUnmount(stopPolling)
   justify-content: space-between;
   gap: 12px;
   padding: 11px 16px;
-  background: var(--bg-surface);
+  background: var(--panel-header-gradient);
   border-bottom: 1px solid var(--border-subtle);
   flex: none;
   flex-wrap: wrap;
@@ -814,6 +815,7 @@ onBeforeUnmount(stopPolling)
   gap: 2px;
   padding: 2px;
   border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
   background: var(--bg-subtle);
 }
 
@@ -828,7 +830,7 @@ onBeforeUnmount(stopPolling)
 }
 
 .filter-chip-active {
-  background: var(--bg-surface);
+  background: var(--control-gradient);
   color: var(--text-primary);
   font-weight: 600;
   box-shadow: var(--shadow-sm);
@@ -871,7 +873,7 @@ onBeforeUnmount(stopPolling)
   border: 1px solid var(--border-subtle);
   border-left: 2px solid var(--border-strong);
   border-radius: var(--radius-sm);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
   overflow: hidden;
 }
 

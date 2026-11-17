@@ -24,7 +24,12 @@ import ToastHost from '@/components/ToastHost.vue'
 <style scoped>
 .shell {
   display: flex;
-  height: 100%;
+  height: calc(100% - 24px);
+  margin: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+  background: var(--bg-canvas);
+  box-shadow: var(--shadow-md);
   overflow: hidden;
 }
 
@@ -38,5 +43,15 @@ import ToastHost from '@/components/ToastHost.vue'
 .content {
   flex: 1;
   min-height: 0;
+  background: var(--bg-canvas);
+}
+
+@media (max-width: 900px) {
+  .shell {
+    height: 100%;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
 }
 </style>

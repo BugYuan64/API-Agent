@@ -178,6 +178,26 @@ async def test_repair_cannot_exceed_budget(tmp_path):
     assert budget.consumed == 1
 
 
+async def test_truncated_model_response_retries_with_larger_output_budget(tmp_path):
+    limits = []
+
+    class TruncatedModel(ScriptedModel):
+        async def chat_completion(self, request):
+            limits.append(request.max_tokens)
+            if len(limits) == 1:
+                return ChatCompletionResponse(
+                    id="truncated", model=self.model, content="", finish_reason="length"
+                )
+            return await super().chat_completion(request)
+
+    budget = CallBudget(2)
+    agent = service(tmp_path, TruncatedModel(generated()))
+    result = await agent.generate(generate_request(), budget)
+    assert result.plan.requests[0].id == "phone-long"
+    assert limits[1] > limits[0]
+    assert budget.consumed == 2
+
+
 async def test_inferred_rule_cannot_be_presented_as_contract_quote(tmp_path):
     output = generated()
     output["intents"][0]["source_quote"] = "数据库唯一约束已证实"

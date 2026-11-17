@@ -200,18 +200,25 @@ class AgentService:
         secrets.extend(os.environ.get(name) for name in settings.target_auth_env_vars)
         self.context = Context(value for value in secrets if value)
 
-    async def structured(self, stage, data, output_type, budget, validate=None):
+    async def structured(
+        self, stage, data, output_type, budget, validate=None, *, prepare_context=None
+    ):
         """清洗阶段输入，返回通过结构和可选回调校验的输出模型。
 
         最多一次初次调用和一次输出修复，两次均计入共享预算；派发前通知
         预留变化，传输失败转换为稳定 AgentError，格式/引用失败可触发修复。
         上下文过大、预算不足或修复仍失败时抛 AgentError，不回显任意模型原文。
         """
-        self.context.learn(data)
-        context = self.context.clean(data)
-        # Contract schema property definitions must not be mistaken for credentials.
-        if "contract" in data:
-            context["contract"] = self.context.contract(data["contract"])
+        if prepare_context is not None:
+            # 源码需要保留类型声明与变量引用，由调用模块使用源码专用脱敏规则。
+            # 调用方只能提供上下文准备函数，不能改变输出、引用或预算校验。
+            context = prepare_context(data, self.context)
+        else:
+            self.context.learn(data)
+            context = self.context.clean(data)
+            # Contract schema property definitions must not be mistaken for credentials.
+            if "contract" in data:
+                context["contract"] = self.context.contract(data["contract"])
         serialized = json.dumps(context, ensure_ascii=False, allow_nan=False)
         if len(serialized.encode()) > 196_608:
             raise AgentError("model_context_too_large")
@@ -223,6 +230,7 @@ class AgentService:
             + json.dumps(output_type.model_json_schema(), ensure_ascii=False)
         )
         repair = ""
+        max_tokens = 16000 if stage in {"recognize", "document_source"} else 6000
         for _ in range(2):
             if budget.remaining <= 0:
                 raise AgentError("model_budget_exhausted")
@@ -239,7 +247,7 @@ class AgentService:
                             ChatMessage(role="user", content=serialized + repair),
                         ],
                         temperature=0.2,
-                        max_tokens=6000,
+                        max_tokens=max_tokens,
                     )
                 )
                 call.model = response.model
@@ -264,6 +272,8 @@ class AgentService:
                     call.status = "unknown"
                 await budget.notify()
             try:
+                if response.finish_reason == "length":
+                    max_tokens = min(max_tokens * 2, 32000)
                 if response.finish_reason in {"length", "content_filter"}:
                     raise ValueError("incomplete_output")
                 content = response.content or ""

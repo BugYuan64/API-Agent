@@ -113,7 +113,7 @@ class CaseExecutor:
                 )
             ).model_dump(mode="json")
             transport_ok = evidence["ok"]
-            events = (evidence.get("response") or {}).get("sse", {}).get("events", [])
+            events = ((evidence.get("response") or {}).get("sse") or {}).get("events", [])
             for event in events:
                 event["data"] = self._redact_body(event.get("data"))
             if events:
@@ -141,7 +141,7 @@ class CaseExecutor:
         if response and isinstance(response.get("body"), str) and len(response["body"]) > 16000:
             response["body"] = response["body"][:16000]
             response["body_truncated"] = True
-        events = (response or {}).get("sse", {}).get("events")
+        events = ((response or {}).get("sse") or {}).get("events")
         if events is None:
             events = evidence.get("events")
         if not isinstance(events, list):

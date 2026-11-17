@@ -1,67 +1,142 @@
-/* 设计令牌：配色取自 magpie 的克制浅色体系，布局密度参考 apifox。
-   整体是「近白底 + 墨黑主色 + 单一紫色强调」，避免多色竞争注意力；
-   语义色只用于状态，不用于装饰。 */
+/* 全局主题令牌。暗色采用炭灰表面与柔和高光，亮色以白色表面配合蓝绿渐变。
+   组件只引用语义变量，主题切换不会改变尺寸、字号或布局密度。 */
 :root {
-  /* 底色与表面：从最浅到最深的四层，靠层次而不是边框来分隔区域 */
-  --bg-canvas: #f7f7f8;
-  --bg-surface: #ffffff;
-  --bg-subtle: #f2f2f4;
-  --bg-sunken: #ebebee;
-  --bg-hover: #f4f4f6;
-  --bg-active: #ededf0;
+  color-scheme: dark;
+  --bg-app: #0c0d0e;
+  --bg-canvas: #121415;
+  --bg-sidebar: #151718;
+  --bg-surface: #191b1d;
+  --bg-subtle: #202325;
+  --bg-sunken: #141617;
+  --bg-input: #151719;
+  --bg-hover: #272b2d;
+  --bg-active: #303537;
 
-  /* 文字：主/次/弱三级，足以表达层级又不制造灰度噪音 */
-  --text-primary: #17171a;
-  --text-secondary: #5c5c66;
-  --text-tertiary: #8e8e99;
-  --text-inverse: #ffffff;
+  --text-primary: #f0f2f3;
+  --text-secondary: #b9bec2;
+  --text-tertiary: #8f979d;
+  --text-inverse: #15191c;
+  --text-on-accent: #f8fafb;
+  --switch-thumb: #ffffff;
 
-  /* 描边：默认几乎不可见，只在需要界定可交互区域时加深 */
-  --border-subtle: #ebebee;
-  --border-default: #e0e0e5;
-  --border-strong: #c9c9d1;
+  --border-subtle: #292d30;
+  --border-default: #383e42;
+  --border-strong: #535d63;
+  --border-highlight: rgb(255 255 255 / 7%);
 
-  /* 主色：墨黑用于主按钮（magpie 的下载按钮即是），紫色作强调 */
-  --accent: #4f3ff0;
-  --accent-hover: #4331e0;
-  --accent-soft: #eeeaff;
-  --accent-border: #d8d0ff;
+  --accent: #a5ddcb;
+  --accent-hover: #c5efdf;
+  --accent-soft: #203831;
+  --accent-border: #365a4e;
+  --accent-gradient: linear-gradient(135deg, #4b5256 0%, #343b3f 52%, #2a3233 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #596369 0%, #414c51 52%, #354341 100%);
+  --nav-active-gradient: linear-gradient(110deg, #383e41 0%, #2a3033 100%);
+  --surface-gradient: linear-gradient(155deg, #1e2123 0%, #191b1d 65%);
+  --panel-header-gradient:
+    repeating-linear-gradient(130deg, transparent 0 10px, rgb(255 255 255 / 2%) 10px 11px),
+    linear-gradient(110deg, #202426, #1a1d1f);
+  --control-gradient: linear-gradient(180deg, #2c3134, #22272a);
+  --control-hover-gradient: linear-gradient(180deg, #373e42, #2b3236);
+  --focus-ring: rgb(165 221 203 / 22%);
+  --modal-backdrop: rgb(0 0 0 / 65%);
 
-  /* 语义状态色：低饱和底色 + 高对比文字，保证在浅色主题下可读 */
-  --success: #12805c;
-  --success-soft: #e6f6f0;
-  --warning: #a15c07;
-  --warning-soft: #fdf3e2;
-  --danger: #c22b2b;
-  --danger-soft: #fdecec;
-  --info: #1f6fd0;
-  --info-soft: #e8f1fd;
+  --success: #8fd8b4;
+  --success-soft: #1b352b;
+  --success-border: #315341;
+  --warning: #e9bf7c;
+  --warning-soft: #392e1f;
+  --warning-border: #5b472b;
+  --danger: #f39b9b;
+  --danger-soft: #3b2427;
+  --danger-border: #63373b;
+  --info: #9fc7f7;
+  --info-soft: #203047;
+  --info-border: #354e6e;
 
-  /* HTTP 方法色：沿用 apifox 的语义（GET 绿、POST 橙、PUT 蓝、DELETE 红） */
-  --method-get: #12805c;
-  --method-post: #b56808;
-  --method-put: #1f6fd0;
-  --method-patch: #7a4dc4;
-  --method-delete: #c22b2b;
-  --method-head: #5c5c66;
-  --method-options: #5c5c66;
+  --method-get: #8fd8b4;
+  --method-post: #e9bf7c;
+  --method-put: #9fc7f7;
+  --method-patch: #c5b3ed;
+  --method-delete: #f39b9b;
+  --method-head: #b9bec2;
+  --method-options: #b9bec2;
 
-  --radius-sm: 6px;
+  --radius-sm: 7px;
   --radius-md: 9px;
   --radius-lg: 13px;
-  --radius-xl: 18px;
+  --radius-xl: 16px;
 
-  --shadow-sm: 0 1px 2px rgba(23, 23, 26, 0.06);
-  --shadow-md: 0 4px 14px rgba(23, 23, 26, 0.07);
-  --shadow-lg: 0 12px 34px rgba(23, 23, 26, 0.1);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 16%), inset 0 1px 0 var(--border-highlight);
+  --shadow-md: 0 4px 18px rgb(0 0 0 / 12%), inset 0 1px 0 var(--border-highlight);
+  --shadow-lg: 0 18px 54px rgb(0 0 0 / 32%), inset 0 1px 0 var(--border-highlight);
 
   --font-sans: 'Inter', 'Segoe UI Variable Display', 'Segoe UI', -apple-system,
     'PingFang SC', 'Microsoft YaHei', sans-serif;
   --font-mono: 'JetBrains Mono', 'Cascadia Code', 'SF Mono', Consolas, monospace;
 
-  --sidebar-width: 232px;
-  --topbar-height: 52px;
+  --sidebar-width: 248px;
+  --sidebar-collapsed-width: 72px;
+  --topbar-height: 60px;
   --workspace-width: 268px;
+  --motion-fast: 140ms;
+  --motion-normal: 220ms;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg-app: #eaf0f4;
+  --bg-canvas: #f5f8fa;
+  --bg-sidebar: #ffffff;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f0f5f7;
+  --bg-sunken: #f5f8fa;
+  --bg-input: #ffffff;
+  --bg-hover: #edf4f7;
+  --bg-active: #e2edf2;
+  --text-primary: #1c2b35;
+  --text-secondary: #506471;
+  --text-tertiary: #697e8b;
+  --text-inverse: #ffffff;
+  --text-on-accent: #ffffff;
+  --border-subtle: #e2eaee;
+  --border-default: #cfdee5;
+  --border-strong: #a5bdca;
+  --border-highlight: rgb(255 255 255 / 85%);
+  --accent: #147a93;
+  --accent-hover: #0b647b;
+  --accent-soft: #e7f4f6;
+  --accent-border: #b9dfe2;
+  --accent-gradient: linear-gradient(115deg, #236acf 0%, #187dab 48%, #0e8979 100%);
+  --accent-gradient-hover: linear-gradient(115deg, #1c59b6 0%, #126b93 48%, #087565 100%);
+  --nav-active-gradient: linear-gradient(105deg, #e5effc 0%, #e3f5ee 100%);
+  --surface-gradient: linear-gradient(145deg, #ffffff 40%, #fbfdfe 100%);
+  --panel-header-gradient: linear-gradient(110deg, #f0f6ff 0%, #f0f9f5 100%);
+  --control-gradient: linear-gradient(180deg, #ffffff, #f5f9fb);
+  --control-hover-gradient: linear-gradient(180deg, #f6fbff, #eaf4f5);
+  --focus-ring: rgb(20 122 147 / 16%);
+  --modal-backdrop: rgb(19 39 53 / 42%);
+  --success: #18734f;
+  --success-soft: #eaf7ef;
+  --success-border: #c5e7d3;
+  --warning: #94601e;
+  --warning-soft: #fff5e3;
+  --warning-border: #efd9b2;
+  --danger: #bd3945;
+  --danger-soft: #fff0f0;
+  --danger-border: #efcdd1;
+  --info: #2867ac;
+  --info-soft: #edf4ff;
+  --info-border: #ccdef5;
+  --method-get: #18734f;
+  --method-post: #94601e;
+  --method-put: #2867ac;
+  --method-patch: #7954ae;
+  --method-delete: #bd3945;
+  --method-head: #506471;
+  --method-options: #506471;
+  --shadow-sm: 0 1px 3px rgb(24 53 70 / 5%), inset 0 1px 0 var(--border-highlight);
+  --shadow-md: 0 5px 20px rgb(24 53 70 / 5%), inset 0 1px 0 var(--border-highlight);
+  --shadow-lg: 0 20px 54px rgb(24 53 70 / 14%), inset 0 1px 0 var(--border-highlight);
 }
 
 * {
@@ -75,8 +150,11 @@ body,
   margin: 0;
 }
 
+/* 收纳桌面外壳的外边距，避免 margin 折叠把整页撑出第二条滚动条。 */
+#app { display: flow-root; }
+
 body {
-  background: var(--bg-canvas);
+  background: var(--bg-app);
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-size: 13px;
@@ -89,11 +167,22 @@ a {
   text-decoration: none;
 }
 
-button {
-  font-family: inherit;
-  font-size: inherit;
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+input[type='checkbox'], input[type='radio'] { accent-color: var(--accent); }
+input[type='file'] { max-width: 100%; font-size: 12px; }
+input[type='file']::file-selector-button {
+  margin-right: 9px;
+  padding: 5px 9px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--control-gradient);
+  color: var(--text-primary);
+  font: inherit;
   cursor: pointer;
 }
+input[type='file']::file-selector-button:hover { background: var(--control-hover-gradient); }
+::selection { background: var(--accent-border); color: var(--text-primary); }
 
 code,
 pre,
@@ -103,7 +192,10 @@ input.mono {
   font-size: 12px;
 }
 
-/* 滚动条保持细窄，避免在数据密集页面里抢视觉重量 */
+/* 原生菜单、滚动条和焦点与主题一致。 */
+option { background: var(--bg-input); color: var(--text-primary); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
 * ::-webkit-scrollbar {
   width: 9px;
   height: 9px;
@@ -123,4 +215,14 @@ input.mono {
 
 * ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* 尊重减少动态效果偏好，主题和折叠操作保留完整功能。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
 }

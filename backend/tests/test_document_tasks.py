@@ -117,13 +117,18 @@ paths:
     assert cases[2].protocol == "sse"
 
 
+@pytest.mark.parametrize("sse_method", ["GET", "POST"])
 async def test_mixed_task_executes_original_and_generated_cases_and_exports(
-    client, app, target, monkeypatch
+    client, app, target, monkeypatch, sse_method
 ):
     await enable_model(client, monkeypatch)
+    input_catalog = catalog().model_dump()
+    input_catalog["endpoints"][1]["method"] = sse_method
+    if sse_method == "POST":
+        input_catalog["endpoints"][1]["body"] = {"question": "hello"}
     started = await client.post(
         "/api/tasks",
-        json={"catalog": catalog().model_dump(), "origin": target.base_url, "allow_writes": True},
+        json={"catalog": input_catalog, "origin": target.base_url, "allow_writes": True},
     )
     assert started.status_code == 202, started.text
     task_id = started.json()["id"]

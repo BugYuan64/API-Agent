@@ -155,13 +155,13 @@ onBeforeUnmount(() => { disposed = true; stopPolling() })
 .task-panel { height: 100%; min-height: 0; padding: 18px; box-sizing: border-box; }
 h2 { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 15px; margin: 0 0 16px; }
 .field { display: flex; flex-direction: column; gap: 8px; margin: 16px 0; }
-.upload { display: flex; flex-direction: column; gap: 12px; padding: 18px; border: 1px dashed var(--border-default); border-radius: 8px; margin-top: 18px; }
+.upload { display: flex; flex-direction: column; gap: 12px; padding: 18px; border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); background: var(--surface-gradient); margin-top: 18px; }
 .hint { line-height: 1.7; color: var(--text-tertiary); }
 .operations { max-height: 240px; overflow: auto; padding-left: 16px; }
 .operations li { padding: 5px 0; overflow-wrap: anywhere; }
 .actions { display: flex; gap: 8px; margin-top: 20px; }
 .check { display: flex; align-items: center; gap: 8px; margin: 16px 0; }
-.case { border: 1px solid var(--border-subtle); border-radius: 6px; padding: 12px; margin: 10px 0; }
+.case { border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--surface-gradient); box-shadow: var(--shadow-sm); padding: 12px; margin: 10px 0; }
 .case summary { cursor: pointer; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
 .warning { color: var(--warning); }

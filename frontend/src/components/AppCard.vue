@@ -41,7 +41,8 @@ defineProps<{
   flex-direction: column;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 
@@ -52,6 +53,7 @@ defineProps<{
   gap: 16px;
   padding: 14px 18px;
   border-bottom: 1px solid var(--border-subtle);
+  background: var(--panel-header-gradient);
 }
 
 .app-card-title-group {

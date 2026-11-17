@@ -1,5 +1,7 @@
 # API-Agent：API 自动测试与异常分析智能体
 
+> 2026-11-17 新增项目源码导入与 AI 接口文档。`/projects` 可读取运行 API-Agent 电脑上的项目目录，保存源码快照，按全部纳入扫描的文件分批分析并核对静态接口清单。文档可下载为 Markdown 或 OpenAPI 3.1 JSON，包含文件处理进度、扫描遗漏与待确认事项。使用步骤见下方“项目导入与接口文档”。
+
 > 2026-11-04（CRM Docker 全链路实测）：CRM 栈（8088 后端 / 8002 RAG）上完成双引擎冒烟（各 **6 请求 / 16 断言**）、鉴权只读（**3 请求 / 15 断言**）、AI 契约生成与按 `execution_id` 诊断、自适应补测、CRM SSE 与 WebSocket 双向收发。过程中修复一个真实缺陷：赋值式凭据正则会把证据 ID `r0:xxx-password:a0=500` 误判为凭据并整段脱敏，导致 AI 诊断恒返回 `invalid_model_output`。后端 **325 项测试通过**。未执行写操作，未写入 CRM 业务数据。
 
 > 2026-11-03（结构与质量复核）：拆分长连接输入、状态、持久化和编排职责；模型客户端分离传输与供应方响应解析。修复启动恢复、异常资源释放、事件写入失败丢失、终态任务收尾、前端轮询重启/卸载及响应体超时等问题。Docker 8088 经正式 CLI→MCP→两种引擎实测，每个引擎均通过 **9 请求 / 32 断言**（登录、错误参数、鉴权拦截、客户分页/搜索/详情），unknown=0；本轮未写入 CRM 业务数据。完整证据和限制见[阶段记录](阶段步骤实现.md)最新章节。
@@ -45,6 +47,7 @@
 | 能力 | 当前状态 |
 | --- | --- |
 | 项目/环境追加版本、SQLite 迁移 | 已实现；`/api` 管理 API |
+| **项目源码导入与 AI 接口文档** | **已实现**，`/projects` 支持本机目录导入、源码快照、分批生成、取消与历史回看，导出 Markdown 和 OpenAPI 3.1 JSON |
 | 独立测试命令、本地 stdio MCP | 已实现；`doctor`、`validate`、`run`（均支持 `--engine`） |
 | **执行驱动适配器（Driver / Adapter Pattern）** | **已实现可切换双引擎**；测试内容（`ExecutionPlan`）与执行技术解耦，`native` 与 `postman` 并列注册 |
 | **原生 `native` 引擎（纯 Python / httpx）** | **已实现**；零外部依赖、毫秒级、跨平台，覆盖全部 5 类受控断言 |
@@ -73,6 +76,8 @@
 既有 AI 闭环通过 `/api/agent/runs`，确定性计划仍通过 `/api/executions` 或独立 CLI/MCP 执行。文档任务使用 `/api/tasks/recognize`、`POST /api/tasks`、详情/取消/报告接口；本地标准文档识别无需 LLM，非标准文档识别与任务总结需模型服务可用。单接口页面的 SSE 请求通过 HTTP 响应呈现，事件观察使用字节、事件数与时间上限。
 
 **前端控制台**：Vue 3 + TypeScript + Vite，侧边栏分为接口管理、任务测试、项目、记录和设置；SSE 在接口测试或文档用例测试中执行，长连接页仅调试 WebSocket。Iconify 图标数据本地打包，不请求远端图标服务。
+
+控制台提供暗色和亮色主题，首次打开采用暗色。暗色使用炭灰表面与柔和渐变，亮色使用白色表面与蓝绿渐变；按钮、表单、卡片、表格、弹窗和状态提示共用主题变量。侧边栏底部可切换主题和折叠导航，折叠后保留可点击图标与名称提示。主题和折叠偏好保存在当前浏览器，刷新后恢复。
 
 ## 组成与数据流
 
@@ -241,7 +246,7 @@ npm run dev   # vite dev server，端口 5180，/api 与 /health 代理到 8010
 | 接口调试 | `/request` | `POST /api/console/requests`、`GET/DELETE /api/console/history` |
 | 文档任务测试 | `/testcases` | `/api/tasks/recognize`、`POST/GET/DELETE /api/tasks/{id}`、`/{id}/cancel`、`/{id}/report` |
 | 长连接测试 | `/long-connection` | `POST/GET /api/streams`、`/{id}/send`、`/{id}/stop`、`DELETE /api/streams/{id}` |
-| 项目与环境 | `/projects` | `/api/projects`、`/api/environments*` |
+| 项目与环境 | `/projects` | `/api/projects`、`/api/projects/import`、`/api/projects/{id}/source`、`/api/projects/{id}/documents*`、`/api/environments*` |
 | 请求历史 | `/history` | console + streams + executions 三组历史 |
 | 执行结果 | `/executions` | `GET /api/executions` |
 | 系统设置 | `/settings` | `GET/PUT /api/settings/llm`、`POST /api/settings/llm/ping`、`POST /api/settings/llm/models`、`GET /api/executions/engine/list`（引擎选择器） |
@@ -269,6 +274,21 @@ npm run dev   # vite dev server，端口 5180，/api 与 /health 代理到 8010
 - **模型列表**：点「获取模型列表」调用 `POST /api/settings/llm/models`，后端向 `{base_url}/models` 发起 `GET` 并解析 `data[].id`，界面以下拉框列出，可直接点选写回模型名。
 - **预览态**：`base_url` 与 `api_key` 可在未保存时先用于拉取模型与连通性测试，避免“先存错再改”。
 
+### 项目导入与接口文档
+
+1. 在系统设置中保存模型服务地址、模型名及所需凭据。
+2. 打开 `/projects`，点击项目栏的“导入”，填写项目名称与 `<PROJECT_DIRECTORY>`。目录必须是运行 API-Agent 电脑上的绝对本地路径。已有项目可在“接口文档”页签中点击“导入源码”或“重新导入源码”。
+3. 查看扫描统计、排除项和待核验项，再点击“生成接口文档”。导入的脱敏源码会分批发送给系统设置中已配置的模型。生成进度按文件与批次展示，刷新页面后可继续查看，运行期间可取消。
+4. 生成结束后，从当前文档或生成历史下载 Markdown、OpenAPI JSON。部分完成、取消或中断的记录也可导出已有内容，文档会保留完成度和遗漏说明。
+
+导入会递归检查目录，排除凭据文件、版本控制目录、依赖与构建产物，并拒绝跟随符号链接。当前扫描上限为 5000 个源码文件、每个文件 512 KiB、合计 20 MiB。超限、无法读取或不支持编码的源码进入扫描问题清单，并将扫描标为不完整。有可读取源码时仍可生成部分文档，界面和导出均保留 `partial` 状态及原因。
+
+后台保存不可变源码快照，将纳入范围的完整文本逐批交给模型分析。大文件按片段处理，并保留片段相邻上下文。静态提取的接口清单用于核对模型输出，未补全的已知接口保留待确认标记。文档包含方法、路径、参数、请求体、响应、鉴权、源码依据及未知信息。源码批次处理完成后，动态注册、运行时前缀、网关重写和外部组件路由仍需结合实际服务核验。
+
+OpenAPI 导出使用 3.1 JSON，覆盖信息位于 `x-generation`，WebSocket 条目位于 `x-websocket-operations`。未知结构与鉴权信息通过说明和扩展字段保留。源码与文档保存在 `ARTIFACT_DIR/projects/<project-id>/sources/` 和 `documents/`，导入新源码会创建新版本，历史文档继续引用原快照。
+
+2026-11-17 使用 `deepseek-v4.1-flash` 实际调用 1 次，完成非秘密夹具的 2 个源码文件和 4 个接口文档，其中 HTTP 3 个、WebSocket 1 个，跨文件 `Product` 参数的 JSON Schema 与源码一致。浏览器已通过项目导入、文档生成、Markdown/OpenAPI 下载及 900px 宽窗口检查。前端 51 项测试、类型检查与生产构建通过，相关后端专项 125 项通过、1 项跳过，所涉 20 个文件的 Ruff 检查与格式检查通过。后端本轮全量结果为 412 项通过、18 项失败、1 项跳过，失败集中于旧 SSE 测试与当前仅接受 WebSocket 的长连接输入契约不匹配，详细范围见阶段步骤实现第 21 节。
+
 ### 长连接测试
 
 - **SSE**：逐行解析 WHATWG 的 SSE 语法（`data:`/`event:`/`id:`/`retry:`/`:` 注释，多行 `data` 拼接）。握手状态与 `Content-Type` 被记录；目标主动关闭记为 `target_closed`。
@@ -290,7 +310,7 @@ backend/
   src/api_agent/
     main.py, cli.py
     infrastructure/              # 配置、日志、ORM、API公共契约、目标策略
-    projects/                    # 项目和环境版本
+    projects/                    # 项目/环境版本、源码扫描与快照、AI 文档任务和导出
     execution/                   # 计划、engine(协议)、native(原生驱动)、postman(CLI驱动)、Collection、报告、路由
     console/                     # 手动 HTTP 请求 + 脱敏历史
     streams/                     # schemas 输入输出、state 内存、repository 写库、service 编排、transport 读取预算

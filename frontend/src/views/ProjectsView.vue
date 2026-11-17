@@ -1,11 +1,12 @@
 <script setup lang="ts">
-/** 项目与环境管理页：依赖项目、环境及版本 API，创建项目、编辑授权配置并查看历史。认证只保存环境变量引用；追加版本带乐观锁，管理接口失败通过全局提示反馈。 */
+/** 项目与环境管理页：管理项目导入、源码文档工作区、环境配置及版本历史。认证保存环境变量引用，接口文档由独立组件追踪后台进度。 */
 
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
   ChevronRight,
   FolderKanban,
   FolderPlus,
+  FolderInput,
   History,
   Loader2,
   Plus,
@@ -13,7 +14,10 @@ import {
   ShieldCheck,
 } from 'lucide-vue-next'
 import EmptyState from '@/components/EmptyState.vue'
+import AppModal from '@/components/AppModal.vue'
+import ProjectDocuments from '@/components/ProjectDocuments.vue'
 import { describeError } from '@/api/client'
+import { importProject } from '@/api/projectDocuments'
 import {
   createEnvironment,
   createProject,
@@ -38,6 +42,12 @@ const loading = ref(false)
 const projectForm = reactive({ name: '', description: '' })
 const creatingProject = ref(false)
 const showProjectForm = ref(false)
+const showImportForm = ref(false)
+const importForm = reactive({ name: '', description: '', directory: '' })
+const importingProject = ref(false)
+const importError = ref('')
+const activeDetail = ref<'documents' | 'environment'>('documents')
+let projectSelection = 0
 
 /** 环境表单：origin 与方法/路径用文本编辑，避免多值输入控件的复杂度。 */
 const environmentForm = reactive({
@@ -72,31 +82,74 @@ const parsedPaths = computed(() =>
 
 /** 切换当前项目并清空旧环境选中及历史，再读取该项目环境；失败提示并清空环境列表，始终解除 loading。 */
 async function selectProject(project: Project) {
+  const selection = ++projectSelection
   selectedProject.value = project
   selectedEnvironment.value = null
   history.value = null
+  environments.value = []
+  showEnvironmentForm.value = false
+  activeDetail.value = 'documents'
   loading.value = true
   try {
     const page = await listEnvironments(project.id)
+    if (selection !== projectSelection) return
     environments.value = page.items
   } catch (error) {
+    if (selection !== projectSelection) return
     useToastStore().push('danger', '加载环境失败', describeError(error))
     environments.value = []
   } finally {
-    loading.value = false
+    if (selection === projectSelection) loading.value = false
   }
 }
 
 /** 切换当前环境并读取版本历史；失败时清空历史并提示，不修改已保存版本。 */
 async function selectEnvironment(environment: Environment) {
   selectedEnvironment.value = environment
+  activeDetail.value = 'environment'
   showEnvironmentForm.value = false
   try {
-    history.value = await environmentHistory(environment.id)
+    const result = await environmentHistory(environment.id)
+    if (selectedEnvironment.value?.id === environment.id) history.value = result
   } catch (error) {
+    if (selectedEnvironment.value?.id !== environment.id) return
     useToastStore().push('danger', '加载版本历史失败', describeError(error))
     history.value = null
   }
+}
+
+/** 创建项目并导入本机源码目录，成功后直接进入文档工作区。 */
+async function submitImport(): Promise<void> {
+  if (!importForm.name.trim() || !importForm.directory.trim() || importingProject.value) return
+  importingProject.value = true
+  importError.value = ''
+  try {
+    const result = await importProject({
+      name: importForm.name.trim(), description: importForm.description.trim(), directory: importForm.directory.trim(),
+    })
+    projects.value.push(result.project)
+    showImportForm.value = false
+    importForm.name = ''
+    importForm.description = ''
+    importForm.directory = ''
+    await selectProject(result.project)
+    useToastStore().push(result.source.complete ? 'success' : 'warning',
+      result.source.complete ? '项目已导入，可生成接口文档' : '项目已导入，请检查源码扫描问题')
+  } catch (failure) {
+    importError.value = describeError(failure)
+  } finally {
+    importingProject.value = false
+  }
+}
+
+/** 新建环境从空身份开始，避免已有环境的选中态把创建入口变成版本编辑。 */
+function startEnvironment(): void {
+  selectedEnvironment.value = null
+  history.value = null
+  activeDetail.value = 'environment'
+  showEnvironmentForm.value = true
+  Object.assign(environmentForm, { name: '', origin: 'http://127.0.0.1:8080', methods: 'GET,POST',
+    paths: '/health', authKind: 'none', authEnvVar: '', authHeaderName: '', sensitive: '' })
 }
 
 /** 读取项目列表并默认加载第一项的环境；失败提示且始终解除 loading。 */
@@ -239,9 +292,14 @@ onMounted(loadProjects)
     <aside class="col projects-col">
       <div class="col-head">
         <span class="col-title">项目</span>
-        <button class="btn btn-ghost btn-sm" title="新建项目" @click="showProjectForm = !showProjectForm">
-          <FolderPlus :size="13" />
-        </button>
+        <div class="card-actions-inline">
+          <button class="btn btn-ghost btn-sm" title="导入项目" @click="showImportForm = true">
+            <FolderInput :size="13" />导入
+          </button>
+          <button class="btn btn-ghost btn-sm" title="新建项目" @click="showProjectForm = !showProjectForm">
+            <FolderPlus :size="13" />
+          </button>
+        </div>
       </div>
 
       <div v-if="showProjectForm" class="inline-form">
@@ -272,7 +330,7 @@ onMounted(loadProjects)
           v-if="!projects.length && !loading"
           :icon="FolderKanban"
           title="还没有项目"
-          description="项目是环境配置的归属，先创建一个再添加环境。"
+          description="导入项目源码可生成接口文档，也可新建项目管理环境。"
         />
       </div>
     </aside>
@@ -285,7 +343,7 @@ onMounted(loadProjects)
           class="btn btn-ghost btn-sm"
           :disabled="!selectedProject"
           title="新建环境"
-          @click="showEnvironmentForm = !showEnvironmentForm"
+          @click="startEnvironment"
         >
           <Plus :size="13" />
         </button>
@@ -315,7 +373,13 @@ onMounted(loadProjects)
 
     <!-- 详情 -->
     <section class="detail scroll-y">
-      <div v-if="showEnvironmentForm || (selectedEnvironment && showEnvironmentForm)" class="detail-card">
+      <div v-if="selectedProject" class="detail-tabs" role="tablist" aria-label="项目内容">
+        <button class="detail-tab" :class="{ active: activeDetail === 'documents' }" role="tab" :aria-selected="activeDetail === 'documents'" @click="activeDetail = 'documents'">接口文档</button>
+        <button class="detail-tab" :class="{ active: activeDetail === 'environment' }" role="tab" :aria-selected="activeDetail === 'environment'" @click="activeDetail = 'environment'">环境配置</button>
+      </div>
+      <ProjectDocuments v-if="selectedProject" v-show="activeDetail === 'documents'" :key="selectedProject.id" :project-id="selectedProject.id" />
+      <template v-if="activeDetail === 'environment'">
+      <div v-if="showEnvironmentForm" class="detail-card">
         <div class="card-head">
           <span class="card-title">{{
             selectedEnvironment ? `编辑「${selectedEnvironment.name}」` : '新建环境'
@@ -492,10 +556,21 @@ onMounted(loadProjects)
       <EmptyState
         v-else
         :icon="FolderKanban"
-        title="选择左侧项目与环境"
+        title="选择左侧环境或新建环境"
         description="这里会显示 origin 白名单、路径模板、鉴权引用与完整版本历史。"
       />
+      </template>
+      <EmptyState v-if="!selectedProject" :icon="FolderKanban" title="导入或选择项目" description="导入项目源码后可生成接口文档并导出，也可为项目添加测试环境。" />
     </section>
+    <AppModal v-model:open="showImportForm" title="导入项目" width="580px" :confirm-text="importingProject ? '扫描项目中' : '导入并扫描'" :confirm-disabled="importingProject || !importForm.name.trim() || !importForm.directory.trim()" @confirm="submitImport">
+      <div class="import-fields">
+        <label class="field"><span class="field-label">项目名称</span><input v-model="importForm.name" class="input" maxlength="80" placeholder="填写项目名称" :disabled="importingProject" /></label>
+        <label class="field"><span class="field-label">项目目录</span><input v-model="importForm.directory" class="input mono" placeholder="本机项目的绝对路径" :disabled="importingProject" /></label>
+        <p class="hint">填写运行 API-Agent 电脑上的目录，导入会递归扫描源码并保存快照。</p>
+        <label class="field"><span class="field-label">项目描述（可选）</span><textarea v-model="importForm.description" class="textarea" rows="2" maxlength="500" :disabled="importingProject" /></label>
+        <p v-if="importError" class="import-error" role="alert">{{ importError }}</p>
+      </div>
+    </AppModal>
   </div>
 </template>
 
@@ -531,6 +606,7 @@ onMounted(loadProjects)
   height: 38px;
   padding: 0 8px 0 13px;
   flex: none;
+  color: var(--text-secondary);
 }
 
 .col-title {
@@ -576,7 +652,7 @@ onMounted(loadProjects)
 }
 
 .list-item-active {
-  background: var(--accent-soft);
+  background: var(--nav-active-gradient);
   border-color: var(--accent-border);
 }
 
@@ -617,10 +693,18 @@ onMounted(loadProjects)
   gap: 12px;
 }
 
+.detail-tabs { display: flex; gap: 18px; margin: -4px 0 16px; border-bottom: 1px solid var(--border-subtle); }
+.detail-tab { padding: 10px 0; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-secondary); font-size: 12px; }
+.detail-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.import-fields { display: flex; flex-direction: column; gap: 12px; }
+.import-fields .hint { margin: -5px 0 0; }
+.import-error { margin: 0; color: var(--danger); font-size: 12px; }
+
 .detail-card {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
+  box-shadow: var(--shadow-sm);
   padding: 13px 15px 15px;
 }
 
@@ -709,8 +793,32 @@ onMounted(loadProjects)
 }
 
 @media (max-width: 1080px) {
+  /* 窄窗口纵向排列项目、环境和详情，让导入入口与表单保持可滚动、可操作。 */
+  .projects {
+    flex-direction: column;
+    height: auto;
+    min-height: 100%;
+    min-width: 300px;
+  }
+
+  .projects-col,
   .env-col {
-    display: none;
+    width: 100%;
+    border-right: 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .col-body {
+    max-height: 160px;
+  }
+
+  .detail {
+    overflow: visible;
+    padding: 12px;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

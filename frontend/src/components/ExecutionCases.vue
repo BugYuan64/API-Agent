@@ -106,16 +106,17 @@ function httpTone(status: number | null): string {
 .case {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 
 .case-failed {
-  border-color: #f4d4d4;
+  border-color: var(--danger-border);
 }
 
 .case-error {
-  border-color: #f6e0c8;
+  border-color: var(--warning-border);
 }
 
 .case-timed_out { border-color: var(--warning); }

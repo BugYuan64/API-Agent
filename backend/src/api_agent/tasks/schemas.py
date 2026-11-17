@@ -66,9 +66,9 @@ class Case(ApiInput):
         """Reject browser-forbidden HTTP bodies and ambiguous WebSocket/SSE inputs."""
         if self.protocol == "websocket" and self.body is not None:
             raise ValueError("websocket_case_does_not_use_http_body")
-        if self.protocol == "sse" and self.method != "GET":
-            raise ValueError("sse_requires_get")
-        if self.protocol == "sse" and (self.body is not None or self.messages):
+        if self.body is not None and self.method in {"GET", "HEAD", "OPTIONS"}:
+            raise ValueError("body_not_allowed_for_method")
+        if self.protocol == "sse" and self.messages:
             raise ValueError("sse_is_server_to_client_only")
         if self.protocol == "websocket" and self.method != "GET":
             raise ValueError("websocket_upgrade_requires_get")

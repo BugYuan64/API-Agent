@@ -136,7 +136,8 @@ onMounted(load)
 .execution {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  background: var(--surface-gradient);
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 
@@ -148,6 +149,7 @@ onMounted(load)
   padding: 9px 11px;
   border: 0;
   background: transparent;
+  color: var(--text-primary);
   text-align: left;
 }
 
