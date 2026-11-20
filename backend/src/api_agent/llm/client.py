@@ -1,6 +1,6 @@
 """通过 httpx 调用 OpenAI 兼容的 Chat Completions 与模型列表接口。
 
-依赖配置、共享错误和响应解析器；仅支持非流式传输及工具调用数据，
+依赖配置、共享错误和响应解析器；支持普通对话、工具调用数据和纯文本流，
 不执行返回的工具、不自动重试，也不验证供应商具备全部 OpenAI 能力。
 """
 
@@ -155,6 +155,57 @@ class OpenAIClient:
 
         raw = await self._request("POST", "/chat/completions", payload=payload)
         return parse_completion(raw, model_name)
+
+    async def stream_text(self, request: ChatCompletionRequest):
+        """Yield only OpenAI SSE text deltas and reject incomplete model output."""
+        payload = {
+            "model": request.model or self.model,
+            "messages": self._format_messages(request.messages),
+            "stream": True,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+        }
+        finished = False
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, trust_env=False) as client:
+                async with client.stream(
+                    "POST",
+                    self._build_url(),
+                    headers={**self._build_headers(), "Accept": "text/event-stream"},
+                    json=payload,
+                ) as response:
+                    if response.status_code in {401, 403}:
+                        raise LLMAuthenticationError("LLM authentication failed")
+                    if response.status_code != 200 or not response.headers.get(
+                        "Content-Type", ""
+                    ).lower().startswith("text/event-stream"):
+                        raise LLMResponseError("LLM did not return an SSE completion")
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            return
+                        try:
+                            chunk = json.loads(data)
+                            choices = chunk["choices"]
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            if choice.get("finish_reason") in {"length", "content_filter"}:
+                                raise LLMResponseError("Incomplete LLM completion")
+                            finished = finished or choice.get("finish_reason") == "stop"
+                            delta = choice.get("delta", {}).get("content")
+                        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+                            raise LLMResponseError("Invalid LLM completion event") from None
+                        if isinstance(delta, str) and delta:
+                            yield delta
+        except httpx.TimeoutException:
+            raise LLMTimeoutError("LLM stream timed out") from None
+        except (httpx.HTTPError, OSError):
+            raise LLMConnectionError("Could not read the configured LLM stream") from None
+        if not finished:
+            raise LLMResponseError("LLM stream ended without a completion marker")
 
     async def _request(self, method: str, path: str, *, payload=None) -> Any:
         """对指定路径发送一次异步 HTTP 请求并返回解码后的 JSON。

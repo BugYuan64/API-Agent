@@ -6,8 +6,12 @@ native 引擎与 Postman 报告归一化中各有一份实现。
 """
 
 import zlib
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from api_agent.console.sse import SseProgress
 
 MAX_BODY_CHARS = 1_000_000
 
@@ -59,14 +63,18 @@ async def bounded_send(
     max_bytes: int,
     *,
     sse_options: tuple[int, int] | None = None,
+    on_sse: "SseProgress | None" = None,
+    follow_redirects: bool = False,
 ) -> httpx.Response:
     """发送已构造请求，读取与解压时检查字节预算并始终关闭原始流。返回有界缓冲响应；不自动重定向，超限和编码失败抛专门异常。"""
     response = await client.send(request, stream=True, follow_redirects=False)
     try:
-        if sse_options and "text/event-stream" in response.headers.get("content-type", "").lower():
+        media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if sse_options and media_type == "text/event-stream":
             from api_agent.console.sse import observe_sse
 
-            return await observe_sse(response, max_bytes, *sse_options)
+            publish = None if follow_redirects and response.next_request is not None else on_sse
+            return await observe_sse(response, max_bytes, *sse_options, publish)
         # In-memory transports may supply an already-consumed response.
         if response.is_stream_consumed:
             if len(response.content) > max_bytes:

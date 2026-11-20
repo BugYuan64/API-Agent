@@ -28,6 +28,8 @@ import {
 } from 'lucide-vue-next'
 import AppModal from '@/components/AppModal.vue'
 import CopyButton from '@/components/CopyButton.vue'
+import TestSettingsFields from '@/components/TestSettingsFields.vue'
+import ThemePaletteSettings from '@/components/ThemePaletteSettings.vue'
 import { describeError } from '@/api/client'
 import {
   getLLMConfig,
@@ -391,6 +393,35 @@ onMounted(() => {
       </div>
 
       <!-- 第一部分：大模型配置 -->
+      <section class="card" aria-labelledby="test-workbench-settings">
+        <div class="card-header">
+          <div class="card-title-group">
+            <div>
+              <h2 id="test-workbench-settings" class="card-title">工作台设置</h2>
+              <p class="card-sub">与测试页共用配置，修改后自动保存在当前浏览器。</p>
+            </div>
+          </div>
+        </div>
+        <div class="card-body workbench-settings">
+          <fieldset><legend>接口测试</legend><TestSettingsFields group="console" /></fieldset>
+          <fieldset><legend>长连接测试</legend><TestSettingsFields group="websocket" /></fieldset>
+          <fieldset><legend>智能测试</legend><TestSettingsFields group="task" /></fieldset>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="appearance-settings-title">
+        <div class="card-header">
+          <div class="card-title-group">
+            <Settings2 :size="17" class="accent-icon" />
+            <div>
+              <h2 id="appearance-settings-title" class="card-title">外观与配色</h2>
+              <p class="card-sub">自定义亮色和暗色主题；修改会应用到全局，重置恢复项目当前默认配色。</p>
+            </div>
+          </div>
+        </div>
+        <div class="card-body"><ThemePaletteSettings /></div>
+      </section>
+
       <section class="card">
         <div class="card-header">
           <div class="card-title-group">
@@ -938,6 +969,10 @@ onMounted(() => {
   min-height: 100%;
   box-sizing: border-box;
 }
+
+.workbench-settings { display: grid; gap: 12px; }
+.workbench-settings fieldset { margin: 0; min-width: 0; padding: 8px 12px 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
+.workbench-settings legend { padding-inline: 4px; font-weight: 600; }
 
 .settings-container {
   width: 100%;

@@ -93,7 +93,7 @@ def _sanitize_body(text: str | None, mode: str, context: Context) -> str | None:
             )
     if context.redactor.secrets:
         cleaned = context.text(cleaned)
-    return cleaned[:PREVIEW_LIMIT] or None
+    return cleaned or None
 
 
 def _learn_header_secret(context: Context, value) -> None:
@@ -125,13 +125,15 @@ def sanitize_console(
     迁移旧行时没有完整原文，只能退化为“按预览学习”。
     """
     context = Context()
+    request_body = full_body if full_body is not None else record.request_body
+    body_source = request_body if request_body is not None else record.body_preview
     # 第一遍：学习全部明文字段中的敏感值（含 URL 查询串、请求头、响应体、错误消息）。
     # 敏感头的原值必须在 redact 之前学习，否则错误消息里对它的回显无从识别。
     context.learn(
         {
             "request_headers": record.request_headers or {},
             "response_headers": record.response_headers or {},
-            "body": _jsonable(full_body if full_body is not None else record.body_preview),
+            "body": _jsonable(body_source),
             "response": _jsonable(
                 full_response if full_response is not None else record.response_preview
             ),
@@ -144,7 +146,7 @@ def sanitize_console(
     for name, value in (record.response_headers or {}).items():
         if is_sensitive_key(name):
             _learn_header_secret(context, value)
-    context.body(full_body or record.body_preview or "", record.body_mode or "json")
+    context.body(body_source or "", record.body_mode or "json")
     if full_response:
         context.body(full_response, "json")
     if record.error_message:
@@ -153,7 +155,7 @@ def sanitize_console(
 
     url = context.text(record.url) if record.url else record.url
     headers = _safe_headers(record.request_headers, context=context)
-    body = _sanitize_body(record.body_preview, record.body_mode or "json", context)
+    body = _sanitize_body(body_source, record.body_mode or "json", context)
     response_headers = _safe_headers(record.response_headers, context=context)
     response_body = _sanitize_body(record.response_preview, "json", context)
     error_message = context.text(record.error_message) if record.error_message else None
@@ -162,9 +164,10 @@ def sanitize_console(
     for field, value in (
         ("url", url),
         ("request_headers", headers),
-        ("body_preview", body),
+        ("body_preview", body[:PREVIEW_LIMIT] if body else None),
+        ("request_body", body if request_body is not None else None),
         ("response_headers", response_headers),
-        ("response_preview", response_body),
+        ("response_preview", response_body[:PREVIEW_LIMIT] if response_body else None),
         ("error_message", error_message),
     ):
         if getattr(record, field) != value:
@@ -174,17 +177,23 @@ def sanitize_console(
 
 
 def sanitize_stream(record: StreamSessionRecord) -> bool:
-    """就地清洗一条长连接会话记录，返回是否有字段被改写。"""
+    """清洗地址、头和预置消息，保护同一会话表单内的敏感值。"""
     context = Context()
     context.learn({"request_headers": record.request_headers or {}})
+    scheduled = record.scheduled_messages
+    if scheduled is not None:
+        for message in scheduled:
+            context.body(message)
+        scheduled = [_sanitize_body(message, "json", context) or "" for message in scheduled]
     url = context.text(record.url) if record.url else record.url
-    headers = context.clean(redact_headers(record.request_headers or {}))
+    headers = _safe_headers(record.request_headers, context=context)
     error_message = context.text(record.error_message) if record.error_message else None
 
     changed = False
     for field, value in (
         ("url", url),
         ("request_headers", headers),
+        ("scheduled_messages", scheduled),
         ("error_message", error_message),
     ):
         if getattr(record, field) != value:

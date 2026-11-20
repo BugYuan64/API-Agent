@@ -41,8 +41,7 @@ defineProps<{
   flex-direction: column;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  background: var(--surface-gradient);
-  box-shadow: var(--shadow-sm);
+  background: var(--bg-surface);
   overflow: hidden;
 }
 
@@ -51,9 +50,8 @@ defineProps<{
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 14px 18px;
+  padding: 15px 18px;
   border-bottom: 1px solid var(--border-subtle);
-  background: var(--panel-header-gradient);
 }
 
 .app-card-title-group {
@@ -65,7 +63,7 @@ defineProps<{
 .app-card-icon {
   display: grid;
   place-items: center;
-  color: var(--accent);
+  color: var(--text-secondary);
   margin-top: 2px;
   flex: none;
 }

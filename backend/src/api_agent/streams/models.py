@@ -41,6 +41,7 @@ class StreamSessionRecord(IdMixin, CreatedAtMixin, Base):
     sent_count: Mapped[int] = mapped_column(Integer, default=0)
     truncated_count: Mapped[int] = mapped_column(Integer, default=0)
     settings: Mapped[dict] = mapped_column(JSON, default=dict)
+    scheduled_messages: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
     opened_at: Mapped[datetime | None]
     closed_at: Mapped[datetime | None]
 

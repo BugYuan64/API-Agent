@@ -189,6 +189,16 @@ class DocumentManager:
         for record in self.store.list(project.id, "documents"):
             if record["id"] in self.active:
                 raise ApiError(409, "document_active", "此项目已有文档生成任务，请等待或取消")
+        record, batches = self.prepare(project.name, source, agent, project.id)
+        self.store.save(project.id, "documents", record)
+        task = asyncio.create_task(self._run(record, source, batches, agent))
+        self.active[record["id"]] = task
+        task.add_done_callback(lambda finished: self.active.pop(record["id"], None))
+        return deepcopy(record)
+
+    @staticmethod
+    def prepare(project_name, source, agent, project_id=None):
+        """Build the same analysis plan for in-memory and legacy persisted runs."""
         if not source["files"]:
             raise ApiError(400, "source_empty", "项目中没有可分析的源码文件")
         batches = source_batches(source["files"])
@@ -205,10 +215,10 @@ class DocumentManager:
         record = {
             "schema_version": "1",
             "id": new_id(),
-            "project_id": project.id,
-            "project_name": project.name,
-            "source_id": source["id"],
-            "source_sha256": source["sha256"],
+            "project_id": project_id,
+            "project_name": project_name,
+            "source_id": source.get("id", ""),
+            "source_sha256": source.get("sha256", ""),
             "created_at": now,
             "updated_at": now,
             "status": "queued",
@@ -224,25 +234,31 @@ class DocumentManager:
             "error": None,
             "endpoints": merge_endpoints([], endpoints),
         }
-        self.store.save(project.id, "documents", record)
-        task = asyncio.create_task(self._run(record, source, batches, agent))
-        self.active[record["id"]] = task
-        task.add_done_callback(lambda finished: self.active.pop(record["id"], None))
-        return deepcopy(record)
+        return record, batches
 
-    async def _run(self, record: dict, source: dict, batches: list, agent):
+    async def analyze(self, project_name, source, agent):
+        """Analyze selected files without creating any project, source or job artifact."""
+        record, batches = self.prepare(project_name, source, agent)
+        await self._run(record, source, batches, agent, persist=False)
+        return record
+
+    async def _run(self, record: dict, source: dict, batches: list, agent, *, persist=True):
         """逐批校验文件确认和接口来源，失败/取消保存部分文档，成功核对静态清单。"""
         remaining = Counter(item["path"] for batch in batches for item in batch)
+
+        def save():
+            if persist:
+                self._save(record)
 
         async def save_progress():
             """模型预算变动在派发前持久化，失败重启仍能识别未完成批次。"""
             record["model_calls"] = budget.consumed + budget.reserved
-            self._save(record)
+            save()
 
         budget = CallBudget(limit=len(batches) * 2, changed=save_progress)
         try:
             record["status"] = "running"
-            self._save(record)
+            save()
             for batch in batches:
                 current_paths = {item["path"] for item in batch}
                 context, omitted = related_sources(batch, source["files"])
@@ -284,7 +300,7 @@ class DocumentManager:
                 record["processed_files"] = sum(count == 0 for count in remaining.values())
                 record["processed_batches"] += 1
                 record["warnings"] = list(dict.fromkeys(record["warnings"]))
-                self._save(record)
+                save()
             pending = sum(PENDING in item["uncertainties"] for item in record["endpoints"])
             if pending:
                 record["warnings"].append(f"静态扫描中有 {pending} 个接口尚未得到 AI 补全。")
@@ -296,13 +312,15 @@ class DocumentManager:
                 else "partial"
             )
         except asyncio.CancelledError:
+            if not persist:
+                raise
             record.update(status="cancelled", error="生成已取消，已完成结果可导出。")
         except AgentError as error:
             record.update(status="failed", error=f"模型生成未完成（{error}），已完成结果可导出。")
         except Exception:
             record.update(status="failed", error="文档生成或保存失败，已完成结果可导出。")
         finally:
-            self._save(record)
+            save()
 
     def _save(self, record: dict):
         """刷新更新时间后原子保存；文件系统失败向上游传播。"""

@@ -26,6 +26,7 @@ from api_agent.llm.schemas import (
     LLMConfigUpdate,
     LLMModelListRequest,
     LLMModelListResponse,
+    LLMModelUpdate,
     LLMPingRequest,
     LLMPingResponse,
     LLMStatusResponse,
@@ -50,6 +51,14 @@ async def update_llm_settings(
 ) -> LLMConfigResponse:
     """保存显式配置覆盖并返回脱敏结果；同源密钥复用规则由配置服务执行。"""
     return await LLMSettingService(session, request.app.state.settings).update(payload)
+
+
+@router.patch("/settings/llm/model", response_model=LLMConfigResponse)
+async def select_llm_model(
+    payload: LLMModelUpdate, session: Session, request: Request
+) -> LLMConfigResponse:
+    """Share the selected model with Settings without replacing addresses, keys or limits."""
+    return await LLMSettingService(session, request.app.state.settings).select_model(payload.model)
 
 
 @router.post("/settings/llm/ping", response_model=LLMPingResponse)

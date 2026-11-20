@@ -140,6 +140,13 @@ export interface RedirectHop {
   cross_origin: boolean
 }
 
+export interface ConsoleSseEvent {
+  event: string
+  data: string
+}
+
+export type ConsoleSseProgress = { type: 'sse_start' } | { type: 'sse_event'; event: ConsoleSseEvent }
+
 /** 目标 HTTP 响应证据；正文可能截断或为空，headers 保留同名头的多个值。 */
 export interface ConsoleResponse {
   status: number
@@ -152,12 +159,13 @@ export interface ConsoleResponse {
   body_encoding: string | null
   elapsed_ms: number
   redirects: RedirectHop[]
-  sse?: { events: { event: string; data: string }[]; stop_reason: string } | null
+  sse?: { events: ConsoleSseEvent[]; stop_reason: string } | null
 }
 
 /** 目标请求结果：ok 描述传输结果，HTTP 状态仍需单独查看；失败时 response 可空。 */
 export interface ConsoleResult extends ResultMetadata {
   ok: boolean
+  history_id?: string | null
   request: { method: string; url: string }
   response: ConsoleResponse | null
   error_kind: string | null
@@ -174,6 +182,7 @@ export interface ConsoleHistory extends ResultMetadata {
   request_headers: Record<string, unknown>
   body_mode: string
   body_preview: string | null
+  request_body?: string | null
   ok: boolean
   status_code: number | null
   elapsed_ms: number
@@ -251,6 +260,13 @@ export interface StreamEventPage {
 }
 
 /** 已保存会话摘要及请求配置预览；完整事件通过会话游标接口另外读取。 */
+export interface StreamReplayInputs {
+  url: string
+  request_headers: Record<string, string>
+  subprotocols: string[]
+  scheduled_messages: string[] | null
+}
+
 export interface StreamHistory extends ResultMetadata {
   id: string
   kind: string

@@ -1,37 +1,70 @@
 <script setup lang="ts">
-/** 历史聚合页：依赖 HTTP、长连接及执行列表 API，并行读取三类已存证据。部分来源失败仍显示其余结果；删除操作仅作用于 HTTP 历史。 */
+/** 汇总接口、长连接和文档用例测试的持久化结果，选中任务后按需读取完整证据。 */
 
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ChevronRight, History, Inbox, Radio, Trash2 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import ResizableSplit from '@/components/ResizableSplit.vue'
+import TaskResultTree from '@/components/TaskResultTree.vue'
 import { describeError } from '@/api/client'
 import {
   clearConsoleHistory,
   deleteConsoleHistory,
   listConsoleHistory,
-  listExecutions,
   listStreams,
 } from '@/api/endpoints'
-import type { ConsoleHistory, Execution, StreamHistory } from '@/api/types'
+import { listTasks, readTask, taskHistoryLabel, type TaskHistory, type TaskRecord } from '@/api/tasks'
+import type { ConsoleHistory, StreamHistory } from '@/api/types'
 import {
   describeStopReason,
   formatBytes,
   formatDateTime,
   formatDuration,
+  isSseHistory,
   prettyJson,
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
-import { presentResult, resultCodeLabel } from '@/lib/results'
+import { countCaseOutcomes, presentResult, resultCodeLabel, taskProgress } from '@/lib/results'
+import { activeStreamWait } from '@/lib/taskResults'
 
-/** 请求历史：把三类证据（HTTP 请求、长连接会话、计划执行）放在同一页，
- *  因为它们回答的是同一个问题——“我做过什么，结果如何”。 */
-const tab = ref<'http' | 'stream' | 'execution'>('http')
+const tab = ref<'http' | 'stream' | 'task'>('http')
 const httpItems = ref<ConsoleHistory[]>([])
 const streamItems = ref<StreamHistory[]>([])
-const executionItems = ref<Execution[]>([])
+const taskItems = ref<TaskHistory[]>([])
 const loading = ref(false)
 const selectedHttp = ref<ConsoleHistory | null>(null)
+const selectedStream = ref<StreamHistory | null>(null)
+const selectedTaskId = ref('')
+const task = ref<TaskRecord | null>(null)
+const taskLoading = ref(false)
+const taskOutcomes = computed(() => countCaseOutcomes(task.value?.results ?? []).filter(item => item.count > 0))
+const streamWait = computed(() => task.value ? activeStreamWait(task.value) : null)
+const viewport = window.matchMedia('(max-width: 760px)')
+const narrow = ref(viewport.matches)
+const listWidth = ref(360)
+const listHeight = ref(190)
+let taskRequest: AbortController | undefined
+
+function resizeLayout(event: MediaQueryListEvent) { narrow.value = event.matches }
+
+/** Cancel stale reads after switching tasks so the detail always matches the selected row. */
+async function selectTask(id: string) {
+  taskRequest?.abort()
+  const request = new AbortController()
+  taskRequest = request
+  if (selectedTaskId.value !== id) task.value = null
+  selectedTaskId.value = id
+  taskLoading.value = true
+  try {
+    const record = await readTask(id, request.signal)
+    if (!request.signal.aborted) task.value = record
+  } catch (error) {
+    if (!request.signal.aborted) useToastStore().push('danger', '读取任务失败', describeError(error))
+  } finally {
+    if (!request.signal.aborted) taskLoading.value = false
+  }
+}
 
 /** 根据选中 HTTP 历史的状态码计算色调；未选择时使用 neutral。 */
 const activeTone = computed(() => (selectedHttp.value ? presentResult(selectedHttp.value, selectedHttp.value.status_code).tone : 'neutral'))
@@ -40,15 +73,24 @@ const activeTone = computed(() => (selectedHttp.value ? presentResult(selectedHt
 async function load() {
   loading.value = true
   try {
-    const [http, streams, executions] = await Promise.allSettled([
+    const [http, streams, tasks] = await Promise.allSettled([
       listConsoleHistory(60),
       listStreams(60),
-      listExecutions(60),
+      listTasks(),
     ])
     httpItems.value = http.status === 'fulfilled' ? http.value.items : []
     streamItems.value = streams.status === 'fulfilled' ? streams.value.items : []
-    executionItems.value = executions.status === 'fulfilled' ? executions.value.items : []
-    const failure = [http, streams, executions].find((item) => item.status === 'rejected')
+    taskItems.value = tasks.status === 'fulfilled' ? tasks.value.items : []
+    if (selectedTaskId.value && tab.value === 'task' && tasks.status === 'fulfilled') {
+      if (taskItems.value.some(item => item.id === selectedTaskId.value)) void selectTask(selectedTaskId.value)
+      else {
+        taskRequest?.abort()
+        selectedTaskId.value = ''
+        task.value = null
+        taskLoading.value = false
+      }
+    }
+    const failure = [http, streams, tasks].find((item) => item.status === 'rejected')
     if (failure && failure.status === 'rejected') {
       useToastStore().push('warning', '部分历史加载失败', describeError(failure.reason))
     }
@@ -80,17 +122,15 @@ async function clearAll() {
   }
 }
 
-onMounted(load)
+onMounted(() => { viewport.addEventListener('change', resizeLayout); void load() })
+onBeforeUnmount(() => { viewport.removeEventListener('change', resizeLayout); taskRequest?.abort() })
 </script>
 
 <template>
   <div class="history-page">
     <div class="page-head">
       <div>
-        <h2 class="page-title">请求历史</h2>
-        <p class="page-sub">
-          HTTP 请求与长连接会话都存本机 SQLite；凭据类头在落库前已脱敏。计划执行结果在「执行结果」页。
-        </p>
+        <h2 class="page-title">执行结果</h2>
       </div>
       <div class="page-actions">
         <button class="btn btn-sm" :disabled="loading" @click="load">刷新</button>
@@ -110,7 +150,7 @@ onMounted(load)
         v-for="item in [
           { key: 'http', label: `HTTP 请求 ${httpItems.length}` },
           { key: 'stream', label: `长连接会话 ${streamItems.length}` },
-          { key: 'execution', label: `计划执行 ${executionItems.length}` },
+          { key: 'task', label: `智能群测 ${taskItems.length}` },
         ]"
         :key="item.key"
         class="tab"
@@ -121,9 +161,12 @@ onMounted(load)
       </button>
     </div>
 
-    <!-- HTTP 请求 -->
-    <div v-if="tab === 'http'" class="split">
-      <div class="list scroll-y">
+    <ResizableSplit :key="Number(narrow)" class="results-split" :direction="narrow ? 'vertical' : 'horizontal'"
+      :size="narrow ? listHeight : listWidth" :min="narrow ? 110 : 215" :min-other="narrow ? 180 : 300"
+      :persist-key="narrow ? 'api-agent.layout.results.height' : 'api-agent.layout.results.width'"
+      label="调整记录列表与详情大小" @update:size="narrow ? listHeight = $event : listWidth = $event">
+      <template #first>
+      <div v-if="tab === 'http'" class="list scroll-y">
         <button
           v-for="record in httpItems"
           :key="record.id"
@@ -134,6 +177,7 @@ onMounted(load)
           <div class="row-main">
             <div class="row-top">
               <span class="method" :class="`method-${record.method.toLowerCase()}`">{{ record.method }}</span>
+              <span v-if="isSseHistory(record)" class="tag tag-accent">SSE</span>
               <span class="row-status" :class="`tone-${presentResult(record, record.status_code).tone}`">
                 {{ record.ok ? record.status_code : presentResult(record).title }}
               </span>
@@ -149,17 +193,53 @@ onMounted(load)
           v-if="!httpItems.length && !loading"
           :icon="History"
           title="没有 HTTP 请求记录"
-          description="在「接口调试」页发送一次请求，这里会保留脱敏后的请求与响应摘要。"
+          description="在「接口测试」页发送请求后，这里会保留脱敏后的请求与响应摘要。"
         />
       </div>
 
-      <div class="detail scroll-y">
+      <div v-else-if="tab === 'stream'" class="list scroll-y">
+        <button v-for="record in streamItems" :key="record.id" class="row"
+          :class="{ 'row-active': selectedStream?.id === record.id }" @click="selectedStream = record">
+          <div class="row-main">
+            <div class="row-top">
+              <span class="tag tag-accent">{{ record.kind === 'sse' ? 'SSE' : 'WS' }}</span>
+              <span class="row-status">{{ record.status }}</span>
+              <span class="row-fill" />
+              <span class="row-date">{{ formatDateTime(record.created_at) }}</span>
+            </div>
+            <div class="row-url mono truncate">{{ record.url }}</div>
+          </div>
+          <ChevronRight :size="13" class="row-chevron" />
+        </button>
+        <EmptyState v-if="!streamItems.length && !loading" :icon="Radio" title="没有长连接会话"
+          description="在「长连接测试」页建立连接后，这里会显示会话结果。" />
+      </div>
+      <div v-else class="list scroll-y">
+        <button v-for="item in taskItems" :key="item.id" class="row"
+          :class="{ 'row-active': selectedTaskId === item.id }" @click="selectTask(item.id)">
+          <div class="row-main">
+            <div class="row-top">
+              <span class="tag" :class="`tag-${taskProgress(item.status).tone}`">{{ taskProgress(item.status).label }}</span>
+              <span class="row-fill" />
+              <span class="row-date">{{ formatDateTime(item.created_at) }}</span>
+            </div>
+            <div class="row-url truncate" :title="taskHistoryLabel(item)">{{ taskHistoryLabel(item) }}</div>
+          </div>
+          <ChevronRight :size="13" class="row-chevron" />
+        </button>
+        <EmptyState v-if="!taskItems.length && !loading" :icon="History" title="没有智能群测记录"
+          description="在「智能群测」页运行文档任务后，这里会显示逐条结果与总结。" />
+      </div>
+      </template>
+      <template #second>
+      <div v-if="tab === 'http'" class="detail scroll-y">
         <template v-if="selectedHttp">
           <div class="detail-head">
             <div class="detail-title-row">
               <span class="method" :class="`method-${selectedHttp.method.toLowerCase()}`">
                 {{ selectedHttp.method }}
               </span>
+              <span v-if="isSseHistory(selectedHttp)" class="tag tag-accent">SSE</span>
               <span class="tag" :class="`tag-${activeTone === 'neutral' ? '' : activeTone}`">
                 {{ selectedHttp.ok ? selectedHttp.status_code : presentResult(selectedHttp).title }}
               </span>
@@ -226,81 +306,43 @@ onMounted(load)
           description="这里会显示脱敏后的请求头、请求体预览与响应内容。"
         />
       </div>
-    </div>
-
-    <!-- 长连接会话 -->
-    <div v-else-if="tab === 'stream'" class="list scroll-y wide">
-      <table v-if="streamItems.length" class="table">
-        <thead>
-          <tr>
-            <th>协议</th>
-            <th>地址</th>
-            <th>状态</th>
-            <th>结束原因</th>
-            <th>事件</th>
-            <th>数据量</th>
-            <th>建立时间</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="record in streamItems" :key="record.id">
-            <td><span class="tag tag-accent">{{ record.kind === 'sse' ? 'SSE' : 'WS' }}</span></td>
-            <td class="mono truncate url-cell">{{ record.url }}</td>
-            <td>
-              <span class="tag" :class="`tag-${record.status === 'closed' ? 'success' : record.status === 'error' ? 'danger' : ''}`">
-                {{ record.status }}
-              </span>
-            </td>
-            <td class="hint">{{ describeStopReason(record.stop_reason) }}</td>
-            <td class="mono">{{ record.event_count }}</td>
-            <td class="mono hint">{{ formatBytes(record.byte_count) }}</td>
-            <td class="hint">{{ formatDateTime(record.opened_at ?? record.created_at) }}</td>
-          </tr>
-        </tbody>
-      </table>
-      <EmptyState
-        v-else
-        :icon="Radio"
-        title="没有长连接会话"
-        description="在「长连接测试」页建立一次 SSE 或 WebSocket 连接，这里会保留完整时间线。"
-      />
-    </div>
-
-    <!-- 计划执行 -->
-    <div v-else class="list scroll-y wide">
-      <table v-if="executionItems.length" class="table">
-        <thead>
-          <tr>
-            <th>标签</th>
-            <th>结果</th>
-            <th>请求</th>
-            <th>耗时</th>
-            <th>错误类别</th>
-            <th>时间</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="item in executionItems" :key="item.id">
-            <td>{{ item.label || '(未命名)' }}</td>
-            <td>
-              <span class="tag" :class="`tag-${presentResult(item).tone}`" :title="presentResult(item).message">
-                {{ presentResult(item).title }}
-              </span>
-            </td>
-            <td class="mono">{{ item.observed_attempts }}/{{ item.reserved_requests }}</td>
-            <td class="mono hint">{{ formatDuration(item.duration_ms) }}</td>
-            <td class="mono hint">{{ item.result_code ?? item.error_kind ?? '—' }}</td>
-            <td class="hint">{{ formatDateTime(item.created_at) }}</td>
-          </tr>
-        </tbody>
-      </table>
-      <EmptyState
-        v-else
-        :icon="Inbox"
-        title="没有执行记录"
-        description="在「用例计划」页执行一份计划，这里会保留每条断言的通过情况。"
-      />
-    </div>
+      <div v-else-if="tab === 'stream'" class="detail scroll-y">
+        <div v-if="selectedStream" class="detail-head">
+          <div class="detail-title-row">
+            <span class="tag tag-accent">{{ selectedStream.kind === 'sse' ? 'SSE' : 'WS' }}</span>
+            <span class="tag" :class="`tag-${selectedStream.status === 'closed' ? 'success' : selectedStream.status === 'error' ? 'danger' : 'neutral'}`">{{ selectedStream.status }}</span>
+            <span class="tag">{{ selectedStream.event_count }} 事件</span>
+            <span class="tag">{{ formatBytes(selectedStream.byte_count) }}</span>
+          </div>
+          <div class="detail-url mono">{{ selectedStream.url }}</div>
+          <div class="hint">{{ formatDateTime(selectedStream.opened_at ?? selectedStream.created_at) }} · {{ describeStopReason(selectedStream.stop_reason) }}</div>
+          <p v-if="selectedStream.error_message" class="detail-error">{{ selectedStream.error_message }}</p>
+        </div>
+        <EmptyState v-else :icon="Inbox" title="选择左侧一条会话" />
+      </div>
+      <div v-else class="detail scroll-y">
+        <template v-if="task">
+          <div class="detail-head">
+            <strong class="detail-url">{{ taskHistoryLabel(task) }}</strong>
+            <div class="detail-title-row">
+              <span class="tag" :class="`tag-${taskProgress(task.status).tone}`">{{ taskProgress(task.status).label }}</span>
+              <span class="hint">{{ task.results.length }} / {{ task.snapshot.cases.length }} 条已记录</span>
+              <a class="btn btn-sm" :href="`/api/tasks/${encodeURIComponent(task.id)}/report`" download>导出总结</a>
+            </div>
+            <div class="detail-title-row">
+              <span v-if="streamWait" class="tag tag-info">{{ streamWait.label }} 1</span>
+              <span v-for="item in taskOutcomes" :key="item.status" class="tag" :class="`tag-${item.tone}`">{{ item.label }} {{ item.count }}</span>
+            </div>
+          </div>
+          <p v-if="task.error_kind" class="detail-error">{{ task.error_kind }}</p>
+          <TaskResultTree :key="task.id" :task="task" :stream-wait="streamWait" />
+          <div class="detail-section"><div class="mini-label">AI 总结</div><pre class="code">{{ task.summary || '暂无总结。' }}</pre></div>
+        </template>
+        <p v-else-if="taskLoading" class="hint" role="status">正在读取智能群测结果…</p>
+        <EmptyState v-else :icon="Inbox" title="选择左侧一条用例任务" />
+      </div>
+      </template>
+    </ResizableSplit>
   </div>
 </template>
 
@@ -326,14 +368,6 @@ onMounted(load)
   font-size: 15px;
   font-weight: 650;
   letter-spacing: -0.015em;
-}
-
-.page-sub {
-  margin: 3px 0 0;
-  font-size: 11.5px;
-  color: var(--text-tertiary);
-  max-width: 82ch;
-  line-height: 1.7;
 }
 
 .page-actions {
@@ -365,26 +399,12 @@ onMounted(load)
   font-weight: 600;
 }
 
-.split {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
+.results-split { flex: 1; }
 
 .list {
   flex: 1;
   min-height: 0;
   padding: 10px 12px 16px;
-}
-
-.list.wide {
-  overflow-x: auto;
-}
-
-.split .list {
-  flex: none;
-  width: 44%;
-  border-right: 1px solid var(--border-subtle);
 }
 
 .row {
@@ -473,6 +493,7 @@ onMounted(load)
   display: flex;
   align-items: center;
   gap: 7px;
+  flex-wrap: wrap;
 }
 
 .detail-url {
@@ -539,20 +560,6 @@ onMounted(load)
   overflow: auto;
 }
 
-.url-cell {
-  max-width: 340px;
-}
-
-@media (max-width: 1080px) {
-  .split {
-    flex-direction: column;
-  }
-
-  .split .list {
-    width: 100%;
-    border-right: 0;
-    border-bottom: 1px solid var(--border-subtle);
-    max-height: 40%;
-  }
-}
+.results-split.split-horizontal .list { border-right: 1px solid var(--border-subtle); }
+.results-split.split-vertical .list { border-bottom: 1px solid var(--border-subtle); }
 </style>

@@ -11,7 +11,22 @@ from api_agent.agent.service import AgentError, CallBudget
 from api_agent.agent.store import AgentStore
 from api_agent.infrastructure.targets import validate_target
 from api_agent.tasks.documents import NativeCaseGenerator
+from api_agent.tasks.evidence import TaskEvidence
 from api_agent.tasks.executor import CaseExecutor
+from api_agent.tasks.schemas import Case
+
+
+def public_task(record):
+    """Keep raw local attachments out of task API responses and live frames."""
+    snapshot = record["snapshot"]
+    document = snapshot.get("document")
+    return {
+        **record,
+        "snapshot": {
+            **{key: value for key, value in snapshot.items() if key != "document"},
+            **({"document": {"filename": document["filename"]}} if document else {}),
+        },
+    }
 
 
 def report(record):
@@ -54,7 +69,7 @@ def report(record):
     return "\n".join(lines) + "\n"
 
 
-async def summarize_results(agent, results, warnings):
+async def summarize_results(agent, results, warnings, publish=None):
     """Summarize all results in bounded chunks, then combine every chunk's commentary."""
     chunks = []
     batch = []
@@ -71,6 +86,8 @@ async def summarize_results(agent, results, warnings):
         batch.append(compact)
     if batch:
         chunks.append(batch)
+    if publish and len(chunks) <= 1:
+        return await agent.stream_task_summary({"results": batch, "warnings": warnings}, publish)
     budget = CallBudget(limit=2 * (2 * len(chunks) + 4))
     parts = []
     for chunk in chunks:
@@ -81,27 +98,61 @@ async def summarize_results(agent, results, warnings):
     while len(parts) > 5:
         reduced = []
         for offset in range(0, len(parts), 5):
-            summary = await agent.report({"batch_summaries": parts[offset:offset + 5]}, budget)
+            summary = await agent.report({"batch_summaries": parts[offset : offset + 5]}, budget)
             reduced.append(summary.model_dump())
         parts = reduced
-    return await agent.report({"batch_summaries": parts, "total_results": len(results)}, budget)
+    combined = {"batch_summaries": parts, "total_results": len(results)}
+    if publish:
+        return await agent.stream_task_summary(combined, publish)
+    return await agent.report(combined, budget)
+
+
+class LiveTask:
+    """Keep only bounded current-case evidence and a wakeup signal alongside the worker."""
+
+    def __init__(self, record):
+        self.record = record
+        self.events = []
+        self.events_seen = 0
+        self.live_summary = ""
+        self.changed = asyncio.Event()
+
+    def notify(self):
+        self.changed.set()
+        self.changed = asyncio.Event()
+
+    def frame(self, sent_results):
+        """Send only newly completed cases and the latest view of in-flight work."""
+        record = self.record
+        return {
+            **{
+                key: record.get(key)
+                for key in ("status", "stage", "current_index", "active_stream", "error_kind")
+            },
+            "results": record["results"][sent_results:],
+            "events": self.events,
+            "events_seen": self.events_seen,
+            "summary": record["summary"] or self.live_summary or None,
+        }
 
 
 class TaskManager:
     """Own bounded background tasks and persist evidence before every next case."""
 
     def __init__(self, root, settings, streams):
-        """Reuse atomic artifact storage; keep raw documents and credentials out of records."""
+        """Reuse atomic artifact storage with separate live state per running task."""
         self.store = AgentStore(root)
         self.settings = settings
         self.executor = CaseExecutor(settings, streams)
         self.active = {}
+        self.live = {}
 
     def recover(self):
         """Mark interrupted tasks without replaying requests after a process restart."""
         for path in self.store.root.glob("*.json"):
             record = self.store.read(path.stem)
             if record["status"] in {"queued", "running"}:
+                record.pop("active_stream", None)
                 self._mark_incomplete(record)
                 record.update(
                     status="interrupted", stage="finished", error_kind="service_restarted"
@@ -109,31 +160,71 @@ class TaskManager:
                 self.store.save(record)
 
     def start(self, request, agent):
+        """Compile the reviewed catalog and attach its optional source document locally."""
+        cases, operations = NativeCaseGenerator().plan(request.catalog)
+        return self._start(
+            request,
+            agent,
+            cases,
+            operations,
+            request.catalog.warnings,
+            request.catalog.title,
+            request.document.model_dump() if request.document else None,
+        )
+
+    def rerun(self, request, agent, source):
+        """Apply edits to a fresh case list without changing saved order, groups or attachment."""
+        snapshot = source["snapshot"]
+        cases = [Case.model_validate(case) for case in snapshot["cases"]]
+        for index, edited in request.case_edits.items():
+            if not 0 <= index < len(cases):
+                raise ValueError("unknown_case_index")
+            original = cases[index]
+            if (edited.method, edited.protocol, edited.source) != (
+                original.method,
+                original.protocol,
+                original.source,
+            ):
+                raise ValueError("case_identity_changed")
+            cases[index] = edited
+        return self._start(
+            request,
+            agent,
+            cases,
+            snapshot.get("operations", []),
+            snapshot.get("warnings", []),
+            source.get("title"),
+            snapshot.get("document"),
+        )
+
+    def _start(self, request, agent, cases, operations, warnings, title, document):
         """Validate every case and freeze the safe plan before scheduling any target traffic."""
         if len(self.active) >= 4:
             raise ValueError("task_capacity_exceeded")
         parsed, origin = validate_target(request.origin, self.settings.target_allowed_origins)
-        if parsed.path not in {"", "/"} or parsed.query:
-            raise ValueError("origin_must_not_include_path")
-        request.origin = origin
-        cases = NativeCaseGenerator().generate(request.catalog)
+        if "?" in request.origin or "#" in request.origin or "\\" in request.origin:
+            raise ValueError("invalid_target_base_url")
+        request.origin = origin + parsed.path.rstrip("/")
         if not cases or len(cases) > 200:
             raise ValueError("case_limit_exceeded")
         for case in cases:
-            validate_target(origin + case.path, self.settings.target_allowed_origins)
+            validate_target(request.origin + case.path, self.settings.target_allowed_origins)
             if case.body is not None and case.method in {"GET", "HEAD", "OPTIONS"}:
                 raise ValueError("body_not_allowed_for_method")
-        agent.context.learn(request.model_dump())
-        snapshot = agent.context.clean(
-            {
-                "origin": origin,
-                "cases": [case.model_dump() for case in cases],
-                "warnings": request.catalog.warnings,
-                "engine": "native-contract-v1",
-            }
-        )
+        raw_snapshot = {
+            "origin": request.origin,
+            "cases": [case.model_dump() for case in cases],
+            "operations": operations,
+            "warnings": warnings,
+            "engine": "native-contract-v1",
+        }
+        agent.context.learn(raw_snapshot)
+        snapshot = agent.context.clean(raw_snapshot)
+        if document is not None:
+            snapshot["document"] = document
         record = {
             "id": str(uuid.uuid4()),
+            "title": agent.context.clean(title) if title else None,
             "status": "queued",
             "stage": "generated",
             "created_at": datetime.now(UTC).isoformat(),
@@ -146,30 +237,88 @@ class TaskManager:
             "error_kind": None,
         }
         self.store.save(record)
-        task = asyncio.create_task(self._run(record, request, cases, agent))
+        live = self.live[record["id"]] = LiveTask(record)
+        task = asyncio.create_task(self._run(record, request, cases, agent, live))
         self.active[record["id"]] = task
-        task.add_done_callback(lambda completed: self.active.pop(record["id"], None))
+
+        def remove_worker(completed):
+            self.active.pop(record["id"], None)
+            self.live.pop(record["id"], None)
+            live.notify()
+
+        task.add_done_callback(remove_worker)
         return record
 
-    async def _run(self, record, request, cases, agent):
+    async def observe(self, record):
+        """Follow a run over NDJSON. Reopening starts with its current bounded state."""
+        live = self.live.get(record["id"]) or LiveTask(record)
+        sent = 0
+        while True:
+            changed = live.changed
+            frame = live.frame(sent)
+            sent += len(frame["results"])
+            terminal = frame["status"] not in {"queued", "running"}
+            yield json.dumps({"type": "progress", **frame}, ensure_ascii=False) + "\n"
+            if terminal:
+                return
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=10)
+            except TimeoutError:
+                yield '{"type":"heartbeat"}\n'
+            if record["id"] not in self.live and live.record["status"] in {"queued", "running"}:
+                live = LiveTask(self.store.read(record["id"]))
+
+    async def _run(self, record, request, cases, agent, live):
         """Execute in order, retain skipped/failed cases, then summarize all recorded verdicts."""
         record.update(status="running", stage="executing")
+
+        async def observe_sse(event):
+            """Mark confirmed SSE responses and forward complete, redacted event previews."""
+            if event is None:
+                record["active_stream"] = "sse"
+                self.store.save(record)
+            else:
+                live.events_seen += 1
+                if len(live.events) < 40:
+                    # Replace the list on append so a frame remains coherent across yields.
+                    clean = agent.context.clean(
+                        {"event": event["event"], "data": TaskEvidence.redact_body(event["data"])}
+                    )
+                    live.events = [*live.events, {**clean, "data": clean["data"][:1000]}]
+            live.notify()
+
+        async def publish_summary(text):
+            """Expose model commentary while keeping the summary snapshot consistent on reload."""
+            live.live_summary = text
+            live.notify()
+
         try:
             async with asyncio.timeout(request.wall_time_seconds):
                 for index, case in enumerate(cases):
                     record["current_index"] = index
+                    live.events = []
+                    live.events_seen = 0
                     self.store.save(record)
+                    live.notify()
                     if not request.allow_writes and (
                         case.method not in {"GET", "HEAD", "OPTIONS"} or case.messages
                     ):
                         result = {
-                            "status": "skipped",
+                            "status": "permission_required",
                             "reason": "write_permission_required",
                             "assertions": [],
                         }
                     else:
                         try:
-                            result = await self.executor.execute(case, request)
+                            if case.protocol == "websocket":
+                                record["active_stream"] = case.protocol
+                                self.store.save(record)
+                                live.notify()
+                            result = await self.executor.execute(
+                                case,
+                                request,
+                                on_sse=observe_sse,
+                            )
                         except (ValueError, OSError):
                             result = {
                                 "status": "error",
@@ -184,13 +333,18 @@ class TaskManager:
                     if response and response.get("body"):
                         response["body"] = agent.context.body(response["body"])
                     record["results"].append(agent.context.clean(result))
+                    record.pop("active_stream", None)
+                    live.events = []
+                    live.events_seen = 0
                     self.store.save(record)
-                record["stage"] = "summarizing"
-                self.store.save(record)
-                summary = await summarize_results(
-                    agent, record["results"], request.catalog.warnings
-                )
-                record["summary"] = summary.overview + "\n" + "\n".join(summary.recommendations)
+                    live.notify()
+                if agent.client is not None:
+                    record["stage"] = "summarizing"
+                    self.store.save(record)
+                    live.notify()
+                    record["summary"] = await summarize_results(
+                        agent, record["results"], record["snapshot"]["warnings"], publish_summary
+                    )
                 record.update(status="completed", stage="finished")
         except asyncio.CancelledError:
             record.update(status="cancelled", stage="finished", error_kind="cancelled")
@@ -201,8 +355,14 @@ class TaskManager:
         except Exception:
             record.update(status="partial", stage="finished", error_kind="task_or_summary_failed")
         finally:
+            record.pop("active_stream", None)
+            live.events = []
+            live.events_seen = 0
+            if not record["summary"] and live.live_summary:
+                record["summary"] = live.live_summary
             self._mark_incomplete(record)
             self.store.save(record)
+            live.notify()
 
     @staticmethod
     def _mark_incomplete(record):

@@ -1,6 +1,29 @@
 /* 共享基础样式：按钮、输入、标签页、表格、空状态。
    组件级样式留在各 SFC 内，这里只放跨页面复用的原子类。 */
 
+/* Theme palette transition fallback; View Transitions provide the full-screen crossfade where available. */
+:root[data-theme-transitioning='true'] *,
+:root[data-theme-transitioning='true'] *::before,
+:root[data-theme-transitioning='true'] *::after {
+  transition: background-color 720ms ease, background-image 720ms ease, color 720ms ease,
+    border-color 720ms ease, box-shadow 720ms ease, fill 720ms ease, stroke 720ms ease !important;
+}
+
+::view-transition-group(root) { animation-duration: 760ms; }
+::view-transition-old(root),
+::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
+::view-transition-new(root) { animation: theme-dawn 760ms ease-in-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(root) { animation-duration: 760ms !important; }
+  ::view-transition-new(root) { animation: theme-dawn 760ms ease-in-out !important; }
+}
+
+@keyframes theme-dawn {
+  from { clip-path: circle(0 at var(--theme-origin-x, 32px) var(--theme-origin-y, 32px)); }
+  to { clip-path: circle(150vmax at var(--theme-origin-x, 32px) var(--theme-origin-y, 32px)); }
+}
+
 /* ---------- 按钮 ---------- */
 .btn {
   display: inline-flex;
@@ -11,17 +34,16 @@
   padding: 0 12px;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  background: var(--control-gradient);
+  background: var(--bg-surface);
   color: var(--text-primary);
   font-weight: 500;
   white-space: nowrap;
-  box-shadow: var(--shadow-sm);
   transition: background var(--motion-fast), border-color var(--motion-fast),
     box-shadow var(--motion-fast), color var(--motion-fast);
 }
 
 .btn:hover:not(:disabled) {
-  background: var(--control-hover-gradient);
+  background: var(--bg-hover);
   border-color: var(--border-strong);
 }
 
@@ -32,7 +54,7 @@
 
 .btn-primary,
 .btn-accent {
-  background: var(--accent-gradient);
+  background: var(--action-fill);
   border-color: transparent;
   color: var(--text-on-accent);
   box-shadow: var(--shadow-sm);
@@ -40,7 +62,7 @@
 
 .btn-primary:hover:not(:disabled),
 .btn-accent:hover:not(:disabled) {
-  background: var(--accent-gradient-hover);
+  background: var(--action-fill-hover);
   border-color: var(--accent-border);
 }
 
@@ -144,11 +166,11 @@
   gap: 4px;
   height: 21px;
   padding: 0 7px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: var(--bg-subtle);
   color: var(--text-secondary);
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 500;
   white-space: nowrap;
 }
@@ -183,6 +205,54 @@
   color: var(--accent);
 }
 
+.status-dot::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.verdict {
+  height: auto;
+  min-height: 23px;
+  gap: 5px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tag-neutral { border-color: var(--border-subtle); }
+
+.outcome-card {
+  --outcome-ink: var(--text-secondary);
+  --outcome-rail: var(--border-strong);
+  --outcome-surface: var(--bg-subtle);
+  border: 1px solid var(--border-subtle);
+  border-inline-start: 3px solid var(--outcome-rail);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--outcome-surface) 27%, var(--bg-surface));
+}
+
+.outcome-success {
+  --outcome-ink: var(--success);
+  --outcome-rail: color-mix(in srgb, var(--success) 62%, var(--success-border));
+  --outcome-surface: var(--success-soft);
+}
+
+.outcome-danger {
+  --outcome-ink: var(--danger);
+  --outcome-rail: var(--danger);
+  --outcome-surface: var(--danger-soft);
+}
+
+.outcome-warning {
+  --outcome-ink: var(--warning);
+  --outcome-rail: var(--warning);
+  --outcome-surface: var(--warning-soft);
+}
+
 .method {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -212,7 +282,7 @@
   font-size: 11.5px;
   color: var(--text-tertiary);
   padding: 7px 10px;
-  background: var(--panel-header-gradient);
+  background: var(--bg-rail);
   border-bottom: 1px solid var(--border-subtle);
   white-space: nowrap;
 }
@@ -244,11 +314,10 @@
   place-items: center;
   width: 44px;
   height: 44px;
-  border-radius: 12px;
-  background: var(--control-gradient);
-  border: 1px solid var(--border-default);
-  box-shadow: var(--shadow-sm);
-  color: var(--text-tertiary);
+  border-radius: var(--radius-lg);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
 }
 
 /* ---------- 滚动容器 ---------- */
@@ -330,7 +399,7 @@ pre {
   inset: auto 6px -1px 6px;
   height: 2px;
   border-radius: 2px;
-  background: var(--accent-gradient);
+  background: var(--accent);
 }
 
 /* ---------- 页面头部 ---------- */
@@ -342,7 +411,7 @@ pre {
 
 .page-title {
   margin: 0;
-  font-size: 17px;
+  font-size: 20px;
   font-weight: 650;
   letter-spacing: -0.015em;
   color: var(--text-primary);

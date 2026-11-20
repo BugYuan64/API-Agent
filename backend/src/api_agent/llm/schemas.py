@@ -4,9 +4,9 @@
 由解析器规范化，密钥复用与实际工具执行均不由这些结构决定。
 """
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from api_agent.infrastructure.api import ApiInput, ApiModel
 
@@ -121,6 +121,12 @@ class LLMConfigUpdate(ApiInput):
     api_key: str | None = None
     model: str = Field(default="gpt-4o", min_length=1, max_length=120)
     timeout_seconds: float = Field(default=60.0, ge=1.0, le=600.0)
+
+
+class LLMModelUpdate(ApiInput):
+    """Change the shared model without rewriting any other setting."""
+
+    model: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
 
 
 class LLMPingRequest(ApiInput):

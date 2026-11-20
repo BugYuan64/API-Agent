@@ -40,7 +40,8 @@ class AgentStore:
         encoded = json.dumps(record["snapshot"], sort_keys=True, ensure_ascii=True).encode()
         if hashlib.sha256(encoded).hexdigest() != record["snapshot_sha256"]:
             raise ValueError("agent_snapshot_modified")
-        safe = Context().clean({k: v for k, v in record.items() if k != "snapshot"})
+        safe = Context().clean({k: v for k, v in record.items() if k not in {"id", "snapshot"}})
+        safe["id"] = path.stem
         safe["snapshot"] = record["snapshot"]
         self.root.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
@@ -51,9 +52,11 @@ class AgentStore:
         os.replace(temporary, path)
 
     def read(self, run_id: str) -> dict:
-        """按规范运行 ID 读取 JSON 字典；ID、文件不存在和解码错误直接上抛。"""
+        """Read by canonical filename, recovering IDs altered by older privacy filtering."""
         with self.path(run_id).open(encoding="utf-8") as handle:
-            return json.load(handle)
+            record = json.load(handle)
+        record["id"] = run_id
+        return record
 
     def report(self, run_id: str) -> str:
         """读取指定运行并返回 Markdown 报告；沿用读取与渲染过程的错误。"""

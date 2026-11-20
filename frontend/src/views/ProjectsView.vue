@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** 项目与环境管理页：管理项目导入、源码文档工作区、环境配置及版本历史。认证保存环境变量引用，接口文档由独立组件追踪后台进度。 */
 
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import {
   ChevronRight,
   FolderKanban,
@@ -16,6 +16,7 @@ import {
 import EmptyState from '@/components/EmptyState.vue'
 import AppModal from '@/components/AppModal.vue'
 import ProjectDocuments from '@/components/ProjectDocuments.vue'
+import ResizableSplit from '@/components/ResizableSplit.vue'
 import { describeError } from '@/api/client'
 import { importProject } from '@/api/projectDocuments'
 import {
@@ -28,6 +29,7 @@ import {
 } from '@/api/endpoints'
 import type { Environment, EnvironmentHistory, Project } from '@/api/types'
 import { formatDateTime } from '@/lib/format'
+import { clampSize, writeStoredSize } from '@/lib/split'
 import { useToastStore } from '@/stores/toasts'
 
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
@@ -47,7 +49,39 @@ const importForm = reactive({ name: '', description: '', directory: '' })
 const importingProject = ref(false)
 const importError = ref('')
 const activeDetail = ref<'documents' | 'environment'>('documents')
+const viewport = window.matchMedia('(max-width: 900px)')
+const narrow = ref(viewport.matches)
+const projectWidth = ref(236)
+const environmentWidth = ref(232)
+const projectHeight = ref(170)
+const environmentHeight = ref(145)
+const remainingSpace = ref(0)
+const environmentSize = computed(() => narrow.value ? environmentHeight.value : environmentWidth.value)
+const environmentMin = computed(() => narrow.value ? 100 : 170)
+const detailMin = computed(() => narrow.value ? 200 : 340)
+const environmentKey = computed(() => narrow.value
+  ? 'api-agent.layout.projects.environment.height'
+  : 'api-agent.layout.projects.environment.width')
 let projectSelection = 0
+
+/** Keep desktop column widths and compact viewport row heights independent. */
+function resizeLayout(event: MediaQueryListEvent) { narrow.value = event.matches }
+
+/** Match the inner split's sizing rules using the outer split's current allocation. */
+function allocatedEnvironment(available: number) {
+  return clampSize({ size: environmentSize.value, min: environmentMin.value, minOther: detailMin.value,
+    fitOther: detailMin.value, available })
+}
+
+const reservedDetail = computed(() => Math.max(detailMin.value, remainingSpace.value - allocatedEnvironment(remainingSpace.value)))
+
+/** Give the project divider's entire displacement to the neighboring environment pane. */
+function resizeProjectNeighbor({ delta, remaining }: { delta: number; remaining: number }) {
+  const next = allocatedEnvironment(remaining + delta) - delta
+  if (narrow.value) environmentHeight.value = next
+  else environmentWidth.value = next
+  writeStoredSize(environmentKey.value, next)
+}
 
 /** 环境表单：origin 与方法/路径用文本编辑，避免多值输入控件的复杂度。 */
 const environmentForm = reactive({
@@ -283,12 +317,19 @@ function startEdit(environment: Environment) {
   environmentForm.sensitive = environment.config.sensitive_field_rules.join(',')
 }
 
-onMounted(loadProjects)
+onMounted(() => { viewport.addEventListener('change', resizeLayout); void loadProjects() })
+onBeforeUnmount(() => viewport.removeEventListener('change', resizeLayout))
 </script>
 
 <template>
   <div class="projects">
-    <!-- 项目列 -->
+    <ResizableSplit :key="Number(narrow)" :direction="narrow ? 'vertical' : 'horizontal'"
+      :size="narrow ? projectHeight : projectWidth" :min="narrow ? 100 : 175" :min-other="environmentMin + detailMin"
+      :fit-other="environmentMin + detailMin" :resize-min-other="environmentMin + reservedDetail"
+      :persist-key="narrow ? 'api-agent.layout.projects.project.height' : 'api-agent.layout.projects.project.width'"
+      label="调整项目区域大小" @update:size="narrow ? projectHeight = $event : projectWidth = $event"
+      @layout="remainingSpace = $event.second" @resize="resizeProjectNeighbor">
+    <template #first>
     <aside class="col projects-col">
       <div class="col-head">
         <span class="col-title">项目</span>
@@ -334,8 +375,13 @@ onMounted(loadProjects)
         />
       </div>
     </aside>
-
-    <!-- 环境列 -->
+    </template>
+    <template #second>
+    <ResizableSplit :direction="narrow ? 'vertical' : 'horizontal'"
+      :size="environmentSize" :min="environmentMin" :min-other="detailMin" :fit-other="detailMin"
+      :persist-key="environmentKey" label="调整环境与详情大小"
+      @update:size="narrow ? environmentHeight = $event : environmentWidth = $event">
+    <template #first>
     <aside class="col env-col">
       <div class="col-head">
         <span class="col-title">环境</span>
@@ -370,8 +416,8 @@ onMounted(loadProjects)
         />
       </div>
     </aside>
-
-    <!-- 详情 -->
+    </template>
+    <template #second>
     <section class="detail scroll-y">
       <div v-if="selectedProject" class="detail-tabs" role="tablist" aria-label="项目内容">
         <button class="detail-tab" :class="{ active: activeDetail === 'documents' }" role="tab" :aria-selected="activeDetail === 'documents'" @click="activeDetail = 'documents'">接口文档</button>
@@ -562,6 +608,10 @@ onMounted(loadProjects)
       </template>
       <EmptyState v-if="!selectedProject" :icon="FolderKanban" title="导入或选择项目" description="导入项目源码后可生成接口文档并导出，也可为项目添加测试环境。" />
     </section>
+    </template>
+    </ResizableSplit>
+    </template>
+    </ResizableSplit>
     <AppModal v-model:open="showImportForm" title="导入项目" width="580px" :confirm-text="importingProject ? '扫描项目中' : '导入并扫描'" :confirm-disabled="importingProject || !importForm.name.trim() || !importForm.directory.trim()" @confirm="submitImport">
       <div class="import-fields">
         <label class="field"><span class="field-label">项目名称</span><input v-model="importForm.name" class="input" maxlength="80" placeholder="填写项目名称" :disabled="importingProject" /></label>
@@ -576,7 +626,6 @@ onMounted(loadProjects)
 
 <style scoped>
 .projects {
-  display: flex;
   height: 100%;
   min-height: 0;
 }
@@ -584,18 +633,13 @@ onMounted(loadProjects)
 .col {
   display: flex;
   flex-direction: column;
-  flex: none;
+  flex: 1;
   min-height: 0;
   border-right: 1px solid var(--border-subtle);
   background: var(--bg-surface);
 }
 
-.projects-col {
-  width: 236px;
-}
-
 .env-col {
-  width: 232px;
   background: var(--bg-canvas);
 }
 
@@ -792,28 +836,13 @@ onMounted(loadProjects)
   }
 }
 
-@media (max-width: 1080px) {
-  /* 窄窗口纵向排列项目、环境和详情，让导入入口与表单保持可滚动、可操作。 */
-  .projects {
-    flex-direction: column;
-    height: auto;
-    min-height: 100%;
-    min-width: 300px;
-  }
-
-  .projects-col,
-  .env-col {
-    width: 100%;
+@media (max-width: 900px) {
+  .col {
     border-right: 0;
     border-bottom: 1px solid var(--border-subtle);
   }
 
-  .col-body {
-    max-height: 160px;
-  }
-
   .detail {
-    overflow: visible;
     padding: 12px;
   }
 

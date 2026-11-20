@@ -5,11 +5,12 @@
  * 只负责布局，不知道两个插槽里是什么业务。尺寸以像素计算并夹在
  * `[min, available - minOther]` 内，因此拖到阈值后继续移动不会
  * 把另一侧挤没。resize 时也会重新夹紧，避免窗口缩小后留下旧的大尺寸。
- * size/update:size 是受控首栏宽度；workspacePane 显式启用末栏锚定，
- * 通过工作台上下文保留中栏最小值与末栏宽度，不接触插槽里的业务状态。
+ * size/update:size 是首栏宽度偏好；layout 独立发布本轮分配的实际尺寸。
+ * range 由父级提供实际尺寸与拖动阈值，避免嵌套分栏各自分配同一份空间。
+ * resizeMinOther 仅约束用户调整；resize 传出实际位移供嵌套布局分配相邻区域。
  */
-import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { clampSize, readStoredSize, workspaceSplitKey, writeStoredSize } from '@/lib/split'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { clampSize, readStoredSize, writeStoredSize } from '@/lib/split'
 
 /** 长按阈值：按住这么久才真正进入拖动，避免“碰到边界就误改布局”。 */
 const HOLD_MS = 260
@@ -21,15 +22,22 @@ const props = withDefaults(
     min?: number
     max?: number
     minOther?: number
+    maxOther?: number
+    resizeMinOther?: number
     persistKey?: string
     label?: string
-    workspacePane?: string
     fitOther?: number
+    /** A parent layout may supply exact track widths and adjacent drag limits. */
+    range?: { min: number; max: number }
   }>(),
   { direction: 'horizontal', min: 220, minOther: 360, label: '调整区域大小' },
 )
 
-const emit = defineEmits<{ (event: 'update:size', value: number): void }>()
+const emit = defineEmits<{
+  'update:size': [value: number]
+  layout: [sizes: { first: number; second: number }]
+  resize: [change: { delta: number; remaining: number }]
+}>()
 const root = ref<HTMLElement | null>(null)
 const dragging = ref(false)
 /** 已按下但尚未满足长按阈值。 */
@@ -37,26 +45,39 @@ const holding = ref(false)
 const available = ref(0)
 /** 请求宽度与临时显示宽度分离，避免ResizeObserver回写把窗口压缩变成新偏好。 */
 const requestedSize = ref(props.size)
-const workspace = inject(workspaceSplitKey, null)
-/** 末栏偏好独立于首栏受控值；容器暂时变窄不覆盖偏好，恢复时可还原。 */
-const secondSize = ref<number | undefined>()
 let pointerId: number | null = null
 let holdTimer: number | undefined
 let startX = 0
 let startY = 0
+let startSize = 0
 let sessionCleanup: (() => void) | null = null
 
 const currentSize = computed(() =>
-  clampSize({
+  props.range ? props.size : clampSize({
     size: requestedSize.value,
     min: props.min,
+    maxOther: props.maxOther,
     max: props.max,
     minOther: props.minOther,
     available: available.value,
-    second: secondSize.value,
     fitOther: props.fitOther,
   }),
 )
+const resizeMinOther = computed(() => Math.max(props.minOther, props.resizeMinOther ?? 0))
+const dragRange = computed(() => {
+  if (props.range) return props.range
+  const clamp = (size: number) => clampSize({
+    size,
+    min: props.min,
+    max: props.max,
+    minOther: resizeMinOther.value,
+    maxOther: props.maxOther,
+    available: available.value,
+    fitOther: props.fitOther,
+  })
+  const min = clamp(-Infinity)
+  return { min, max: props.max === undefined && available.value <= 0 ? min : clamp(Infinity) }
+})
 
 const style = computed(() => {
   const basis = `${currentSize.value}px`
@@ -71,48 +92,30 @@ const handleStyle = computed(() => {
   return props.direction === 'horizontal' ? { left: basis } : { top: basis }
 })
 
-/** 隐藏的 v-show 面板宽度为0，不能用它覆盖末栏偏好或工作台保留量。 */
-function readAvailable(initialSize = props.size): void {
+function readAvailable(): void {
   const rect = root.value?.getBoundingClientRect()
-  if (!rect) return
-  const measured = props.direction === 'horizontal' ? rect.width : rect.height
-  if (measured <= 0) return
-  available.value = measured
-  if (props.workspacePane && secondSize.value === undefined) {
-    const first = clampSize({ size: initialSize, min: props.min, max: props.max, minOther: props.minOther, available: measured })
-    secondSize.value = readStoredSize(
-      props.persistKey ? `${props.persistKey}.second` : undefined,
-      Math.max(props.minOther, measured - first),
-    )
-    writeStoredSize(props.persistKey ? `${props.persistKey}.second` : undefined, secondSize.value)
-  }
+  const size = props.direction === 'horizontal' ? rect?.width : rect?.height
+  if (size && size > 0) available.value = size
 }
 
-/** 同步实际首栏尺寸；尺寸观察产生的回写不改变末栏偏好。 */
-function publishSize(next: number, persist = false): void {
+/** 鼠标和键盘共用同一尺寸阈值；只有实际调整才保存偏好。 */
+function emitSize(value: number, round = true): void {
+  const previous = currentSize.value
+  const { min, max } = dragRange.value
+  const next = Math.min(max, Math.max(min, round ? Math.round(value) : value))
+  if (next === previous) return
+  if (props.range) {
+    emit('update:size', next)
+    return
+  }
+  const minimumOther = props.resizeMinOther === undefined
+    ? props.fitOther ?? props.minOther
+    : resizeMinOther.value
+  if (available.value < props.min + minimumOther) return
+  requestedSize.value = next
   emit('update:size', next)
-  if (persist) writeStoredSize(props.persistKey, next)
-}
-
-/** 接收拖动或键盘期望尺寸，夹紧后通知父级；只在空间足够时保存新偏好。 */
-function emitSize(value: number): void {
-  // 先夹紧再外发与持久化：拖到阈值外时，存储和父级状态都不应记录越界值。
-  const next = clampSize({
-    size: value,
-    min: props.min,
-    max: props.max,
-    minOther: props.minOther,
-    available: available.value,
-    fitOther: props.fitOther ?? (props.workspacePane ? props.minOther : undefined),
-  })
-  // 只有用户拖动/键盘调整中间边界才建立新的末栏宽度。
-  // 物理空间不足时只更新当前显示值，避免临时压缩覆盖正常窗口的末栏偏好。
-  if (props.workspacePane && available.value >= props.min + props.minOther) {
-    secondSize.value = available.value - next
-    writeStoredSize(props.persistKey ? `${props.persistKey}.second` : undefined, secondSize.value)
-  }
-  if (available.value >= props.min + (props.fitOther ?? props.minOther)) requestedSize.value = next
-  publishSize(next, available.value >= props.min + (props.fitOther ?? props.minOther))
+  writeStoredSize(props.persistKey, next)
+  emit('resize', { delta: next - previous, remaining: available.value - next })
 }
 
 /**
@@ -136,9 +139,8 @@ function bindSession(id: number): void {
       }
       return
     }
-    const rect = root.value?.getBoundingClientRect()
-    if (!rect) return
-    emitSize(props.direction === 'horizontal' ? e.clientX - rect.left : e.clientY - rect.top)
+    const delta = props.direction === 'horizontal' ? e.clientX - startX : e.clientY - startY
+    emitSize(startSize + delta)
   }
   const onUp = (e: PointerEvent) => {
     if (e.pointerId === id) endSession(id)
@@ -174,6 +176,7 @@ function start(event: PointerEvent): void {
   pointerId = event.pointerId
   startX = event.clientX
   startY = event.clientY
+  startSize = currentSize.value
   holding.value = true
   bindSession(event.pointerId)
   holdTimer = window.setTimeout(() => {
@@ -194,11 +197,10 @@ function keydown(event: KeyboardEvent): void {
   const step = event.shiftKey ? 40 : 10
   if (event.key === 'Home') {
     event.preventDefault()
-    emitSize(props.min)
+    emitSize(dragRange.value.min, false)
   } else if (event.key === 'End') {
     event.preventDefault()
-    const maxAllowed = props.max ?? available.value - (props.minOther ?? 0)
-    emitSize(Math.max(props.min, maxAllowed))
+    emitSize(dragRange.value.max, false)
   } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
     event.preventDefault()
     emitSize(currentSize.value - step)
@@ -210,50 +212,28 @@ function keydown(event: KeyboardEvent): void {
 
 let observer: ResizeObserver | undefined
 onMounted(() => {
+  if (props.range) return
   const saved = readStoredSize(props.persistKey, props.size)
   requestedSize.value = saved
-  readAvailable(saved)
-  observer = new ResizeObserver(() => readAvailable())
-  if (root.value) observer.observe(root.value)
-  // 持久化尺寸可能大于当前窗口，挂载后先夹紧一次再使用。
-  if (props.persistKey) {
-    if (saved !== props.size) publishSize(clampSize({
-      size: saved,
-      min: props.min,
-      max: props.max,
-      minOther: props.minOther,
-      available: available.value,
-      second: secondSize.value,
-      fitOther: props.fitOther,
-    }))
+  if (saved !== props.size) emit('update:size', saved)
+  readAvailable()
+  if (root.value) {
+    observer = new ResizeObserver(readAvailable)
+    observer.observe(root.value)
   }
 })
 
-watch(currentSize, () => {
-  // 外部传入的尺寸也可能越界（例如窗口缩小后旧持久化值），同步回父级。
-  if (currentSize.value !== props.size) publishSize(currentSize.value)
-})
+watch([available, currentSize], ([total, first]) => {
+  if (total > 0) emit('layout', { first, second: Math.max(0, total - first) })
+}, { flush: 'sync' })
 
-/** 接收真正的外部受控修改；自身发布的显示尺寸与currentSize相等，无须覆盖偏好。 */
+/** 区分外部修改与 v-model 回传；被动压缩不触发偏好变更。 */
 watch(() => props.size, value => {
-  if (value !== currentSize.value) {
-    requestedSize.value = value
-    if (props.workspacePane && available.value > 0) {
-      secondSize.value = Math.max(props.minOther, available.value - value)
-    }
-  }
-})
-
-// 一次单向报告即可约束外层边界；隐藏面板各自保存偏好，由工作台选择当前模式。
-watch([secondSize, () => props.min, () => props.minOther], () => {
-  if (props.workspacePane && secondSize.value !== undefined) {
-    workspace?.reserve(props.workspacePane, props.min + secondSize.value, props.min + props.minOther)
-  }
+  if (!props.range) requestedSize.value = value
 })
 
 onBeforeUnmount(() => {
   observer?.disconnect()
-  if (props.workspacePane) workspace?.reserve(props.workspacePane, null)
   if (pointerId !== null) endSession(pointerId)
   document.body.classList.remove('split-dragging')
 })
@@ -274,8 +254,8 @@ onBeforeUnmount(() => {
       :aria-label="label"
       :aria-orientation="direction === 'horizontal' ? 'vertical' : 'horizontal'"
       :aria-valuenow="currentSize"
-      :aria-valuemin="Math.min(min, currentSize)"
-      :aria-valuemax="Math.max(min, available - minOther)"
+      :aria-valuemin="Math.min(dragRange.min, currentSize)"
+      :aria-valuemax="Math.max(dragRange.max, currentSize)"
       :style="handleStyle"
       @pointerdown="start"
       @keydown="keydown"
@@ -356,62 +336,66 @@ onBeforeUnmount(() => {
   transform: translateY(-50%);
 }
 
-/* 细线本身：默认透明，避免在白面上出现一条贯穿的灰色带（“有缝感”）。
-   悬浮/待命/拖动时才显现，作为“此处可调”的提示。 */
-.split-grip {
+/* Keep the divider visible at rest; interaction states strengthen its accent and glow. */
+.split-handle > .split-grip {
   display: block;
-  background: transparent;
+  position: absolute;
+  pointer-events: none;
+  background: var(--border-strong);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--bg-canvas) 70%, transparent);
+  opacity: 0.9;
   transition: background 0.14s ease, width 0.14s ease, height 0.14s ease;
 }
 
-.split-horizontal .split-grip {
-  width: 1px;
-  height: 100%;
-}
-
-.split-vertical .split-grip {
-  width: 100%;
-  height: 1px;
-}
-
-/* 悬浮：只加粗分隔线本身并转为主题紫，不给命中带铺底色。
-   此前额外画过一条 16px 宽的浅紫底，视觉上像一根粗紫条，
-   与“细线提示”的意图不符，已移除；命中仍由整条 16px 区域负责。 */
-.split-handle:hover .split-grip,
-.split-handle:focus-visible .split-grip {
-  background: var(--accent);
-}
-
-.split-horizontal .split-handle:hover .split-grip,
-.split-horizontal .split-handle:focus-visible .split-grip {
+.split-horizontal > .split-handle > .split-grip {
+  inset-block: 0;
+  left: 50%;
+  transform: translateX(-50%);
   width: 2px;
 }
 
-.split-vertical .split-handle:hover .split-grip,
-.split-vertical .split-handle:focus-visible .split-grip {
+.split-vertical > .split-handle > .split-grip {
+  inset-inline: 0;
+  top: 50%;
+  transform: translateY(-50%);
   height: 2px;
+}
+
+/* Hover and keyboard focus highlight only the divider, not its full hit area. */
+.split-handle:hover > .split-grip,
+.split-handle:focus-visible > .split-grip {
+  background: var(--accent);
+}
+
+.split-horizontal > .split-handle:hover > .split-grip,
+.split-horizontal > .split-handle:focus-visible > .split-grip {
+  width: 3px;
+}
+
+.split-vertical > .split-handle:hover > .split-grip,
+.split-vertical > .split-handle:focus-visible > .split-grip {
+  height: 3px;
 }
 
 /* 长按待命与拖动：线条保持紫并加粗（hover 已是同样状态），
    拖动时再叠一圈柔和外发光，作为“正在改变尺寸”的额外确认。
-   选择器从根元素出发并带 .split-handle，才能压过上方 hover 规则的特异性
-   （.split-handle:hover .split-grip 为 (0,2,1)，裸 .holding 只有 (0,2,0)）。 */
-.holding .split-handle .split-grip,
-.dragging .split-handle .split-grip {
+   使用直接子级选择器，避免父分隔组件的方向和状态影响嵌套手柄。 */
+.holding > .split-handle > .split-grip,
+.dragging > .split-handle > .split-grip {
   background: var(--accent);
 }
 
-.split-horizontal.holding .split-grip,
-.split-horizontal.dragging .split-grip {
-  width: 2px;
+.split-horizontal.holding > .split-handle > .split-grip,
+.split-horizontal.dragging > .split-handle > .split-grip {
+  width: 3px;
 }
 
-.split-vertical.holding .split-grip,
-.split-vertical.dragging .split-grip {
-  height: 2px;
+.split-vertical.holding > .split-handle > .split-grip,
+.split-vertical.dragging > .split-handle > .split-grip {
+  height: 3px;
 }
 
-.dragging .split-handle .split-grip {
+.dragging > .split-handle > .split-grip {
   box-shadow: 0 0 0 2px var(--accent-soft);
 }
 

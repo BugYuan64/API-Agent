@@ -1,4 +1,4 @@
-"""Persisted console request history with redacted headers and bounded previews."""
+"""Console history with scrubbed replay inputs and bounded response previews."""
 
 from sqlalchemy import JSON, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,6 +25,7 @@ class ConsoleRequestRecord(IdMixin, CreatedAtMixin, Base):
     request_headers: Mapped[dict] = mapped_column(JSON, default=dict)
     body_mode: Mapped[str] = mapped_column(String(10), default="none")
     body_preview: Mapped[str | None] = mapped_column(Text)
+    request_body: Mapped[str | None] = mapped_column(Text)
     ok: Mapped[bool] = mapped_column(default=False)
     status_code: Mapped[int | None] = mapped_column(Integer)
     elapsed_ms: Mapped[float] = mapped_column(default=0)

@@ -125,3 +125,38 @@ test('console opt-in does not hide a management validation or policy rejection',
   await assert.rejects(module.request('/fixture', { acceptResultErrors: true }),
     error => error.status === 400 && error.code === 'target_not_allowed')
 })
+
+test('live console publishes split UTF-8 events before the result arrives', async () => {
+  const events = [], observed = deferred()
+  let stream
+  const body = new ReadableStream({ start: controller => { stream = controller } })
+  const module = load('api/client.ts', async () => new Response(body, {
+    headers: { 'Content-Type': 'application/x-ndjson' },
+  }))
+  const reading = module.request('/fixture', {
+    readResponse: response => module.readConsoleFrames(response, frame => {
+      events.push(frame)
+      if (frame.type === 'sse_event') observed.resolve()
+    }),
+  })
+  const result = { ok: true }
+  const first = { type: 'sse_event', event: { event: 'message', data: '中文' } }
+  const bytes = Buffer.from(JSON.stringify(first) + '\n')
+  const split = bytes.indexOf(Buffer.from('中')) + 1
+  stream.enqueue(bytes.subarray(0, split))
+  stream.enqueue(bytes.subarray(split))
+  await observed.promise
+  assert.deepEqual(events, [first])
+  stream.enqueue(Buffer.from(JSON.stringify({ type: 'result', result }) + '\n'))
+  assert.deepEqual(await reading, result)
+  assert.equal(module.timers.size, 0)
+})
+
+test('live console reports an interrupted stream when no final frame arrives', async () => {
+  const module = load('api/client.ts', async () => new Response('{"type":"sse_start"}\n', {
+    headers: { 'Content-Type': 'application/x-ndjson' },
+  }))
+  await assert.rejects(module.request('/fixture', {
+    readResponse: response => module.readConsoleFrames(response, () => {}),
+  }), error => error.code === 'incomplete_stream')
+})

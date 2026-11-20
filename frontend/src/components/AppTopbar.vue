@@ -55,7 +55,7 @@ onMounted(refresh)
 <template>
   <header class="topbar">
     <div class="crumbs">
-      <span class="crumb-root">API-Agent</span>
+      <span class="crumb-root">API 工作台</span>
       <ChevronRight class="crumb-sep" :size="13" aria-hidden="true" />
       <span class="crumb-current">{{ $route.meta.title ?? '控制台' }}</span>
     </div>
@@ -87,8 +87,8 @@ onMounted(refresh)
   gap: 16px;
   height: var(--topbar-height);
   flex: none;
-  padding: 0 16px;
-  background: var(--bg-sidebar);
+  padding: 0 18px;
+  background: var(--bg-surface);
   border-bottom: 1px solid var(--border-subtle);
 }
 
@@ -120,7 +120,7 @@ onMounted(refresh)
 .status {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   flex: none;
 }
 
@@ -128,18 +128,16 @@ onMounted(refresh)
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 25px;
-  padding: 0 9px;
+  height: 24px;
+  padding: 0 7px;
   border-radius: var(--radius-sm);
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 500;
   border: 1px solid transparent;
 }
 
 .pill-success {
-  background: var(--success-soft);
   color: var(--success);
-  border-color: var(--success-border);
 }
 
 .pill-warning {
@@ -155,10 +153,10 @@ onMounted(refresh)
 }
 
 .pill-neutral {
-  background: var(--bg-subtle);
   color: var(--text-secondary);
-  border-color: var(--border-default);
 }
+
+.status > .btn-icon { width: 27px; height: 27px; }
 
 .spinning {
   animation: spin 0.9s linear infinite;

@@ -1,9 +1,12 @@
 /** 持久化控制台外观偏好，并在挂载 Vue 前同步根节点属性；禁用存储时仍允许切换。 */
+import { applyPalette, getPalette } from './palette'
+
 export type AppearanceTheme = 'light' | 'dark'
 
 export const THEME_STORAGE_KEY = 'api-agent.theme'
 export const SIDEBAR_STORAGE_KEY = 'api-agent.sidebar-collapsed'
 export const DEFAULT_THEME: AppearanceTheme = 'dark'
+let themeTransitionRevision = 0
 
 /** 读取单项偏好，浏览器禁用存储或读操作失败时回退为空。 */
 function readPreference(key: string): string | null {
@@ -48,7 +51,36 @@ export function writeSidebarCollapsed(collapsed: boolean): void {
 
 /** 将主题同步到 html，所有共享组件读取同一组设计令牌。 */
 export function applyTheme(theme: AppearanceTheme): void {
-  if (typeof document !== 'undefined') document.documentElement.dataset.theme = theme
+  if (typeof document !== 'undefined') {
+    document.documentElement.dataset.theme = theme
+    applyPalette(theme, getPalette(theme))
+  }
+}
+
+/** Crossfade the whole interface between themes, with color transitions as a browser fallback. */
+export function transitionTheme(theme: AppearanceTheme): void {
+  if (typeof document === 'undefined') return
+  const root = document.documentElement
+  if (root.dataset.theme === theme) return
+  const revision = ++themeTransitionRevision
+  const update = () => {
+    root.dataset.theme = theme
+    applyPalette(theme, getPalette(theme))
+  }
+  const view = document as Document & { startViewTransition?: (callback: () => void) => { finished: Promise<void> } }
+  if (view.startViewTransition) {
+    const transition = view.startViewTransition(update)
+    const clearOrigin = () => {
+      if (revision !== themeTransitionRevision) return
+      root.style.removeProperty('--theme-origin-x')
+      root.style.removeProperty('--theme-origin-y')
+    }
+    transition.finished.then(clearOrigin, clearOrigin)
+    return
+  }
+  root.dataset.themeTransitioning = 'true'
+  update()
+  globalThis.setTimeout(() => { delete root.dataset.themeTransitioning }, 760)
 }
 
 /** 入口页在创建 Vue 应用前执行，与 HTML 预加载逻辑保持相同默认值。 */

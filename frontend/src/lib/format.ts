@@ -10,6 +10,17 @@ export function formatDateTime(value: string | null | undefined): string {
   return date.toLocaleString('zh-CN', { hour12: false })
 }
 
+/** Recognize SSE from saved content negotiation headers, including older records. */
+export function isSseHistory(record?: { response_headers: Record<string, unknown>; request_headers: Record<string, unknown> }): boolean {
+  if (!record) return false
+  const hasEventStream = (headers: Record<string, unknown>, header: string) => Object.entries(headers ?? {})
+    .filter(([name]) => name.toLowerCase() === header)
+    .some(([, value]) => (Array.isArray(value) ? value : [value]).some(entry =>
+      typeof entry === 'string' && entry.split(',').some(media => media.split(';', 1)[0].trim().toLowerCase() === 'text/event-stream'),
+    ))
+  return hasEventStream(record.response_headers, 'content-type') || hasEventStream(record.request_headers, 'accept')
+}
+
 /** 相对时间：刚刚 / 3 分钟前 / 2 小时前，超过一天回到绝对时间。 */
 export function formatRelative(value: string | null | undefined): string {
   if (!value) return '—'

@@ -3,7 +3,7 @@
  *  每个函数只做「拼路径 + 声明类型」，不处理加载态与错误展示——
  *  那是页面与 store 的职责。 */
 
-import { request } from './client'
+import { readConsoleFrames, request } from './client'
 import type {
   AgentDiagnosis,
   AgentRun,
@@ -11,6 +11,7 @@ import type {
   ConsoleHistory,
   ConsoleRequestInput,
   ConsoleResult,
+  ConsoleSseProgress,
   EngineInfo,
   EngineStatus,
   Environment,
@@ -26,6 +27,7 @@ import type {
   Project,
   StreamEventPage,
   StreamHistory,
+  StreamReplayInputs,
   StreamSession,
   StreamStartInput,
 } from './types'
@@ -70,13 +72,20 @@ export const updateEnvironment = (
 ) => request<Environment>(`/api/environments/${environmentId}`, { method: 'PUT', body })
 
 /* ---------- 控制台请求 ---------- */
-/** 提交目标 HTTP 请求并返回 ConsoleResult；管理链路等待上限 70 秒，目标传输错误在结果字段内，管理失败抛 ApiError。 */
-export const sendConsoleRequest = (body: ConsoleRequestInput) =>
-  request<ConsoleResult>('/api/console/requests', { method: 'POST', body, timeoutMs: 70_000, acceptResultErrors: true })
+/** 发送一次目标请求，从同一管理响应逐条读取 SSE 事件及最终结果。 */
+export const sendConsoleRequest = (body: ConsoleRequestInput, onProgress: (frame: ConsoleSseProgress) => void, signal?: AbortSignal) =>
+  request<ConsoleResult>('/api/console/requests/live', {
+    method: 'POST', body, timeoutMs: 70_000, signal,
+    readResponse: response => readConsoleFrames(response, onProgress),
+  })
 
 /** 读取脱敏 HTTP 请求历史分页；正文为后端保留的预览，失败抛 ApiError。 */
 export const listConsoleHistory = (limit = 50, offset = 0) =>
   request<Paged<ConsoleHistory>>(`/api/console/history?limit=${limit}&offset=${offset}`)
+
+/** Fetch complete replay inputs for a single request. */
+export const readConsoleHistory = (id: string, signal?: AbortSignal) =>
+  request<ConsoleHistory>(`/api/console/history/${encodeURIComponent(id)}`, { signal })
 
 /** 按记录 ID 删除一条 HTTP 历史；成功返回空结果，失败抛 ApiError，由调用方同步列表。 */
 export const deleteConsoleHistory = (recordId: string) =>
@@ -94,6 +103,10 @@ export const startStream = (body: StreamStartInput) =>
 /** 分页读取已保存长连接会话；返回历史摘要，不拉取事件，失败抛 ApiError。 */
 export const listStreams = (limit = 50, offset = 0) =>
   request<Paged<StreamHistory>>(`/api/streams?limit=${limit}&offset=${offset}`)
+
+/** Fetch saved startup inputs separately from the event timeline. */
+export const readStreamInputs = (id: string, signal?: AbortSignal) =>
+  request<StreamReplayInputs>(`/api/streams/${encodeURIComponent(id)}/inputs`, { signal })
 
 /** 删除一条长连接会话及其事件时间线；在跑的会话会先收尾，不存在时抛 ApiError。 */
 export const deleteStream = (sessionId: string) =>
@@ -149,6 +162,10 @@ export const getLLMConfig = () => request<LLMConfig>('/api/settings/llm')
 /** 保存模型配置并返回脱敏配置；api_key 省略保留旧值、空串清空，校验或保存失败抛 ApiError。 */
 export const updateLLMConfig = (body: LLMConfigUpdate) =>
   request<LLMConfig>('/api/settings/llm', { method: 'PUT', body })
+
+/** Persist only the model name; chat and Settings read the same saved configuration. */
+export const selectLLMModel = (model: string) =>
+  request<LLMConfig>('/api/settings/llm/model', { method: 'PATCH', body: { model } })
 
 /** 由后端按可选覆盖配置进行模型探测；管理链路上限 20 秒，业务失败在结果内，管理失败抛 ApiError。 */
 export const pingLLM = (body?: { base_url?: string; api_key?: string; model?: string }) =>

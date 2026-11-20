@@ -3,12 +3,18 @@
 import asyncio
 import json
 
+import httpx
+import pytest
+
 from api_agent.agent.routes import agent_for
 from api_agent.agent.service import AgentService
 from api_agent.llm.errors import LLMConnectionError
 from api_agent.llm.schemas import ChatCompletionResponse
+from api_agent.projects.document_routes import legacy_writer
 from api_agent.projects.document_schema import DocumentEndpoint
 from api_agent.projects.documents import PENDING, merge_endpoints, source_batches
+from api_agent.tasks import project_document
+from api_agent.tasks import routes as task_routes
 
 
 class SourceModel:
@@ -77,8 +83,15 @@ def python_route(path="/items"):
     )
 
 
+@pytest.fixture
+async def archive_client(app, client):
+    """Mount the retired writer only to exercise old data compatibility in these tests."""
+    app.include_router(legacy_writer)
+    return client
+
+
 async def import_project(client, directory, name="Document project"):
-    """通过正式接口创建项目并导入绝对目录，返回项目与源码快照。"""
+    """Create an archived project fixture with the legacy writer."""
     response = await client.post(
         "/api/projects/import", json={"name": name, "directory": str(directory)}
     )
@@ -107,8 +120,49 @@ async def finished_document(client, app, project_id, document_id):
     return response.json()
 
 
-async def test_import_all_batches_tail_file_and_both_exports(client, app, settings, tmp_path):
+async def test_smart_test_writes_openapi_without_a_source_snapshot(
+    app, settings, tmp_path, monkeypatch
+):
+    """Use an explicit desktop selection and leave only its OpenAPI export on disk."""
+    project = tmp_path / "sample project"
+    project.mkdir()
+    (project / "app.py").write_text(python_route("/health"), encoding="utf-8")
+    model = SourceModel()
+
+    async def configured_agent(request, session):
+        return AgentService(settings, model)
+
+    monkeypatch.setattr(task_routes, "agent_for", configured_agent)
+    monkeypatch.setattr(project_document, "choose_directory", lambda: project)
+    transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:
+        legacy = await client.post(
+            "/api/projects/import", json={"name": "old", "directory": str(project)}
+        )
+        assert legacy.status_code in {404, 405}
+        forbidden = await client.post(
+            "/api/tasks/generate-document", headers={"Origin": "https://elsewhere.invalid"}
+        )
+        assert forbidden.status_code == 403
+        response = await client.post(
+            "/api/tasks/generate-document", headers={"Origin": "http://localhost"}
+        )
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["filename"].startswith("openapi") and result["filename"].endswith(".json")
+        output = project / "API" / result["filename"]
+        assert output.read_text(encoding="utf-8") == result["text"]
+        assert "/health" in json.loads(result["text"])["paths"]
+        assert not list(app.state.documents.store.root.rglob("*.json"))
+        assert (await client.get("/api/projects")).json()["items"] == []
+        assert len(model.calls) == 1
+
+
+async def test_import_all_batches_tail_file_and_both_exports(
+    archive_client, app, settings, tmp_path
+):
     """完整源码每个字符都送入模型，最后一个文件的接口进入预览和两种下载。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     contents = {
@@ -152,9 +206,10 @@ async def test_import_all_batches_tail_file_and_both_exports(client, app, settin
 
 
 async def test_reimport_freezes_old_version_and_cross_project_access_is_rejected(
-    client, app, settings, tmp_path
+    archive_client, app, settings, tmp_path
 ):
     """重导入生成新版本，旧版本仍可生成且其他项目不可使用该源码或文档 ID。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     source_file = directory / "routes.py"
@@ -187,9 +242,10 @@ async def test_reimport_freezes_old_version_and_cross_project_access_is_rejected
 
 
 async def test_model_context_preserves_source_types_and_redacts_literal_credentials(
-    client, app, settings, tmp_path
+    archive_client, app, settings, tmp_path
 ):
     """源码脱敏保留 password 类型注解和重复 str 类型，示例密钥及回显均移除。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     content = (
@@ -229,9 +285,10 @@ async def test_model_context_preserves_source_types_and_redacts_literal_credenti
 
 
 async def test_invalid_source_reference_is_repaired_once_then_saved_failed(
-    client, app, settings, tmp_path
+    archive_client, app, settings, tmp_path
 ):
     """模型引用未提供文件时触发一次修复，持续错误保留静态清单并标记失败。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     (directory / "routes.py").write_text(python_route(), encoding="utf-8")
@@ -250,8 +307,9 @@ async def test_invalid_source_reference_is_repaired_once_then_saved_failed(
     assert "missing.py" not in record["markdown"]
 
 
-async def test_model_failure_preserves_completed_batches(client, app, settings, tmp_path):
+async def test_model_failure_preserves_completed_batches(archive_client, app, settings, tmp_path):
     """第二批传输失败时第一批成果和进度继续可读，未处理文件保持未完成。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     (directory / "first.py").write_text(python_route("/first"), encoding="utf-8")
@@ -273,9 +331,10 @@ async def test_model_failure_preserves_completed_batches(client, app, settings, 
 
 
 async def test_cancel_running_generation_rejects_duplicate_then_allows_new_run(
-    client, app, settings, tmp_path
+    archive_client, app, settings, tmp_path
 ):
     """同项目并发生成返回冲突，取消等待中的模型后可立即重新发起。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     (directory / "routes.py").write_text(python_route(), encoding="utf-8")
@@ -305,9 +364,10 @@ async def test_cancel_running_generation_rejects_duplicate_then_allows_new_run(
 
 
 async def test_incomplete_scan_and_empty_model_details_remain_partial(
-    client, app, settings, tmp_path
+    archive_client, app, settings, tmp_path
 ):
     """超限源码可见为扫描缺口，模型仅回声路由也不能成为完整生成结果。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     (directory / "routes.py").write_text(python_route(), encoding="utf-8")
@@ -332,8 +392,9 @@ async def test_incomplete_scan_and_empty_model_details_remain_partial(
     assert PENDING in record["endpoints"][0]["uncertainties"]
 
 
-async def test_recovery_marks_orphaned_generation_interrupted(client, app, tmp_path):
+async def test_recovery_marks_orphaned_generation_interrupted(archive_client, app, tmp_path):
     """仓储恢复保留已保存的接口和覆盖进度，未结束任务转换为中断。"""
+    client = archive_client
     directory = tmp_path / "source"
     directory.mkdir()
     (directory / "routes.py").write_text(python_route(), encoding="utf-8")

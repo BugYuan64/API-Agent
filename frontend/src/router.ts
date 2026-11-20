@@ -17,7 +17,7 @@ export const router = createRouter({
       path: '/testcases',
       name: 'testcases',
       component: () => import('@/views/TestCasesView.vue'),
-      meta: { title: '用例测试' },
+      meta: { title: '智能群测' },
     },
     // 旧入口统一进入文档驱动任务测试。
     { path: '/plan', redirect: '/testcases' },
@@ -31,8 +31,7 @@ export const router = createRouter({
     {
       path: '/projects',
       name: 'projects',
-      component: () => import('@/views/ProjectsView.vue'),
-      meta: { title: '项目与环境' },
+      redirect: '/testcases',
     },
     {
       path: '/runs',
@@ -48,13 +47,12 @@ export const router = createRouter({
       path: '/history',
       name: 'history',
       component: () => import('@/views/HistoryView.vue'),
-      meta: { title: '请求历史' },
+      meta: { title: '执行结果' },
     },
     {
       path: '/executions',
       name: 'executions',
-      component: () => import('@/views/ExecutionsView.vue'),
-      meta: { title: '执行结果' },
+      redirect: '/history',
     },
     {
       path: '/settings',
@@ -74,5 +72,5 @@ export const router = createRouter({
 /** 导航完成后按目标路由 meta 更新文档标题；缺少标题时回退控制台，不更改导航结果。 */
 router.afterEach((to) => {
   const title = (to.meta.title as string | undefined) ?? '控制台'
-  document.title = `${title} · API-Agent`
+  document.title = `${title} · API 工作台`
 })

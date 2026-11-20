@@ -1,3 +1,5 @@
+import type { ConsoleResult, ConsoleSseProgress } from './types'
+
 /** 管理 API 的浏览器传输边界：依赖 fetch、AbortController 和定时器，统一请求截止时间、响应解析与 ApiError。只封装管理接口，目标测试结果仍由后端响应描述。 */
 /** 一个极薄的 fetch 封装：统一错误结构、超时与 JSON 解析。
  *
@@ -37,6 +39,7 @@ interface RequestOptions {
   timeoutMs?: number
   /** 仅控制台启用：保留后端已分类的传输失败结果，普通管理错误仍抛出。 */
   acceptResultErrors?: boolean
+  readResponse?: (response: Response) => Promise<unknown>
 }
 
 /** 识别控制台的失败结果信封，防止将任意非 2xx 管理错误当成测试结果。 */
@@ -59,9 +62,42 @@ async function readBody(response: Response): Promise<unknown> {
   }
 }
 
+type ConsoleFrame = ConsoleSseProgress
+  | { type: 'result'; result: ConsoleResult }
+  | { type: 'error'; status: number; error: { code: string; message: string; request_id?: string } }
+
+/** 从管理响应逐行解码，完整的 SSE 事件立即交给页面，最终帧携带已保存的结果。 */
+export async function readConsoleFrames(response: Response, onProgress: (frame: ConsoleSseProgress) => void) {
+  const incomplete = () => new ApiError(0, 'incomplete_stream', '管理响应流未返回完整结果')
+  if (!response.body || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) throw incomplete()
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) throw incomplete()
+      const lines = (pending + decoder.decode(value, { stream: true })).split('\n')
+      pending = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line) continue
+        const frame: ConsoleFrame = JSON.parse(line)
+        if (frame.type === 'result') return frame.result
+        if (frame.type === 'error') {
+          throw new ApiError(frame.status, frame.error.code, frame.error.message, [], frame.error.request_id)
+        }
+        if (frame.type === 'sse_start' || frame.type === 'sse_event') onProgress(frame)
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+}
+
 /** 将 path 和请求选项发送为管理 API 请求并返回类型化响应。调用方取消或截止时间覆盖响应体读取，非 2xx 和网络失败均抛 ApiError；finally 释放定时器和外部取消监听。 */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, signal, timeoutMs = 30_000, acceptResultErrors = false } = options
+  const { method = 'GET', body, signal, timeoutMs = 30_000, acceptResultErrors = false, readResponse } = options
   if (signal?.aborted) throw new ApiError(0, 'request_cancelled', '请求已取消')
   const controller = new AbortController()
   let deadlineExpired = false
@@ -83,7 +119,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     })
     // Headers alone do not complete a request: cancellation and the deadline
     // also cover streaming the body and parsing the response.
-    const payload = await readBody(response)
+    const payload = await (response.ok && readResponse ? readResponse(response) : readBody(response))
     if (controller.signal.aborted) throw aborted()
     if (!response.ok) {
       if (acceptResultErrors && isResultError(payload, response.status)) return payload as T
@@ -99,10 +135,10 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     }
     return payload as T
   } catch (error) {
-    if (error instanceof ApiError) throw error
     if (controller.signal.aborted) {
       throw aborted()
     }
+    if (error instanceof ApiError) throw error
     throw new ApiError(0, 'network_error', (error as Error).message || '无法连接后端服务')
   } finally {
     window.clearTimeout(timer)

@@ -15,12 +15,14 @@ from api_agent.infrastructure.api import (
     paginate,
 )
 from api_agent.infrastructure.database import session_for
+from api_agent.infrastructure.history import sanitize_stream
 from api_agent.infrastructure.targets import TargetError
 from api_agent.streams.models import StreamEventRecord, StreamSessionRecord
 from api_agent.streams.schemas import (
     StreamEventPage,
     StreamEventResponse,
     StreamHistoryResponse,
+    StreamReplayInputs,
     StreamSendRequest,
     StreamSessionResponse,
     StreamStart,
@@ -83,6 +85,21 @@ async def list_sessions(
     ).all()
     total = await session.scalar(select(func.count()).select_from(StreamSessionRecord)) or 0
     return paginate(StreamHistoryResponse, items, limit, offset, total)
+
+
+@router.get("/{session_id}/inputs", response_model=StreamReplayInputs)
+async def read_inputs(session_id: str, session: Session):
+    """Fetch the original handshake and scheduled messages independently of event replay."""
+    record = await session.get(StreamSessionRecord, session_id)
+    if record is None:
+        raise not_found("Stream session")
+    sanitize_stream(record)
+    return StreamReplayInputs(
+        url=record.url,
+        request_headers=record.request_headers,
+        subprotocols=(record.settings or {}).get("subprotocols", []),
+        scheduled_messages=record.scheduled_messages,
+    )
 
 
 @router.get("/{session_id}", response_model=StreamEventPage)

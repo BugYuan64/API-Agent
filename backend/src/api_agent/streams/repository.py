@@ -5,8 +5,8 @@ import logging
 from sqlalchemy import update
 
 from api_agent.infrastructure.database import Database
+from api_agent.infrastructure.history import sanitize_stream
 from api_agent.infrastructure.orm import utc_now
-from api_agent.infrastructure.targets import redact_headers
 from api_agent.streams.models import StreamEventRecord, StreamSessionRecord
 from api_agent.streams.schemas import StreamStart
 from api_agent.streams.state import ActiveStream
@@ -24,25 +24,26 @@ class StreamRepository:
     async def create(self, stream: ActiveStream, payload: StreamStart, origin: str) -> None:
         """连接前提交初始会话和脱敏头；失败抛出，由管理器释放预留名额。"""
         async with self.database.session() as session:
-            session.add(
-                StreamSessionRecord(
-                    id=stream.id,
-                    project_id=payload.project_id,
-                    kind=payload.kind,
-                    url=stream.url,
-                    request_headers=redact_headers(payload.headers),
-                    status=stream.status,
-                    settings={
-                        "origin": origin,
-                        "max_events": payload.max_events,
-                        "max_duration_ms": payload.max_duration_ms,
-                        "connect_timeout_ms": payload.connect_timeout_ms,
-                        "ping_interval_ms": payload.ping_interval_ms,
-                        "subprotocols": payload.subprotocols,
-                        "scheduled_sends": len(payload.send),
-                    },
-                )
+            record = StreamSessionRecord(
+                id=stream.id,
+                project_id=payload.project_id,
+                kind=payload.kind,
+                url=stream.url,
+                request_headers=payload.headers,
+                scheduled_messages=payload.send,
+                status=stream.status,
+                settings={
+                    "origin": origin,
+                    "max_events": payload.max_events,
+                    "max_duration_ms": payload.max_duration_ms,
+                    "connect_timeout_ms": payload.connect_timeout_ms,
+                    "ping_interval_ms": payload.ping_interval_ms,
+                    "subprotocols": payload.subprotocols,
+                    "scheduled_sends": len(payload.send),
+                },
             )
+            sanitize_stream(record)
+            session.add(record)
             await session.commit()
 
     async def recover(self) -> int:

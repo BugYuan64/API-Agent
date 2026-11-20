@@ -1,28 +1,107 @@
 """Endpoints for console HTTP requests and their saved history."""
 
+import asyncio
+import json
+import logging
+from contextlib import aclosing
 from typing import Annotated
 
+from anyio import CancelScope
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api_agent.console.models import ConsoleRequestRecord
-from api_agent.console.schemas import ConsoleHistoryResponse
+from api_agent.console.schemas import ConsoleHistoryDetail, ConsoleHistoryResponse
 from api_agent.console.service import ConsoleRequest, ConsoleResult, send
+from api_agent.console.sse import SseEvent
 from api_agent.infrastructure.api import (
     ApiError,
     LimitParam,
     OffsetParam,
     Page,
+    error_response,
     not_found,
     paginate,
 )
 from api_agent.infrastructure.database import session_for
 from api_agent.infrastructure.history import PREVIEW_LIMIT, sanitize_console
-from api_agent.infrastructure.targets import TargetError, redact_headers
+from api_agent.infrastructure.targets import TargetError
 
 router = APIRouter(prefix="/api/console", tags=["console"])
 Session = Annotated[AsyncSession, Depends(session_for)]
+
+
+def ndjson_line(kind: str, **payload) -> bytes:
+    """Frame one management-stream message independently of TCP chunk boundaries."""
+    return (json.dumps({"type": kind, **payload}, ensure_ascii=False) + "\n").encode()
+
+
+class ConsoleStreamingResponse(StreamingResponse):
+    """Close the producer when sending a frame fails or the browser disconnects."""
+
+    async def stream_response(self, send) -> None:
+        async with aclosing(self.body_iterator):
+            await super().stream_response(send)
+
+
+@router.post(
+    "/requests/live",
+    response_class=StreamingResponse,
+    responses={200: {"content": {"application/x-ndjson": {}}}},
+)
+async def stream_request(payload: ConsoleRequest, request: Request):
+    """Send one target request and forward SSE events before committing its final history."""
+
+    async def frames():
+        messages: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+
+        async def publish(event: SseEvent | None) -> None:
+            line = (
+                ndjson_line("sse_start") if event is None else ndjson_line("sse_event", event=event)
+            )
+            await messages.put(line)
+
+        async def execute() -> bytes:
+            try:
+                result = await send(request.app.state.settings, payload, on_sse=publish)
+                async with request.app.state.database.session() as session:
+                    record = await save_history(session, payload, result)
+                result.history_id = record.id
+                return ndjson_line("result", result=result.model_dump(mode="json"))
+            except TargetError as error:
+                status, code, message = 400, str(error), "Target rejected by local target policy"
+            except Exception:
+                logging.getLogger("api_agent").error("Live console request could not finish")
+                status, code, message = 500, "internal_error", "Internal server error"
+            envelope = error_response(request, status, code, message)
+            return ndjson_line("error", status=status, **json.loads(envelope.body))
+
+        worker = asyncio.create_task(execute())
+        next_message = asyncio.create_task(messages.get())
+        try:
+            while True:
+                await asyncio.wait((worker, next_message), return_when=asyncio.FIRST_COMPLETED)
+                if next_message.done():
+                    yield next_message.result()
+                    next_message = asyncio.create_task(messages.get())
+                elif worker.done():
+                    if not messages.empty():
+                        yield await next_message
+                    break
+            yield worker.result()
+        finally:
+            next_message.cancel()
+            worker.cancel()
+            with CancelScope(shield=True):
+                await asyncio.gather(next_message, worker, return_exceptions=True)
+
+    return ConsoleStreamingResponse(
+        frames(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post(
@@ -49,10 +128,20 @@ async def send_request(
     except TargetError as error:
         # 范围裁定失败是“请求被本机策略拒绝”，不是服务端故障，因此返回 400 并带稳定错误码。
         raise ApiError(400, str(error), "Target rejected by local target policy") from None
+    record = await save_history(session, payload, result)
+    result.history_id = record.id
+    # 仅本机传输失败改变外层 HTTP；目标 4xx/5xx 仍是收到真实响应的正常结果。
+    if not result.ok:
+        response.status_code = result.result_status or 500
+    return result
+
+
+async def save_history(session: AsyncSession, payload: ConsoleRequest, result: ConsoleResult):
+    """Commit one scrubbed history record after the shared HTTP engine finishes."""
     record = ConsoleRequestRecord(
         method=payload.method,
         url=result.request["url"],
-        request_headers=redact_headers(payload.headers),
+        request_headers=payload.headers,
         body_mode=payload.body_mode,
         body_preview=(payload.body or "")[:PREVIEW_LIMIT] or None,
         ok=result.ok,
@@ -60,7 +149,7 @@ async def send_request(
         elapsed_ms=result.elapsed_ms,
         error_kind=result.error_kind,
         error_message=result.error_message,
-        response_headers=redact_headers(result.response.headers) if result.response else {},
+        response_headers=result.response.headers if result.response else {},
         response_preview=(result.response.body or "")[:PREVIEW_LIMIT] if result.response else None,
         response_bytes=result.response.body_bytes if result.response else 0,
     )
@@ -74,10 +163,7 @@ async def send_request(
     )
     session.add(record)
     await session.commit()
-    # 仅本机传输失败改变外层 HTTP；目标 4xx/5xx 仍是收到真实响应的正常结果。
-    if not result.ok:
-        response.status_code = result.result_status or 500
-    return result
+    return record
 
 
 @router.get("/history", response_model=Page[ConsoleHistoryResponse])
@@ -107,6 +193,16 @@ async def list_history(
         sanitize_console(item)
     total = await session.scalar(select(func.count()).select_from(ConsoleRequestRecord)) or 0
     return paginate(ConsoleHistoryResponse, items, limit, offset, total)
+
+
+@router.get("/history/{record_id}", response_model=ConsoleHistoryDetail)
+async def read_history(record_id: str, session: Session):
+    """Read one scrubbed replay input without expanding the history list payload."""
+    record = await session.get(ConsoleRequestRecord, record_id)
+    if record is None:
+        raise not_found("Console request")
+    sanitize_console(record)
+    return record
 
 
 @router.delete("/history/{record_id}", status_code=204)

@@ -11,6 +11,26 @@ from api_agent.tasks.schemas import Catalog, Endpoint
 METHODS = {"get", "head", "options", "post", "put", "patch", "delete"}
 
 
+def document_server(root):
+    """Pick the first usable root OpenAPI server or Swagger host and explicit scheme."""
+    if root.get("openapi"):
+        for server in root.get("servers") or []:
+            if not isinstance(server, dict) or not isinstance(server.get("url"), str):
+                continue
+            url = server["url"]
+            for name, variable in (server.get("variables") or {}).items():
+                if isinstance(variable, dict) and isinstance(variable.get("default"), str):
+                    url = url.replace("{" + name + "}", variable["default"])
+            if (hint := Catalog.safe_server_hint(url)) is not None:
+                return hint
+    elif isinstance(root.get("host"), str):
+        for scheme in root.get("schemes") or []:
+            # Swagger basePath already forms part of each case path.
+            if (hint := Catalog.safe_server_hint(f"{scheme}://{root['host']}")) is not None:
+                return hint
+    return None
+
+
 class DocumentLoader(yaml.SafeLoader):
     """Reject YAML aliases to avoid recursive or exponentially expanded documents."""
 
@@ -63,7 +83,7 @@ def resolve(node, root):
     return node
 
 
-def recognize(text):
+def recognize(text, *, operations=None):
     """Return a complete standard catalog, or None for LLM-readable nonstandard text."""
     try:
         root = yaml.load(text.lstrip("\ufeff"), Loader=DocumentLoader)
@@ -72,13 +92,22 @@ def recognize(text):
         return None
     if not isinstance(root, dict):
         return None
+    info = root.get("info")
+    title = (info.get("title") if isinstance(info, dict) else None) or root.get("title")
     if "endpoints" in root:
-        return Catalog.model_validate(root)
+        return Catalog.model_validate(
+            {**{key: value for key, value in root.items() if key != "info"}, "title": title}
+        )
     if not (root.get("openapi") or root.get("swagger")) or not isinstance(root.get("paths"), dict):
         return None
     endpoints = []
     warnings = []
-    for path, raw_item in root["paths"].items():
+    paths = list(root["paths"].items())
+    for websocket in root.get("x-websocket-operations", []):
+        if not isinstance(websocket, dict) or not isinstance(websocket.get("path"), str):
+            raise ValueError("invalid_websocket_operation")
+        paths.append((websocket["path"], {"get": {**websocket, "x-protocol": "websocket"}}))
+    for path, raw_item in paths:
         item = resolve(raw_item, root)
         if not isinstance(item, dict):
             raise ValueError("invalid_path_item")
@@ -124,10 +153,13 @@ def recognize(text):
                 int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300
             ]
             protocol = operation.get("x-protocol", "http")
-            if any(
-                "text/event-stream" in resolve(response, root).get("content", {})
-                for response in responses.values()
-            ) or "text/event-stream" in operation.get("produces", []):
+            if protocol == "http" and (
+                any(
+                    "text/event-stream" in resolve(response, root).get("content", {})
+                    for response in responses.values()
+                )
+                or "text/event-stream" in operation.get("produces", [])
+            ):
                 protocol = "sse"
             original = operation.get("x-test-cases", operation.get("test_cases", []))
             generated = _boundary_cases(
@@ -141,6 +173,18 @@ def recognize(text):
             )
             if not statuses:
                 warnings.append(f"{method.upper()} {path}: 未声明成功状态，生成用例不推断状态码")
+            if operations is not None:
+                operations.append(
+                    {
+                        "description": operation.get("description"),
+                        "parameters": [resolve(parameter, root) for parameter in parameters],
+                        "json_schema": resolve(media.get("schema", {}), root),
+                        "responses": {
+                            code: resolve(response, root).get("description")
+                            for code, response in responses.items()
+                        },
+                    }
+                )
             endpoints.append(
                 Endpoint.model_validate(
                     {
@@ -148,6 +192,7 @@ def recognize(text):
                         "protocol": protocol,
                         "method": method.upper(),
                         "path": request_path,
+                        "path_template": path_template,
                         "body": body if method not in {"get", "head", "options"} else None,
                         "assertions": [{"kind": "status", "expected": min(statuses)}]
                         if statuses
@@ -171,6 +216,8 @@ def recognize(text):
             )
     return Catalog(
         format="openapi" if root.get("openapi") else "swagger",
+        title=title,
+        server_url=document_server(root),
         endpoints=endpoints,
         cases=root.get("x-test-cases", root.get("test_cases", [])),
         warnings=warnings,
@@ -182,31 +229,47 @@ class NativeCaseGenerator:
 
     def generate(self, catalog):
         """Keep supplied cases in order, then add deterministic per-operation coverage."""
-        cases = list(catalog.cases)
-        for endpoint in catalog.endpoints:
-            cases.extend(endpoint.cases)
-        for endpoint in catalog.endpoints:
-            cases.extend(endpoint.generated_cases)
-        for endpoint in catalog.endpoints:
-            from api_agent.tasks.schemas import Case
+        return self.plan(catalog)[0]
 
+    def plan(self, catalog):
+        """Record operation membership without changing the established execution order."""
+        from api_agent.tasks.schemas import Case
+
+        cases = list(catalog.cases)
+        memberships = [[] for _ in catalog.endpoints]
+        for field in ("cases", "generated_cases"):
+            for endpoint, indices in zip(catalog.endpoints, memberships, strict=True):
+                supplied = getattr(endpoint, field)
+                indices.extend(range(len(cases), len(cases) + len(supplied)))
+                source = "generated" if field == "generated_cases" else "document"
+                kind = "test" if field == "generated_cases" else "document"
+                cases.extend(
+                    case.model_copy(update={"source": source, "kind": case.kind or kind})
+                    for case in supplied
+                )
+        operations = []
+        for endpoint, indices in zip(catalog.endpoints, memberships, strict=True):
+            example_index = len(cases)
+            indices.append(example_index)
+            operations.append(
+                {
+                    "path": endpoint.path_template or endpoint.path.split("?", 1)[0],
+                    "example_index": example_index,
+                    "case_indices": indices,
+                }
+            )
             cases.append(
                 Case.model_validate(
                     {
-                        **{
-                            key: value
-                            for key, value in endpoint.model_dump(
-                                exclude={"cases", "generated_cases"}
-                            ).items()
-                            if key in Case.model_fields
-                        },
+                        **endpoint.model_dump(include=set(Case.model_fields)),
                         "source": "generated",
+                        "kind": "contract",
                     }
                 )
             )
         if len(cases) > 200:
             raise ValueError("case_limit_exceeded")
-        return cases
+        return cases, operations
 
 
 def _boundary_cases(operation, path, method, protocol, root, query, path_template):
@@ -221,6 +284,7 @@ def _boundary_cases(operation, path, method, protocol, root, query, path_templat
         "protocol": protocol,
         "assertions": [],
         "source": "generated",
+        "kind": "contract",
     }
     generated = []
     path_parameters = {

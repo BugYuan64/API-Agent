@@ -19,7 +19,7 @@
  * 收进组件后，样式与行为绑定、冒泡由组件保证，调用方只需决定是否传回调。
  */
 import { ref } from 'vue'
-import { Trash2 } from 'lucide-vue-next'
+import { Plus, Trash2 } from 'lucide-vue-next'
 
 /** 共享历史展示条目；source 用于父级分派，raw 仅供插槽访问，列表不感知领域数据结构。 */
 export interface HistoryEntry {
@@ -53,6 +53,7 @@ const props = withDefaults(
     clearLabel?: string
     /** 列表非空但正在删除时置灰清空按钮，避免重复点击。 */
     clearDisabled?: boolean
+    onNewTest?: (() => void) | null
   }>(),
   { activeId: null, onDelete: null, onClear: null, clearLabel: '清空全部历史', clearDisabled: false },
 )
@@ -84,6 +85,9 @@ function requestClear(): void {
     <div class="history-head">
       <span class="history-title">{{ title }}</span>
       <span class="history-count">{{ items.length }}</span>
+      <button v-if="onNewTest" type="button" class="btn btn-sm history-new" @click="onNewTest()">
+        <Plus :size="13" aria-hidden="true" /> 新建测试
+      </button>
       <button
         v-if="onClear"
         type="button"
@@ -125,7 +129,7 @@ function requestClear(): void {
           <slot name="actions" :item="item" />
         </div>
         <div class="history-line history-sub">
-          <span class="tag" :class="`tag-${item.tone}`">{{ item.status }}</span>
+          <span class="tag status-dot" :class="`tag-${item.tone}`">{{ item.status }}</span>
           <span class="history-meta">{{ item.meta }}</span>
         </div>
       </button>
@@ -141,31 +145,37 @@ function requestClear(): void {
   height: 100%;
   min-height: 0;
   border-right: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
+  background: var(--bg-rail);
 }
 
 .history-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 8px;
-  padding: 12px 12px 8px 14px;
+  padding: 11px 9px 10px 14px;
   flex: none;
 }
 
 .history-title {
-  font-size: 10.5px;
+  font-size: 12px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 .history-count {
+  min-width: 20px;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  text-align: center;
   font-size: 10.5px;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
 }
+
+.history-head > .btn:first-of-type { margin-left: auto; }
+.history-new { white-space: nowrap; }
 
 .history-list {
   flex: 1;
@@ -194,8 +204,8 @@ function requestClear(): void {
 }
 
 .history-item-active {
-  background: var(--accent-soft);
-  border-color: var(--accent-border);
+  background: var(--bg-active);
+  border-color: var(--border-subtle);
 }
 
 /* 每条记录两行：首行“方法 + 目标”，次行“状态 + 时间”。
@@ -226,7 +236,10 @@ function requestClear(): void {
 }
 
 .history-empty {
-  padding: 22px 12px;
+  margin: 2px 6px;
+  padding: 12px;
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
   line-height: 1.7;
 }
 

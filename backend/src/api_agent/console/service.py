@@ -8,6 +8,7 @@ from typing import Literal
 import httpx
 from pydantic import Field, field_validator, model_validator
 
+from api_agent.console.sse import SseProgress
 from api_agent.infrastructure.api import ApiInput
 from api_agent.infrastructure.config import Settings
 from api_agent.infrastructure.http import (
@@ -118,6 +119,7 @@ class ConsoleResult(ApiInput, OutcomeFields):
     """
 
     ok: bool
+    history_id: str | None = None
     request: dict
     response: ConsoleResponse | None = None
     error_kind: str | None = None
@@ -142,7 +144,9 @@ def build_url(parsed) -> str:
     )
 
 
-async def _send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
+async def _send(
+    settings: Settings, payload: ConsoleRequest, on_sse: SseProgress | None
+) -> ConsoleResult:
     """发出一次受控 HTTP 请求并返回结构化结果。
 
     作用：这是界面“发送”按钮的实现，也是本项目里第一条由用户界面触发真实请求的路径，
@@ -169,6 +173,7 @@ async def _send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
 
     started = time.monotonic()
     request_summary = {"method": payload.method, "url": url, "at": None}
+    sse_options = (payload.sse_max_events, min(payload.sse_duration_ms, payload.timeout_ms // 2))
     try:
         # 所有跳转及完整正文共享挂钟预算，不能靠持续小片数据重置读超时。
         async with (
@@ -184,10 +189,9 @@ async def _send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
                 client,
                 request,
                 settings.response_max_bytes,
-                sse_options=(
-                    payload.sse_max_events,
-                    min(payload.sse_duration_ms, payload.timeout_ms // 2),
-                ),
+                sse_options=sse_options,
+                on_sse=on_sse,
+                follow_redirects=payload.follow_redirects,
             )
             history = []
             hops: list[RedirectHop] = []
@@ -226,10 +230,9 @@ async def _send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
                     client,
                     next_request,
                     settings.response_max_bytes,
-                    sse_options=(
-                        payload.sse_max_events,
-                        min(payload.sse_duration_ms, payload.timeout_ms // 2),
-                    ),
+                    sse_options=sse_options,
+                    on_sse=on_sse,
+                    follow_redirects=True,
                 )
                 _origin = next_origin
             response.history = history
@@ -307,11 +310,15 @@ class HttpTestClient:
         """Keep local target and response budgets; do not open connections."""
         self.settings = settings
 
-    async def execute(self, payload: ConsoleRequest) -> ConsoleResult:
-        """Execute a validated request and return bounded transport evidence."""
-        return await _send(self.settings, payload)
+    async def execute(
+        self, payload: ConsoleRequest, *, on_sse: SseProgress | None = None
+    ) -> ConsoleResult:
+        """Return bounded transport evidence, optionally reporting SSE progress while reading."""
+        return await _send(self.settings, payload, on_sse)
 
 
-async def send(settings: Settings, payload: ConsoleRequest) -> ConsoleResult:
+async def send(
+    settings: Settings, payload: ConsoleRequest, *, on_sse: SseProgress | None = None
+) -> ConsoleResult:
     """Compatibility entry for existing console callers, sharing the execution class."""
-    return await HttpTestClient(settings).execute(payload)
+    return await HttpTestClient(settings).execute(payload, on_sse=on_sse)

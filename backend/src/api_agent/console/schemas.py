@@ -27,3 +27,9 @@ class ConsoleHistoryResponse(ApiModel, OutcomeFields):
     response_preview: str | None
     response_bytes: int
     created_at: UtcDatetime
+
+
+class ConsoleHistoryDetail(ConsoleHistoryResponse):
+    """Include the replay body only when a single record is opened."""
+
+    request_body: str | None

@@ -11,6 +11,21 @@ const js = ts.transpileModule(source, {
 const api = {}
 new Function('exports', js)(api)
 
+test('case outcomes keep execution errors and unknowns distinct from failed assertions', () => {
+  assert.deepEqual(['passed', 'failed', 'error', 'timed_out', 'skipped', 'unknown'].map(status => api.caseVerdict(status).tone),
+    ['success', 'danger', 'danger', 'warning', 'warning', 'neutral'])
+  assert.notEqual(api.caseVerdict('failed').label, api.caseVerdict('error').label)
+  assert.deepEqual(api.countCaseOutcomes([{status: 'passed'}, {status: 'failed'}, {status: 'skipped'}, {status: 'future_status'}])
+    .filter(({ count }) => count > 0).map(({ label, count }) => [label, count]),
+    [['通过', 1], ['未通过', 1], ['已跳过', 1], ['未评估', 1]])
+})
+
+test('workflow completion is informational, not a passing verdict', () => {
+  assert.equal(api.taskProgress('completed').tone, 'info')
+  assert.equal(api.taskProgress('timed_out').tone, 'warning')
+  assert.equal(api.taskProgress('future_status').tone, 'neutral')
+})
+
 test('a local target timeout has its own 504 label without inventing target HTTP', () => {
   const shown = api.presentResult({ status: 'timed_out', error_kind: 'request_timeout',
     result_code: 'REQUEST_TIMEOUT', result_status: 504 })

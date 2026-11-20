@@ -1,6 +1,11 @@
+import asyncio
+import json
 from datetime import timedelta
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from support.local_server import LocalServer
 
 from api_agent.infrastructure.orm import as_utc, utc_now
@@ -19,6 +24,76 @@ async def target():
         yield server
     finally:
         await server.stop()
+
+
+async def test_live_console_delivers_events_before_target_finishes_and_saves_history(app, client):
+    upstream = FastAPI()
+    proceed = asyncio.Event()
+    closed = asyncio.Event()
+
+    @upstream.post("/sse")
+    async def stream():
+        async def events():
+            yield b": comment\r\n\r\ndata: first\r"
+            yield b"\n\r"
+            await proceed.wait()
+            yield "\ndata: 中文\ndata: next\n\n".encode()
+            closed.set()
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    target_server = await LocalServer(upstream).start()
+    management = LocalServer(app)
+    try:
+        await management.start()
+        async with (
+            httpx.AsyncClient(base_url=management.base_url, trust_env=False) as browser,
+            browser.stream(
+                "POST",
+                "/api/console/requests/live",
+                json={"url": target_server.base_url + "/sse", "method": "POST"},
+            ) as response,
+        ):
+            assert response.status_code == 200
+            assert response.headers["content-type"] == "application/x-ndjson"
+            lines = response.aiter_lines()
+            assert json.loads(await anext(lines)) == {"type": "sse_start"}
+            first = json.loads(await anext(lines))
+            assert first == {"type": "sse_event", "event": {"event": "message", "data": "first"}}
+            assert not closed.is_set()
+            assert (await client.get("/api/console/history")).json()["items"] == []
+            proceed.set()
+            second = json.loads(await anext(lines))
+            assert second["event"]["data"] == "中文\nnext"
+            final = json.loads(await anext(lines))
+            assert final["type"] == "result"
+            assert final["result"]["response"]["sse"] == {
+                "events": [first["event"], second["event"]],
+                "stop_reason": "target_closed",
+            }
+            assert [line async for line in lines] == []
+        assert len((await client.get("/api/console/history")).json()["items"]) == 1
+    finally:
+        proceed.set()
+        await management.stop()
+        await target_server.stop()
+
+
+async def test_live_console_preserves_target_and_policy_results(client, target):
+    completed = await client.post(
+        "/api/console/requests/live",
+        json={"url": target.base_url + "/json"},
+    )
+    assert len(completed.text.splitlines()) == 1
+    assert completed.json()["result"]["response"]["status"] == 200
+    rejected = await client.post(
+        "/api/console/requests/live",
+        json={"url": "http://localhost:8010/health"},
+    )
+    assert rejected.json()["type"] == "error"
+    assert rejected.json()["status"] == 400
+    assert rejected.json()["error"]["code"] == "target_not_loopback"
+    assert len((await client.get("/api/console/history")).json()["items"]) == 1
 
 
 async def test_console_returns_response_body_headers_and_history(client, target):
@@ -41,6 +116,7 @@ async def test_console_returns_response_body_headers_and_history(client, target)
     assert response.status_code == 200, response.text
     payload = response.json()
     assert payload["ok"] is True
+    assert payload["history_id"]
     assert payload["response"]["status"] == 200
     assert payload["response"]["body_bytes"] > 0
     echoed = __import__("json").loads(payload["response"]["body"])
@@ -51,6 +127,7 @@ async def test_console_returns_response_body_headers_and_history(client, target)
     history = await client.get("/api/console/history")
     assert history.status_code == 200
     items = history.json()["items"]
+    assert items[0]["id"] == payload["history_id"]
     stored = {name.lower(): value for name, value in items[0]["request_headers"].items()}
     assert stored["authorization"] == "[redacted]"
     assert stored["x-trace"] == "trace-1"

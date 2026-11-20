@@ -211,9 +211,10 @@ class LocalServer:
     ``stop`` 置 ``should_exit`` 并等待服务任务结束。
     """
 
-    def __init__(self):
+    def __init__(self, app: FastAPI | None = None):
         """初始化内部引用（未启动状态）。"""
         self.server: uvicorn.Server | None = None
+        self.app = app if app is not None else build_app()
         self.task: asyncio.Task | None = None
         self.base_url = ""
         self.ws_url = ""
@@ -225,7 +226,7 @@ class LocalServer:
         超时后抛出明确错误，避免测试挂死。
         """
         config = uvicorn.Config(
-            build_app(), host="127.0.0.1", port=0, log_level="error", lifespan="off"
+            self.app, host="127.0.0.1", port=0, log_level="error", lifespan="off"
         )
         self.server = uvicorn.Server(config)
         self.task = asyncio.create_task(self.server.serve(), name="fixture-server")

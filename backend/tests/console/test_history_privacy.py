@@ -64,6 +64,9 @@ async def test_history_learns_complete_bodies_before_cleaning_and_truncating(
         "session=synthetic-cookie-private; Path=/"
     ]
     history = (await client.get("/api/console/history")).json()["items"][0]
+    detail = (await client.get(f"/api/console/history/{history['id']}")).json()
+    assert "request_body" not in history
+    assert len(detail["request_body"]) > 9000
     async with app.state.database.session() as session:
         stored = await session.get(ConsoleRequestRecord, history["id"])
         persisted = {
@@ -72,11 +75,12 @@ async def test_history_learns_complete_bodies_before_cleaning_and_truncating(
                 "url",
                 "request_headers",
                 "body_preview",
+                "request_body",
                 "response_headers",
                 "response_preview",
             )
         }
-    for boundary in (history, persisted):
+    for boundary in (history, detail, persisted):
         serialized = json.dumps(boundary)
         for secret in (
             password,

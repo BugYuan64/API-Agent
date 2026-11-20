@@ -1,6 +1,6 @@
 """Input and response contracts for long-connection test sessions."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
 
@@ -19,7 +19,9 @@ class StreamStart(ApiInput):
     max_duration_ms: int = Field(default=60_000, ge=1000, le=900_000)
     connect_timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
     ping_interval_ms: int = Field(default=20_000, ge=0, le=300_000)
-    send: list[str] = Field(default_factory=list, max_length=20)
+    send: list[Annotated[str, Field(max_length=65_536)]] = Field(
+        default_factory=list, max_length=20
+    )
     send_interval_ms: int = Field(default=500, ge=0, le=60_000)
     project_id: str | None = None
 
@@ -68,7 +70,7 @@ class StreamSessionResponse(ApiModel, OutcomeFields):
     """
 
     id: str
-    kind: Literal["websocket"]
+    kind: Literal["websocket", "sse"]
     url: str
     status: str
     finished: bool
@@ -157,3 +159,12 @@ class StreamHistoryResponse(ApiModel, OutcomeFields):
     opened_at: UtcDatetime | None
     closed_at: UtcDatetime | None
     created_at: UtcDatetime
+
+
+class StreamReplayInputs(ApiModel):
+    """Saved startup parameters for a single WebSocket session."""
+
+    url: str
+    request_headers: dict
+    subprotocols: list[str]
+    scheduled_messages: list[str] | None

@@ -14,9 +14,11 @@ import {
   ServerOff,
 } from 'lucide-vue-next'
 import CopyButton from '@/components/CopyButton.vue'
-import ResizableSplit from '@/components/ResizableSplit.vue'
+import ResponseDetails from '@/components/ResponseDetails.vue'
+import TaskChat from '@/components/TaskChat.vue'
 import HistoryList, { type HistoryEntry } from '@/components/HistoryList.vue'
 import TestWorkspace from '@/components/TestWorkspace.vue'
+import UrlPrefixPicker from '@/components/UrlPrefixPicker.vue'
 import { useHeaderRows } from '@/composables/useHeaderRows'
 import EmptyState from '@/components/EmptyState.vue'
 import { describeError } from '@/api/client'
@@ -24,6 +26,7 @@ import {
   deleteStream,
   listStreams,
   readStream,
+  readStreamInputs,
   sendStreamMessage,
   startStream,
   stopStream,
@@ -39,37 +42,33 @@ import {
 } from '@/lib/format'
 import { useToastStore } from '@/stores/toasts'
 import { presentResult, resultCodeLabel } from '@/lib/results'
+import { webSocketSettings } from '@/lib/testSettings'
+import TestSettingsFields from '@/components/TestSettingsFields.vue'
+import { joinTargetUrl, urlSuffix } from '@/lib/urlPrefixes'
+import { attachChatToExecution, isChatOnly, listChatHistories, removeChatHistory, type ChatHistoryRecord } from '@/lib/chatHistory'
 
-/** 长连接表单仅配置 WebSocket 握手、消息和会话上限。 */
+/** 连接地址、子协议和待发消息随当前表单编辑。 */
 const form = reactive({
   url: 'ws://127.0.0.1:8010/ws',
   subprotocols: '',
-  maxEvents: 200,
-  maxDurationMs: 60_000,
-  connectTimeoutMs: 10_000,
-  pingIntervalMs: 20_000,
   scheduled: '',
-  sendIntervalMs: 500,
 })
 
-/** 连接配置区宽度：内层分栏（配置|时间线）的受控尺寸。 */
-const configWidth = ref(320)
-try {
-  const saved = Number(window.localStorage.getItem('api-agent.layout.long-connection.config'))
-  if (Number.isFinite(saved) && saved > 0) configWidth.value = saved
-} catch {
-  // 存储不可用时保持默认宽度。
-}
+const urlPrefix = ref('')
 
 const session = ref<StreamSession | null>(null)
 const events = ref<StreamEvent[]>([])
 const cursor = ref(0)
 const connecting = ref(false)
+const restoringHistory = ref(false)
 const stopping = ref(false)
 const outgoing = ref('')
 const sendingMessage = ref(false)
 const history = ref<{ id: string; kind: string; url: string; status: string; stop_reason: string | null; event_count: number; created_at: string }[]>([])
 const activeHistoryId = ref<string | null>(null)
+const chatDraftKey = ref(`draft-${Date.now()}`)
+const chatting = ref(false)
+const chatOnlyHistory = ref<ChatHistoryRecord[]>(listChatHistories('websocket'))
 const filter = ref<'all' | 'in' | 'out'>('all')
 const autoScroll = ref(true)
 const logRef = ref<HTMLElement | null>(null)
@@ -77,6 +76,8 @@ const logRef = ref<HTMLElement | null>(null)
 // 一个可取消的长轮询循环：同一个 Session 只允许存在一条轮询链。
 let pollAbort: AbortController | null = null
 let pollTimer: number | undefined
+let replayGeneration = 0
+let workspaceGeneration = 0
 
 /** 按会话是否存在及 finished 判断仍可操作的会话；不以事件数量推断连接状态。 */
 const isLive = computed(
@@ -128,44 +129,60 @@ const {
 
 /** 把多行文本框拆成待发消息列表：空行忽略，但保留行内空格。 */
 const scheduledMessages = computed(() =>
-  form.scheduled.split('\n').filter((line) => line.trim().length > 0),
+  form.scheduled.split(/\r?\n/).filter((line) => line.trim().length > 0),
 )
 
-/** 提交当前协议配置并重置本页事件游标，成功后启动管理接口长轮询与刷新历史；空地址拦截，失败提示并解除 connecting。 */
+/** Keep the endpoint suffix while changing the base URL. */
+function selectUrlPrefix(prefix: string) {
+  form.url = prefix ? urlSuffix(form.url, prefix, urlPrefix.value) : joinTargetUrl(urlPrefix.value, form.url) || form.url
+  urlPrefix.value = prefix
+}
+
+/** 重置事件游标并用当前全局设置启动新会话，成功后开始长轮询并刷新历史。 */
 async function start() {
-  if (!form.url.trim()) {
-    useToastStore().push('warning', '请先填写长连接地址')
+  if (connecting.value || restoringHistory.value || isLive.value) return
+  const url = joinTargetUrl(urlPrefix.value, form.url)
+  if (!url) {
+    useToastStore().push('warning', urlPrefix.value ? '请填写有效的 URL 后缀' : '请先填写长连接地址')
     return
   }
   stopPolling()
+  const sourceChatId = activeHistoryId.value && isChatOnly(activeHistoryId.value) ? activeHistoryId.value : null
+  replayGeneration++
   connecting.value = true
   events.value = []
   cursor.value = 0
-  activeHistoryId.value = null
+  const generation = workspaceGeneration
   try {
     const created = await startStream({
       kind: 'websocket',
-      url: form.url.trim(),
+      url,
       headers: activeHeaders.value,
       subprotocols: form.subprotocols
         .split(',')
         .map((item) => item.trim())
         .filter(Boolean),
-      max_events: form.maxEvents,
-      max_duration_ms: form.maxDurationMs,
-      connect_timeout_ms: form.connectTimeoutMs,
-      ping_interval_ms: form.pingIntervalMs,
+      max_events: webSocketSettings.maxEvents,
+      max_duration_ms: webSocketSettings.maxDurationMs,
+      connect_timeout_ms: webSocketSettings.connectTimeoutMs,
+      ping_interval_ms: webSocketSettings.pingIntervalMs,
       send: scheduledMessages.value,
-      send_interval_ms: form.sendIntervalMs,
+      send_interval_ms: webSocketSettings.sendIntervalMs,
       project_id: null,
     })
-    session.value = created
-    startPolling(created.id)
+    if (generation === workspaceGeneration) {
+      session.value = created
+      if (sourceChatId) attachChatToExecution('websocket', sourceChatId, created.id)
+      activeHistoryId.value = created.id
+      chatOnlyHistory.value = listChatHistories('websocket')
+      chatDraftKey.value = created.id
+      startPolling(created.id)
+    }
     await loadHistory()
   } catch (error) {
-    useToastStore().push('danger', '长连接未启动', describeError(error))
+    if (generation === workspaceGeneration) useToastStore().push('danger', '长连接未启动', describeError(error))
   } finally {
-    connecting.value = false
+    if (generation === workspaceGeneration) connecting.value = false
   }
 }
 
@@ -175,9 +192,11 @@ function startPolling(sessionId: string) {
   /** 读取指定会话游标后的事件并追加到时间线；会话终止时刷新历史，中止或读取失败退出，否则延迟继续读取。 */
   const step = async () => {
     if (!session.value || session.value.id !== sessionId || session.value.finished) return
-    pollAbort = new AbortController()
+    const controller = new AbortController()
+    pollAbort = controller
     try {
-      const page = await readStream(sessionId, cursor.value, 1200, pollAbort.signal)
+      const page = await readStream(sessionId, cursor.value, 1200, controller.signal)
+      if (controller.signal.aborted) return
       session.value = page.session
       if (page.events.length) {
         events.value.push(...page.events)
@@ -189,7 +208,7 @@ function startPolling(sessionId: string) {
       }
     } catch (error) {
       // 主动中止（停止/重连）不算错误，静默退出循环。
-      if (pollAbort?.signal.aborted) return
+      if (controller.signal.aborted) return
       useToastStore().push('warning', '读取会话失败', describeError(error))
       return
     }
@@ -208,45 +227,68 @@ function stopPolling() {
 /** 请求服务端结束当前会话，成功后停轮询、刷新历史并展示结束原因；失败提示并始终解除 stopping。 */
 async function stop() {
   if (!session.value) return
+  const id = session.value.id
+  const generation = workspaceGeneration
   stopping.value = true
   try {
-    const stopped = await stopStream(session.value.id)
-    session.value = stopped
-    stopPolling()
+    const stopped = await stopStream(id)
+    if (generation === workspaceGeneration && session.value?.id === id) {
+      session.value = stopped
+      stopPolling()
+    }
     await loadHistory()
+    if (generation !== workspaceGeneration) return
     useToastStore().push('info', '已停止会话', `结束原因：${describeStopReason(stopped.stop_reason)}`)
   } catch (error) {
-    useToastStore().push('danger', '停止失败', describeError(error))
+    if (generation === workspaceGeneration) useToastStore().push('danger', '停止失败', describeError(error))
   } finally {
-    stopping.value = false
+    if (generation === workspaceGeneration) stopping.value = false
   }
 }
 
 /** 将非空输入作为消息发送到当前会话并更新摘要；成功后清空输入，失败保留输入并提示，始终解除发送态。 */
 async function sendMessage() {
   if (!session.value || !outgoing.value.trim()) return
+  const id = session.value.id
+  const generation = workspaceGeneration
   sendingMessage.value = true
   try {
-    session.value = await sendStreamMessage(session.value.id, outgoing.value)
-    outgoing.value = ''
+    const updated = await sendStreamMessage(id, outgoing.value)
+    if (generation === workspaceGeneration && session.value?.id === id) {
+      session.value = updated
+      outgoing.value = ''
+    }
   } catch (error) {
-    useToastStore().push('danger', '发送失败', describeError(error))
+    if (generation === workspaceGeneration) useToastStore().push('danger', '发送失败', describeError(error))
   } finally {
-    sendingMessage.value = false
+    if (generation === workspaceGeneration) sendingMessage.value = false
   }
 }
 
 /** 回放指定历史的事件并更新会话摘要；会话结束与事件读尽独立判断，最多读取 40 页或遇空页停止，失败提示并保留已读事件。 */
 async function replay(record: (typeof history.value)[number]) {
+  if (connecting.value) return
   stopPolling()
+  const generation = ++replayGeneration
   activeHistoryId.value = record.id
+  chatDraftKey.value = record.id
   events.value = []
   cursor.value = 0
+  restoringHistory.value = true
   try {
+    const inputs = await readStreamInputs(record.id)
+    if (generation !== replayGeneration) return
+    urlPrefix.value = ''
+    form.url = inputs.url
+    form.subprotocols = inputs.subprotocols.join(', ')
+    form.scheduled = inputs.scheduled_messages?.join('\n') ?? ''
+    headerRows.value = Object.entries(inputs.request_headers).map(([name, value]) => ({ name, value }))
+    if (!headerRows.value.length) headerRows.value = [{ name: '', value: '' }]
     let hasMore = true
     let guard = 0
     while (hasMore && guard < 40) {
       const page = await readStream(record.id, cursor.value, 0)
+      if (generation !== replayGeneration) return
       session.value = page.session
       if (page.events.length) {
         events.value.push(...page.events)
@@ -256,10 +298,63 @@ async function replay(record: (typeof history.value)[number]) {
       guard += 1
       if (!page.events.length) break
     }
-    useToastStore().push('info', '已回放历史会话', '数据来自数据库，含当时落库的全部事件')
+    if (session.value && !session.value.finished) startPolling(record.id)
+    useToastStore().push('info', '已回填历史连接', inputs.scheduled_messages === null
+      ? '这条旧记录未保存自动发送的消息，可手动补填后重新连接。'
+      : '请确认参数后重新连接，已脱敏的凭据需重新填写。')
   } catch (error) {
-    useToastStore().push('danger', '回放失败', describeError(error))
+    if (generation === replayGeneration) useToastStore().push('danger', '回放失败', describeError(error))
+  } finally {
+    if (generation === replayGeneration) restoringHistory.value = false
   }
+}
+
+/** Clear local events while retaining the live cursor so future frames can still arrive. */
+function clearTimeline() {
+  replayGeneration++
+  restoringHistory.value = false
+  events.value = []
+  activeHistoryId.value = null
+  if (session.value?.finished) session.value = null
+}
+
+/** Read the session independently of the visible timeline and its direction filter. */
+async function loadResponseDetails(signal: AbortSignal) {
+  const id = session.value?.id
+  if (!id) throw new Error('当前没有连接记录。')
+  const inputs = await readStreamInputs(id, signal)
+  const recordedEvents: StreamEvent[] = []
+  let page = await readStream(id, 0, 0, signal)
+  recordedEvents.push(...page.events)
+  while (page.has_more) {
+    if (!page.events.length) throw new Error('连接详情的事件分页未能读完。')
+    page = await readStream(id, page.next_cursor, 0, signal)
+    recordedEvents.push(...page.events)
+  }
+  return {
+    request: inputs,
+    response: { session: page.session, events: recordedEvents },
+  }
+}
+
+/** Reset the editor and detach from the old timeline, which remains in history. */
+function newTest() {
+  workspaceGeneration++
+  stopPolling()
+  clearTimeline()
+  chatOnlyHistory.value = listChatHistories('websocket')
+  chatDraftKey.value = `draft-${Date.now()}`
+  session.value = null
+  cursor.value = 0
+  connecting.value = false
+  stopping.value = false
+  sendingMessage.value = false
+  outgoing.value = ''
+  filter.value = 'all'
+  autoScroll.value = true
+  urlPrefix.value = ''
+  Object.assign(form, { url: '', subprotocols: '', scheduled: '' })
+  headerRows.value = [{ name: '', value: '' }]
 }
 
 /** 读取最近长连接会话供回放；管理请求失败时回退空列表，不影响当前连接。 */
@@ -267,6 +362,7 @@ async function loadHistory() {
   try {
     const page = await listStreams(20)
     history.value = page.items.filter(item => item.kind === 'websocket')
+    chatOnlyHistory.value = listChatHistories('websocket')
   } catch {
     history.value = []
   }
@@ -283,6 +379,8 @@ async function removeHistory(record: (typeof history.value)[number]) {
   try {
     await deleteStream(record.id)
     history.value = history.value.filter((item) => item.id !== record.id)
+    removeChatHistory('websocket', record.id)
+    chatOnlyHistory.value = chatOnlyHistory.value.filter(item => item.id !== record.id)
     if (activeHistoryId.value === record.id) {
       activeHistoryId.value = null
       session.value = null
@@ -294,8 +392,43 @@ async function removeHistory(record: (typeof history.value)[number]) {
   }
 }
 
+function createChatHistory(record: ChatHistoryRecord, draftKey: string) {
+  chatOnlyHistory.value = [record, ...chatOnlyHistory.value.filter(item => item.id !== record.id)]
+  if (chatDraftKey.value === draftKey && activeHistoryId.value === null) activeHistoryId.value = record.id
+}
+
+function titleChatHistoryRecord(record: ChatHistoryRecord) {
+  chatOnlyHistory.value = [record, ...chatOnlyHistory.value.filter(item => item.id !== record.id)]
+}
+
+function selectChatHistory(id: string) {
+  const record = chatOnlyHistory.value.find(item => item.id === id)
+  if (!record) return
+  stopPolling()
+  activeHistoryId.value = id
+  chatDraftKey.value = id
+  session.value = null
+  events.value = []
+  cursor.value = 0
+  form.url = ''
+  form.subprotocols = ''
+  form.scheduled = ''
+  urlPrefix.value = ''
+  headerRows.value = [{ name: '', value: '' }]
+}
+
+function deleteChatHistory(id: string) {
+  removeChatHistory('websocket', id)
+  chatOnlyHistory.value = chatOnlyHistory.value.filter(item => item.id !== id)
+  if (activeHistoryId.value === id) newTest()
+}
+
 /** 按共享历史列表提供的 ID 发起删除；记录未加载时忽略。 */
 function removeHistoryById(id: string): void {
+  if (isChatOnly(id) && chatOnlyHistory.value.some(item => item.id === id)) {
+    deleteChatHistory(id)
+    return
+  }
   const target = history.value.find((item) => item.id === id)
   if (target) removeHistory(target)
 }
@@ -325,27 +458,35 @@ function eventBody(event: StreamEvent): string {
 
 /** 把会话记录映射成共享历史列的 WebSocket 条目。 */
 const historyEntries = computed<HistoryEntry[]>(() =>
-  history.value.map((record) => ({
+  [...history.value.map((record) => ({
     id: record.id,
     label: `WS · ${record.url}`,
     status: describeStopReason(record.stop_reason),
     tone: record.status === 'closed' ? 'success' : record.status === 'error' ? 'danger' : 'neutral',
     meta: `${record.event_count} 条 · ${formatRelative(record.created_at)}`,
-  })),
+    at: record.created_at,
+  })), ...chatOnlyHistory.value.filter(chat => chat.id.startsWith('chat-')).map(chat => ({
+    id: chat.id, label: chat.title, status: '仅 AI 对话', tone: 'info', meta: formatRelative(chat.created_at), raw: chat, at: chat.created_at,
+  }))].sort((first, second) => (second.at ?? '').localeCompare(first.at ?? '')),
 )
 
 /** 共享历史列只回传 id。 */
 function replayById(id: string): void {
+  if (isChatOnly(id) && chatOnlyHistory.value.some(item => item.id === id)) {
+    selectChatHistory(id)
+    return
+  }
   const target = history.value.find((item) => item.id === id)
   if (target) replay(target)
 }
 
 onMounted(loadHistory)
-onBeforeUnmount(stopPolling)
+onBeforeUnmount(() => { workspaceGeneration++; replayGeneration++; stopPolling() })
 </script>
 
 <template>
-  <TestWorkspace persist-key="api-agent.layout.long-connection.history" class="lc">
+  <TestWorkspace history-key="api-agent.layout.long-connection.history" editor-key="api-agent.layout.long-connection.config"
+    assistant-key="api-agent.layout.websocket.chat" :editor-width="320">
     <!-- 左：最近会话（独立列，可拖动宽度） -->
     <template #history>
       <HistoryList
@@ -354,39 +495,24 @@ onBeforeUnmount(stopPolling)
         :active-id="activeHistoryId"
         empty-text="还没有会话记录。建立一次连接后会出现在这里。"
         :on-delete="removeHistoryById"
+        :on-new-test="newTest"
         @select="replayById"
-      />
+      >
+      </HistoryList>
     </template>
 
-    <!-- 右：配置 + 时间线 -->
-    <div class="lc-main">
-      <ResizableSplit
-        v-model:size="configWidth"
-        persist-key="api-agent.layout.long-connection.config"
-        :min="280"
-        :min-other="360"
-        label="拖动调整连接配置区与时间线区宽度"
-      >
-        <template #first>
+    <template #editor>
       <aside class="lc-config scroll-y">
       <div class="config-head">
         <h2 class="config-title">WebSocket 调试</h2>
         <p class="config-sub">WebSocket 双向连接调试</p>
       </div>
 
-      <label class="field">
+      <div class="field">
         <span class="field-label">地址</span>
-        <input
-          v-model="form.url"
-          class="input mono"
-          spellcheck="false"
-          placeholder="ws://127.0.0.1:9001/ws"
-          @keydown.enter.exact.prevent="start"
-        />
-        <span class="hint">
-          ws:// 或 wss:// WebSocket 地址
-        </span>
-      </label>
+        <UrlPrefixPicker v-model:address="form.url" :model-value="urlPrefix" websocket label="长连接地址"
+          placeholder="ws://127.0.0.1:9001/ws" @update:model-value="selectUrlPrefix" @submit="start" />
+      </div>
 
       <div class="field">
         <span class="field-label">请求头</span>
@@ -424,35 +550,14 @@ onBeforeUnmount(stopPolling)
         />
       </label>
 
-      <label class="field">
-        <span class="field-label">发送间隔（毫秒）</span>
-        <input v-model.number="form.sendIntervalMs" class="input" type="number" min="0" max="60000" step="50" />
-      </label>
-
-      <div class="grid-2">
-        <label class="field">
-          <span class="field-label">最多事件</span>
-          <input v-model.number="form.maxEvents" class="input" type="number" min="1" max="2000" />
-        </label>
-        <label class="field">
-          <span class="field-label">最长时长（ms）</span>
-          <input v-model.number="form.maxDurationMs" class="input" type="number" min="1000" max="900000" step="1000" />
-        </label>
-      </div>
-
-      <div class="grid-2">
-        <label class="field">
-          <span class="field-label">连接超时（ms）</span>
-          <input v-model.number="form.connectTimeoutMs" class="input" type="number" min="100" max="60000" step="100" />
-        </label>
-        <label class="field">
-          <span class="field-label">心跳间隔（ms）</span>
-          <input v-model.number="form.pingIntervalMs" class="input" type="number" min="0" max="300000" step="1000" />
-        </label>
-      </div>
+      <details class="connection-settings">
+        <summary>设置</summary>
+        <p class="hint">连接限制和发送间隔自动保存在当前浏览器，适用于后续新建连接。</p>
+        <TestSettingsFields group="websocket" />
+      </details>
 
       <div class="actions">
-        <button v-if="!isLive" class="btn btn-accent start-button" :disabled="connecting" @click="start">
+        <button v-if="!isLive" class="btn btn-accent start-button" :disabled="connecting || restoringHistory" @click="start">
           <Loader2 v-if="connecting" :size="14" class="spinning" />
           <Play v-else :size="14" />
           {{ connecting ? '连接中' : '开始连接' }}
@@ -473,7 +578,7 @@ onBeforeUnmount(stopPolling)
 
     </aside>
         </template>
-        <template #second>
+        <template #results>
     <!-- 右：会话与时间线 -->
     <section class="lc-stage">
       <div class="stage-head">
@@ -536,9 +641,13 @@ onBeforeUnmount(stopPolling)
           自动滚动
         </label>
         <CopyButton
+          v-if="events.length"
           :text="events.map((event) => `[${event.sequence}] ${event.direction} ${eventLabel(event)}: ${event.data ?? ''}`).join('\n')"
           label="导出时间线"
         />
+        <ResponseDetails :key="session?.id" :load="loadResponseDetails" :disabled="!session || connecting || restoringHistory"
+          note="包含已记录的握手参数与收发事件。连接进行中时，详情显示打开时已收到的事件。" />
+        <button type="button" class="btn btn-ghost btn-sm" title="清除当前时间线显示" :disabled="!events.length && !session?.finished && !activeHistoryId" @click="clearTimeline">清除</button>
       </div>
 
       <div ref="logRef" class="timeline scroll-y">
@@ -590,32 +699,13 @@ onBeforeUnmount(stopPolling)
       </footer>
       </section>
         </template>
-      </ResizableSplit>
-    </div>
+    <template #assistant>
+      <TaskChat scope="websocket" :conversation-key="activeHistoryId ?? chatDraftKey" @busy="chatting = $event" @history-created="createChatHistory" @history-titled="titleChatHistoryRecord" />
+    </template>
   </TestWorkspace>
 </template>
 
 <style scoped>
-.lc {
-  height: 100%;
-  min-height: 0;
-}
-
-/* 最近会话列：填满左侧插槽，自身滚动 */
-/* 右半：配置栏与时间线并排 */
-.lc-main {
-  display: flex;
-  height: 100%;
-  min-height: 0;
-}
-
-/* 内层分栏是 flex 子项：必须显式撑满，否则会按内容宽度塌缩，
-   导致可用宽度测错、拖动上限被压到几百像素。 */
-.lc-main > .resizable-split {
-  flex: 1;
-  min-width: 0;
-}
-
 /* ---------- 配置栏 ---------- */
 .lc-config {
   height: 100%;
@@ -663,10 +753,12 @@ onBeforeUnmount(stopPolling)
   height: 29px;
 }
 
-.grid-2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 9px;
+.connection-settings summary {
+  cursor: pointer;
+}
+
+.connection-settings .field {
+  margin-top: 8px;
 }
 
 .actions {
@@ -969,16 +1061,4 @@ onBeforeUnmount(stopPolling)
   }
 }
 
-@media (max-width: 1120px) {
-  .lc {
-    flex-direction: column;
-  }
-
-  .lc-config {
-    width: 100%;
-    max-height: 46%;
-    border-right: 0;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-}
 </style>

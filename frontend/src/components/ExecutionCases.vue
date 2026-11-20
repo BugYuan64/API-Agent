@@ -12,7 +12,7 @@
 import { ChevronDown, CircleCheck, CircleX, TriangleAlert } from 'lucide-vue-next'
 import type { CaseResult } from '@/api/types'
 import { describeAssertionKind, formatDuration, statusTone } from '@/lib/format'
-import { assertionVerdict, presentResult, resultCodeLabel } from '@/lib/results'
+import { assertionVerdict, caseVerdict, presentResult, resultCodeLabel } from '@/lib/results'
 
 const props = withDefaults(
   defineProps<{
@@ -47,10 +47,10 @@ function httpTone(status: number | null): string {
     <article
       v-for="item in props.executions"
       :key="item.id"
-      class="case"
-      :class="`case-${item.status}`"
+      class="case outcome-card"
+      :class="`outcome-${caseVerdict(item.status).tone}`"
     >
-      <button type="button" class="case-head" @click="toggle(item.id)">
+      <button type="button" class="case-head" :aria-expanded="expanded === item.id" @click="toggle(item.id)">
         <CircleCheck v-if="item.status === 'passed'" :size="14" class="case-icon ok" />
         <CircleX v-else-if="item.status === 'failed'" :size="14" class="case-icon bad" />
         <TriangleAlert v-else :size="14" class="case-icon unknown" />
@@ -61,7 +61,7 @@ function httpTone(status: number | null): string {
         <span v-if="item.response_time_ms != null" class="case-time">
           {{ formatDuration(item.response_time_ms) }}
         </span>
-        <span class="tag" :class="`tag-${presentResult(item).tone}`">
+        <span class="tag verdict" :class="`tag-${caseVerdict(item.status).tone}`">
           {{ presentResult(item).title }}
           <template v-if="resultCodeLabel(presentResult(item).resultStatus)"> · {{ resultCodeLabel(presentResult(item).resultStatus) }}</template>
         </span>
@@ -104,22 +104,10 @@ function httpTone(status: number | null): string {
 }
 
 .case {
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--surface-gradient);
   box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 
-.case-failed {
-  border-color: var(--danger-border);
-}
-
-.case-error {
-  border-color: var(--warning-border);
-}
-
-.case-timed_out { border-color: var(--warning); }
 .assertion-icon.unknown { color: var(--text-tertiary); }
 
 .case-head {
@@ -149,7 +137,7 @@ function httpTone(status: number | null): string {
 }
 
 .case-icon.unknown {
-  color: var(--warning);
+  color: var(--outcome-ink);
 }
 
 .case-id {

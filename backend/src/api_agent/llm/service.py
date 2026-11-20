@@ -108,6 +108,13 @@ class LLMSettingService:
             has_api_key=has_key,
         )
 
+    async def select_model(self, model: str) -> LLMConfigResponse:
+        """Persist only the model name so the assistant cannot overwrite other settings."""
+        record = await self.get_or_create()
+        record.model = model
+        await self.session.commit()
+        return await self.get_response()
+
     async def update(self, data: LLMConfigUpdate) -> LLMConfigResponse:
         """根据输入更新并提交显式配置，返回脱敏展示；数据库错误向外传播。
 

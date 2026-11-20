@@ -21,6 +21,16 @@ function loadSplit(storage) {
   return exports
 }
 
+function loadWorkspaceLayout() {
+  const source = fs.readFileSync(path.join(__dirname, '../src/lib/workspaceLayout.ts'), 'utf8')
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  })
+  const exports = {}
+  new Function('exports', outputText)(exports)
+  return exports
+}
+
 const memoryStorage = () => {
   const map = new Map()
   return {
@@ -35,7 +45,7 @@ const throwingStorage = () => ({
 })
 
 /** 使用真实Vue计算/观察器，只替换浏览器测量和生命周期，直接执行生产SFC。 */
-function mountSplit(input, storage = memoryStorage()) {
+function mountSplit(input, storage = memoryStorage(), connection = {}) {
   const file = fs.readFileSync(path.join(__dirname, '../src/components/ResizableSplit.vue'), 'utf8')
   const script = file.split('<script setup lang="ts">')[1].split('</script>')[0]
     .replace(/import[^\n]+from[^\n]+\r?\n/g, '')
@@ -43,25 +53,28 @@ function mountSplit(input, storage = memoryStorage()) {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText
   const props = vue.reactive({ direction: 'horizontal', min: 220, minOther: 360, ...input })
-  const mounts = [], cleanup = [], reserved = []
+  const mounts = [], cleanup = []
   const scope = vue.effectScope()
-  let width = 1200
+  let width = 1200, height = 800
   const env = {
     ...vue, ...loadSplit(storage),
     defineProps: () => props, withDefaults: p => p,
-    defineEmits: () => (_, size) => { props.size = size },
+    defineEmits: () => (event, value) => {
+      if (event === 'update:size') props.size = value
+      if (event === 'layout') connection.onLayout?.(value)
+      if (event === 'resize') connection.onResize?.(value)
+    },
     onMounted: fn => mounts.push(fn), onBeforeUnmount: fn => cleanup.push(fn),
-    inject: () => ({ reserve: (...args) => reserved.push(args) }),
     ResizeObserver: class { observe() {} disconnect() {} },
     window: { localStorage: storage },
     document: { body: { classList: { remove() {} } } },
   }
-  const api = scope.run(() => new Function(...Object.keys(env), `${js};return {root,currentSize,readAvailable,emitSize,secondSize}`)(...Object.values(env)))
-  api.root.value = { getBoundingClientRect: () => ({ width, height: 800 }) }
+  const api = scope.run(() => new Function(...Object.keys(env), `${js};return {root,currentSize,readAvailable,emitSize,keydown}`)(...Object.values(env)))
+  api.root.value = { getBoundingClientRect: () => ({ width, height }) }
   mounts.forEach(fn => fn())
   return {
-    ...api, props, reserved, storage,
-    resize: async value => { width = value; api.readAvailable(); await vue.nextTick() },
+    ...api, props, storage,
+    resize: async (value, nextHeight = height) => { width = value; height = nextHeight; api.readAvailable(); await vue.nextTick() },
     dispose: () => { cleanup.forEach(fn => fn()); scope.stop() },
   }
 }
@@ -71,25 +84,87 @@ test('temporary viewport compression preserves saved widths and restores the his
   pane.storage.setItem('history', '278')
   await pane.resize(418)
   assert.equal(pane.currentSize.value, 102)
+  assert.equal(pane.props.size, 278)
   assert.equal(pane.storage.getItem('history'), '278')
   await pane.resize(1368)
   assert.equal(pane.currentSize.value, 278)
   pane.dispose()
 })
 
-test('hidden measurements cannot corrupt a mode result preference or its workspace reservation', async () => {
-  const pane = mountSplit({ size: 460, min: 320, minOther: 300, workspacePane: 'manual', persistKey: 'editor' })
-  await vue.nextTick()
-  assert.equal(pane.secondSize.value, 740)
-  assert.deepEqual(pane.reserved.at(-1), ['manual', 1060, 620])
-  await pane.resize(0)
-  assert.equal(pane.secondSize.value, 740)
-  await pane.resize(250)
-  assert.equal(pane.currentSize.value, 129)
-  assert.equal(pane.storage.getItem('editor.second'), '740')
-  await pane.resize(1200)
-  assert.equal(pane.currentSize.value, 460)
-  pane.dispose()
+function mountWorkspace() {
+  const file = fs.readFileSync(path.join(__dirname, '../src/components/TestWorkspace.vue'), 'utf8')
+  const script = file.split('<script setup lang="ts">')[1].split('</script>')[0]
+    .replace(/import[^\n]+from[^\n]+\r?\n/g, '')
+  const { outputText } = ts.transpileModule(script, { compilerOptions: { target: ts.ScriptTarget.ES2022 } })
+  const storage = memoryStorage()
+  const layout = loadWorkspaceLayout()
+  const mounts = [], cleanup = []
+  const scope = vue.effectScope()
+  let width = 850
+  let notifyResize
+  const env = {
+    ...vue, ...loadSplit(storage), ...layout, bounds: layout.WORKSPACE_LAYOUT_BOUNDS,
+    defineProps: () => ({ historyKey: 'history', editorKey: 'editor', editorWidth: 335 }),
+    withDefaults: (props, defaults) => ({ ...defaults, ...props }),
+    onMounted: fn => mounts.push(fn), onBeforeUnmount: fn => cleanup.push(fn),
+    ResizeObserver: class { constructor(callback) { notifyResize = callback } observe() {} disconnect() {} },
+  }
+  storage.setItem('history', '205')
+  storage.setItem('editor', '325')
+  storage.setItem('editor.second', '320')
+  const api = scope.run(() => new Function(...Object.keys(env), `${outputText};return {root,widths,historyRange,editorRange,resizeNeighbor}`)(...Object.values(env)))
+  api.root.value = { getBoundingClientRect: () => ({ width }) }
+  mounts.forEach(fn => fn())
+  return {
+    ...api, storage,
+    resize: value => { width = value; notifyResize() },
+    dispose: () => { cleanup.forEach(fn => fn()); scope.stop() },
+  }
+}
+
+test('the shared workspace redistributes width without persisting temporary sizes and adjusts adjacent panes on drag', () => {
+  const workspace = mountWorkspace()
+  try {
+    assert.deepEqual(workspace.widths.value, { history: 205, editor: 325, results: 320 })
+    workspace.resize(840)
+    assert.deepEqual(workspace.widths.value, { history: 200, editor: 320, results: 320 })
+    workspace.resize(420)
+    assert.deepEqual(workspace.widths.value, { history: 100, editor: 160, results: 160 })
+    workspace.resize(0)
+    workspace.resize(1300)
+    assert.deepEqual(workspace.widths.value, { history: 200, editor: 720, results: 380 })
+    assert.equal(workspace.storage.getItem('history'), '205')
+    assert.equal(workspace.storage.getItem('editor'), '325')
+    assert.equal(workspace.storage.getItem('editor.second'), '320')
+
+    workspace.resizeNeighbor('editor', 660)
+    assert.deepEqual(workspace.widths.value, { history: 200, editor: 660, results: 440 })
+    workspace.resizeNeighbor('history', 240)
+    assert.deepEqual(workspace.widths.value, { history: 240, editor: 620, results: 440 })
+    assert.equal(workspace.storage.getItem('history'), '240')
+    assert.equal(workspace.storage.getItem('editor'), '620')
+    assert.equal(workspace.storage.getItem('editor.second'), '440')
+  } finally {
+    workspace.dispose()
+  }
+})
+
+test('a drag-only reservation limits the outer divider without resizing it as the inner divider moves', async () => {
+  const changes = []
+  const pane = mountSplit({ size: 236, min: 175, minOther: 510, fitOther: 510, resizeMinOther: 920 },
+    undefined, { onResize: change => changes.push(change) })
+  try {
+    pane.emitSize(400)
+    assert.equal(pane.currentSize.value, 280)
+    assert.deepEqual(changes, [{ delta: 44, remaining: 920 }])
+
+    pane.props.resizeMinOther = 970
+    await vue.nextTick()
+    assert.equal(pane.currentSize.value, 280)
+    assert.equal(changes.length, 1)
+  } finally {
+    pane.dispose()
+  }
 })
 
 test('a drag past the lower threshold stops at the minimum', () => {
@@ -121,52 +196,53 @@ test('unmeasured container applies only min/max, not the other-pane limit', () =
   assert.equal(clampSize({ size: 500, min: 220, minOther: 360, available: 0 }), 500)
 })
 
-test('moving history exchanges width with the editor while preserving the result', () => {
-  const { clampSize } = loadSplit(memoryStorage())
-  // 总宽1200，初始历史268/编辑460/结果472；历史向右移动100。
-  const history = clampSize({ size: 368, min: 200, minOther: 320 + 472, available: 1200 })
-  const editor = clampSize({ size: 460, second: 472, min: 320, minOther: 300, available: 1200 - history })
-  assert.equal(history, 368)
-  assert.equal(editor, 360)
-  assert.equal(1200 - history - editor, 472)
+test('changing workspace width transfers space to editor, results, then history in either direction', () => {
+  const { allocateWorkspaceWidth } = loadWorkspaceLayout()
+  const initial = { history: 260, editor: 600, results: 640 }
+  assert.deepEqual(allocateWorkspaceWidth(1600, initial), { history: 260, editor: 700, results: 640 })
+  assert.deepEqual(allocateWorkspaceWidth(1660, initial), { history: 260, editor: 720, results: 680 })
+  assert.deepEqual(allocateWorkspaceWidth(1720, initial), { history: 280, editor: 720, results: 720 })
+  assert.deepEqual(allocateWorkspaceWidth(1400, initial), { history: 260, editor: 500, results: 640 })
+  assert.deepEqual(allocateWorkspaceWidth(1200, initial), { history: 260, editor: 320, results: 620 })
+  assert.deepEqual(allocateWorkspaceWidth(870, initial), { history: 230, editor: 320, results: 320 })
+  const expanded = allocateWorkspaceWidth(1660, initial)
+  assert.deepEqual(allocateWorkspaceWidth(1500, expanded), { history: 260, editor: 560, results: 680 })
+  assert.deepEqual(allocateWorkspaceWidth(3000, initial), { history: 360, editor: 720, results: 720 })
+  assert.deepEqual(allocateWorkspaceWidth(420, initial), { history: 100, editor: 160, results: 160 })
+  assert.deepEqual(allocateWorkspaceWidth(400, initial, true), { history: 0, editor: 200, results: 200 })
 })
 
-test('history reaches the editor minimum before it can squeeze the result', () => {
-  const { clampSize } = loadSplit(memoryStorage())
-  for (const requested of [800, 10000]) {
-    const history = clampSize({ size: requested, min: 200, minOther: 320 + 472, available: 1200 })
-    const editor = clampSize({ size: 460, second: 472, min: 320, minOther: 300, available: 1200 - history })
-    assert.equal(history, 408)
-    assert.equal(editor, 320)
-    assert.equal(1200 - history - editor, 472)
+test('workspace drag limits reserve both adjacent panes without touching the third', () => {
+  const { adjacentWidthRange } = loadWorkspaceLayout()
+  const widths = { history: 260, editor: 700, results: 400 }
+  assert.deepEqual(adjacentWidthRange(widths, 'history'), { min: 240, max: 360 })
+  assert.deepEqual(adjacentWidthRange(widths, 'editor'), { min: 380, max: 720 })
+  assert.deepEqual(adjacentWidthRange({ history: 100, editor: 160, results: 160 }, 'editor'), { min: 160, max: 160 })
+})
+
+test('assistant height obeys both shared bounds including keyboard and restored sizes', async () => {
+  const { WORKSPACE_LAYOUT_BOUNDS: bounds } = loadWorkspaceLayout()
+  const storage = memoryStorage()
+  storage.setItem('upper', '240')
+  const pane = mountSplit({ direction: 'vertical', size: 260, min: bounds.upperMinHeight,
+    minOther: bounds.assistantHeight.min, maxOther: bounds.assistantHeight.max, fitOther: bounds.assistantHeight.min,
+    persistKey: 'upper' }, storage)
+  try {
+    await pane.resize(1200, 800.25)
+    assert.equal(800.25 - pane.currentSize.value, 420)
+    pane.keydown({ key: 'End', preventDefault() {} })
+    assert.equal(800.25 - pane.currentSize.value, 200)
+    pane.keydown({ key: 'Home', preventDefault() {} })
+    assert.equal(800.25 - pane.currentSize.value, 420)
+  } finally {
+    pane.dispose()
   }
 })
 
-test('second-anchored layout fits a narrow viewport and restores the result on expansion', () => {
-  const { clampSize } = loadSplit(memoryStorage())
-  // 临时不足两侧最小值时，按最小值比例降级，两侧仍可见；保留偏好供恢复。
-  assert.equal(clampSize({ size: 9999, second: 472, min: 320, minOther: 300, available: 250 }), 129)
-  assert.equal(clampSize({ size: 129, second: 472, min: 320, minOther: 300, available: 600 }), 310)
-  assert.equal(clampSize({ size: 320, second: 472, min: 320, minOther: 300, available: 1000 }), 528)
-})
-
-test('only a physically undersized three-column workspace compresses the history minimum', () => {
-  const { clampSize } = loadSplit(memoryStorage())
-  const history = clampSize({ size: 268, min: 200, minOther: 320 + 590, fitOther: 620, available: 418 })
-  const editor = clampSize({ size: 460, min: 320, minOther: 300, second: 590, available: 418 - history })
-  assert.equal(history, 102)
-  assert.equal(editor, 163)
-  assert.equal(418 - history - editor, 153)
-  // 仍放得下三栏最小值时，历史200px保底不可因结果偏好较宽而被压缩。
-  assert.equal(clampSize({ size: 268, min: 200, minOther: 910, fitOther: 620, available: 900 }), 200)
-})
-
-test('an editor drag establishes a new result width for subsequent history movement', () => {
-  const { clampSize } = loadSplit(memoryStorage())
-  const editor = clampSize({ size: 500, min: 320, minOther: 300, available: 932 })
-  const result = 932 - editor
-  assert.equal(result, 432)
-  assert.equal(clampSize({ size: editor, second: result, min: 320, minOther: 300, available: 832 }), 400)
+test('same-axis nested project dividers explicitly transfer size to their adjacent environment pane', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/views/ProjectsView.vue'), 'utf8')
+  assert.match(source, /@resize="resizeProjectNeighbor"/)
+  assert.match(source, /function resizeProjectNeighbor\([\s\S]*?allocatedEnvironment\(remaining \+ delta\) - delta/)
 })
 
 test('saved size is restored, and missing or invalid values fall back', () => {
@@ -255,10 +331,13 @@ test('the separator uses outlined resize cursors and a plain line without arrow 
   assert.match(source, /fill='%23fff'/, 'cursor artwork must stay light inside the outline')
   assert.ok(!/grip-arrow|data:image\/svg/.test(source.replace(/cursor:\s*\n?\s*url\("data:image\/svg\+xml,[^"]+"\)/g, '')),
     'the separator must not use arrow artwork beyond the cursor image')
-  assert.match(source, /\.split-handle:hover \.split-grip/)
+  assert.match(source, /\.split-handle:hover > \.split-grip/)
 
-  // 静止时是一条 1px 细线，不绘制箭头图案。
-  assert.match(source, /\.split-horizontal \.split-grip \{[\s\S]*?width: 1px;/)
+  // 静止时也能看见分割线，悬停和拖动会进一步强化。
+  assert.match(source, /\.split-horizontal > \.split-handle > \.split-grip \{[\s\S]*?width: 2px;/)
+  assert.match(source, /\.split-vertical > \.split-handle > \.split-grip \{[\s\S]*?height: 2px;/)
+  assert.match(source, /background: var\(--border-strong\)/)
+  assert.match(source, /opacity: 0\.9/)
 
   // 悬浮只加粗线条本身，不再给命中带铺一条宽的浅紫底。
   assert.ok(!/\.split-handle:hover::before/.test(source),
@@ -293,12 +372,15 @@ test('the resize cursor stays locked for the whole drag, not just over the handl
 })
 
 
-test('long connection has an independent config|stage split', () => {
-  const source = fs.readFileSync(
-    path.join(__dirname, '../src/views/LongConnection.vue'), 'utf8')
-  assert.match(source, /persist-key="api-agent\.layout\.long-connection\.config"/)
-  assert.match(source, /:min="280"/)
-  assert.match(source, /:min-other="360"/)
+test('the three test pages use the shared history, editor, results and assistant layout', () => {
+  for (const view of ['RequestConsole', 'LongConnection', 'TestCasesView']) {
+    const source = fs.readFileSync(path.join(__dirname, `../src/views/${view}.vue`), 'utf8')
+    assert.match(source, /<TestWorkspace[^>]*history-key="[^"]+"[^>]*editor-key="[^"]+"[^>]*assistant-key="[^"]+"/)
+    for (const slot of ['history', 'editor', 'results', 'assistant']) assert.ok(source.includes(`<template #${slot}>`))
+    assert.doesNotMatch(source, /<ResizableSplit/)
+  }
+  const source = fs.readFileSync(path.join(__dirname, '../src/components/TestWorkspace.vue'), 'utf8')
+  assert.match(source, /direction="vertical"[\s\S]*?:max-other="bounds.assistantHeight.max"[\s\S]*?#first[\s\S]*?slot name="editor"[\s\S]*?slot name="results"[\s\S]*?slot name="assistant"/)
 })
 
 

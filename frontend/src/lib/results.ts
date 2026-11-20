@@ -110,11 +110,58 @@ export function resultCodeLabel(resultStatus: number | null | undefined): string
   return resultStatus == null ? null : `结果码 ${resultStatus}`
 }
 
+type StatusFeedback = { label: string; tone: ResultPresentation['tone']; symbol: string }
+
 /** 三态断言展示：null/缺失表示未评估，只有明确 false 才显示未通过。 */
-export function assertionVerdict(passed: boolean | null | undefined) {
+export function assertionVerdict(passed: boolean | null | undefined): StatusFeedback {
   if (passed === true) return { label: '通过', symbol: '✓', tone: 'success' }
   if (passed === false) return { label: '未通过', symbol: '✕', tone: 'danger' }
   return { label: '未评估', symbol: '—', tone: 'neutral' }
+}
+
+const CASE_OUTCOMES = new Map<string, StatusFeedback>([
+  ['passed', { label: '通过', tone: 'success', symbol: '✓' }],
+  ['failed', { label: '未通过', tone: 'danger', symbol: '✕' }],
+  ['error', { label: '执行错误', tone: 'danger', symbol: '!' }],
+  ['timed_out', { label: '超时', tone: 'warning', symbol: '◷' }],
+  ['skipped', { label: '已跳过', tone: 'warning', symbol: '↷' }],
+  ['permission_required', { label: '待授权', tone: 'warning', symbol: '↷' }],
+  ['cancelled', { label: '已取消', tone: 'neutral', symbol: '—' }],
+  ['unknown', { label: '未评估', tone: 'neutral', symbol: '—' }],
+])
+
+/** Map permission skips in existing task history to the same verdict as new runs. */
+function caseOutcomeKey(status: string, reason?: string) {
+  return status === 'skipped' && reason === 'write_permission_required' ? 'permission_required' : status
+}
+
+export function caseVerdict(status: string, reason?: string): StatusFeedback {
+  return CASE_OUTCOMES.get(caseOutcomeKey(status, reason)) ?? assertionVerdict(null)
+}
+
+export function countCaseOutcomes(results: readonly { status: string; reason?: string }[]) {
+  const counts = new Map<string, number>()
+  for (const result of results) {
+    const status = caseOutcomeKey(result.status, result.reason)
+    const key = CASE_OUTCOMES.has(status) ? status : 'unknown'
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return Array.from(CASE_OUTCOMES, ([status, feedback]) => ({ status, ...feedback, count: counts.get(status) ?? 0 }))
+}
+
+const TASK_PROGRESS = new Map<string, StatusFeedback>([
+  ['queued', { label: '排队中', tone: 'info', symbol: '◷' }],
+  ['running', { label: '执行中', tone: 'info', symbol: '▶' }],
+  ['completed', { label: '流程完成', tone: 'info', symbol: '■' }],
+  ['partial', { label: '部分完成', tone: 'warning', symbol: '!' }],
+  ['cancelled', { label: '已取消', tone: 'neutral', symbol: '—' }],
+  ['timed_out', { label: '已超时', tone: 'warning', symbol: '◷' }],
+  ['interrupted', { label: '已中断', tone: 'warning', symbol: '!' }],
+  ['failed', { label: '任务失败', tone: 'danger', symbol: '✕' }],
+])
+
+export function taskProgress(status: string): StatusFeedback {
+  return TASK_PROGRESS.get(status) ?? { label: status, tone: 'neutral', symbol: '—' }
 }
 
 /** 管理链路失败独立展示；浏览器未收到结果不等于目标请求超时，不生成目标 HTTP。 */

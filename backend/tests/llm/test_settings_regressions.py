@@ -78,6 +78,25 @@ async def test_get_client_uses_environment_until_explicit_disabled_override(app,
         assert not disabled.is_configured
 
 
+@pytest.mark.parametrize("persisted", [True, False])
+async def test_switching_shared_model_preserves_other_settings(client, app, persisted):
+    if persisted:
+        response = await client.put(
+            "/api/settings/llm",
+            json={"enabled": True, "model": "saved-model", "timeout_seconds": 42},
+        )
+        assert response.status_code == 200
+    original = (await client.get("/api/settings/llm")).json()
+    response = await client.patch("/api/settings/llm/model", json={"model": "  new-model  "})
+    assert response.status_code == 200
+    assert response.json() == {**original, "model": "new-model"}
+    assert (await client.get("/api/settings/llm")).json() == response.json()
+    async with app.state.database.session() as session:
+        record = await LLMSettingService(session).get_record()
+        assert record.api_key == "fictional-saved-key"
+    assert (await client.patch("/api/settings/llm/model", json={"model": "   "})).status_code == 422
+
+
 @pytest.mark.parametrize("endpoint", ["ping", "models"])
 @pytest.mark.parametrize(
     ("payload", "authorization"),

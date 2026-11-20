@@ -120,6 +120,33 @@ async def test_websocket_scheduled_sends_run_before_stop(client, target):
     else:
         raise AssertionError(f"scheduled messages were not echoed: {collected}")
     await client.post(f"/api/streams/{session_id}/stop")
+    inputs = (await client.get(f"/api/streams/{session_id}/inputs")).json()
+    assert inputs["url"] == f"{target.ws_url}/ws"
+    assert inputs["scheduled_messages"] == ["first", "second"]
+
+
+async def test_saved_websocket_inputs_are_scrubbed_and_new_connections_get_new_ids(client, target):
+    url = f"{target.ws_url}/ws"
+    request = {
+        "url": url,
+        "headers": {"Authorization": "Bearer fixture-private-value", "X-Trace": "example"},
+        "subprotocols": ["example"],
+        "send": ['{"token":"fixture-body-secret"}', "fixture-body-secret"],
+    }
+    first = await client.post("/api/streams", json=request)
+    assert first.status_code == 202
+    first_id = first.json()["id"]
+    await client.post(f"/api/streams/{first_id}/stop")
+    saved = (await client.get(f"/api/streams/{first_id}/inputs")).json()
+    assert saved["request_headers"] == {"Authorization": "[redacted]", "X-Trace": "example"}
+    assert saved["subprotocols"] == ["example"]
+    assert "fixture-body-secret" not in str(saved)
+    second = await client.post("/api/streams", json={"url": saved["url"], "send": ["retry"]})
+    assert second.status_code == 202
+    second_id = second.json()["id"]
+    await client.post(f"/api/streams/{second_id}/stop")
+    ids = {item["id"] for item in (await client.get("/api/streams")).json()["items"]}
+    assert len({first_id, second_id}) == 2 and {first_id, second_id} <= ids
 
 
 async def test_websocket_scheduled_sends_do_not_noise_after_target_close(client, target):

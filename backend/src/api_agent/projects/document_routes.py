@@ -1,4 +1,4 @@
-"""项目源码导入、后台 AI 文档生成与下载入口，源码始终通过快照冻结。"""
+"""Archived document reads; retired snapshot writers are not mounted by the application."""
 
 import asyncio
 import json
@@ -21,6 +21,7 @@ from api_agent.projects.service import ProjectService
 from api_agent.projects.source import SourceScanError, scan_directory
 
 router = APIRouter(prefix="/api/projects", tags=["project documents"])
+legacy_writer = APIRouter(prefix="/api/projects")
 
 
 class DirectoryInput(ApiInput):
@@ -71,7 +72,7 @@ def document_response(record: dict) -> dict:
     return {**record, "markdown": render_markdown(record)}
 
 
-@router.post("/import", status_code=201)
+@legacy_writer.post("/import", status_code=201)
 async def import_project(data: ImportProject, request: Request, session: Session):
     """先成功扫描和保存源码，再创建项目；数据库拒绝时回收本次孤立快照。"""
     snapshot = await scan(data.directory, request.app.state.settings.artifact_dir)
@@ -91,7 +92,7 @@ async def import_project(data: ImportProject, request: Request, session: Session
     return {"project": ProjectResponse.model_validate(project), "source": source_summary(source)}
 
 
-@router.post("/{project_id}/source", status_code=201)
+@legacy_writer.post("/{project_id}/source", status_code=201)
 async def import_source(project_id: str, data: DirectoryInput, request: Request, session: Session):
     """给已有项目追加独立源码版本，读文件时释放数据库读事务。"""
     await ProjectService(session).get_project(project_id)
@@ -111,7 +112,7 @@ async def latest_source(project_id: str, request: Request, session: Session):
     return source_summary(records[0])
 
 
-@router.post("/{project_id}/documents", status_code=202)
+@legacy_writer.post("/{project_id}/documents", status_code=202)
 async def generate_document(
     project_id: str,
     data: GenerateDocument,
@@ -144,7 +145,7 @@ async def get_document(project_id: str, document_id: str, request: Request, sess
     return document_response(read_artifact(request, project_id, "documents", document_id))
 
 
-@router.post("/{project_id}/documents/{document_id}/cancel")
+@legacy_writer.post("/{project_id}/documents/{document_id}/cancel")
 async def cancel_document(project_id: str, document_id: str, request: Request, session: Session):
     """等待取消收尾后返回终态，已生成文档仍可下载。"""
     await ProjectService(session).get_project(project_id)

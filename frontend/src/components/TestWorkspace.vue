@@ -1,74 +1,131 @@
 <script setup lang="ts">
 /**
- * 测试工作台：历史列 + 测试内容。
- *
- * 外壳只管理分栏，不接触请求、执行、轮询或历史回放状态。
- * 历史与编辑器/结果的具体内容由各测试页通过插槽提供。
+ * 三种测试共用的分栏外壳。页面通过插槽提供内容；外壳管理尺寸和拖动偏好。
  */
-import { computed, provide, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import ResizableSplit from './ResizableSplit.vue'
-import { workspaceSplitKey } from '@/lib/split'
+import { readStoredSize, writeStoredSize } from '@/lib/split'
+import { allocateWorkspaceWidth, adjacentWidthRange, WORKSPACE_LAYOUT_BOUNDS as bounds, workspaceMaxWidth, workspaceMinWidth, type WorkspaceWidths } from '@/lib/workspaceLayout'
 
 const props = withDefaults(
   defineProps<{
-    persistKey: string
+    historyKey: string
+    editorKey: string
+    assistantKey: string
     historyWidth?: number
-    minHistory?: number
-    minContent?: number
-    /** 当前可见的内层分栏标识；未指定时维持普通双栏语义。 */
-    activePane?: string
+    editorWidth: number
+    upperHeight?: number
+    hideHistoryOnNarrow?: boolean
   }>(),
-  { historyWidth: 268, minHistory: 200, minContent: 280 },
+  { historyWidth: 268, upperHeight: 260 },
 )
 
-const width = ref(props.historyWidth)
-const reservations = ref<Record<string, { width: number; minimum: number }>>({})
-/** 历史只借用中栏空间：末栏期望宽度与中栏最小值共同限定历史右边界。 */
-const contentMinimum = computed(() => Math.max(
-  props.minContent,
-  props.activePane ? reservations.value[props.activePane]?.width ?? 0 : 0,
-))
-/** 极窄视口按三栏真实最小值降级；末栏偏好不参与物理最小值计算。 */
-const contentFloor = computed(() => props.activePane
-  ? reservations.value[props.activePane]?.minimum ?? props.minContent
-  : undefined)
+const root = ref<HTMLElement | null>(null)
+const upperHeight = ref(props.upperHeight)
+const historyHidden = ref(false)
+const widths = ref<WorkspaceWidths>({ history: props.historyWidth, editor: props.editorWidth, results: bounds.results.min })
+let desktopWidths: WorkspaceWidths | undefined
+let compactWidths: WorkspaceWidths | undefined
+let observer: ResizeObserver | undefined
+let narrowViewport: MediaQueryList | undefined
+const resultKey = `${props.editorKey}.second`
+const historyRange = computed(() => adjacentWidthRange(widths.value, 'history', historyHidden.value))
+const editorRange = computed(() => adjacentWidthRange(widths.value, 'editor', historyHidden.value))
+const shellStyle = computed(() => ({ maxWidth: `${workspaceMaxWidth - (historyHidden.value ? bounds.history.max : 0)}px` }))
 
-provide(workspaceSplitKey, {
-  reserve(pane, reservedWidth, minimum = reservedWidth ?? 0) {
-    if (reservedWidth === null) delete reservations.value[pane]
-    else reservations.value[pane] = { width: reservedWidth, minimum }
-  },
-})
-
-/** 缺失、非法值或存储不可用均回退初始历史宽度。 */
-function restore(): number {
-  try {
-    const saved = Number(window.localStorage.getItem(props.persistKey))
-    return Number.isFinite(saved) && saved > 0 ? saved : props.historyWidth
-  } catch {
-    return props.historyWidth
+/** Distribute width changes without overwriting saved preferences or a layout temporarily squeezed below its minimum. */
+function measureWidth(): void {
+  const total = root.value?.getBoundingClientRect().width ?? 0
+  if (total <= 0) return
+  const hidden = narrowViewport?.matches ?? false
+  historyHidden.value = hidden
+  let previous = hidden ? compactWidths : desktopWidths
+  if (!previous) {
+    const history = readStoredSize(props.historyKey, props.historyWidth)
+    const editor = readStoredSize(props.editorKey, props.editorWidth)
+    previous = {
+      history,
+      editor,
+      results: readStoredSize(resultKey, Math.min(total, workspaceMaxWidth) - (hidden ? 0 : history) - editor),
+    }
+  }
+  const next = allocateWorkspaceWidth(total, previous, hidden)
+  widths.value = next
+  if (total >= workspaceMinWidth(hidden)) {
+    if (hidden) compactWidths = next
+    else desktopWidths = next
   }
 }
 
-width.value = restore()
+/** Dragging the history divider trades width with the editor; dragging the editor divider trades with results. */
+function resizeNeighbor(pane: 'history' | 'editor', value: number): void {
+  const neighbor = pane === 'history' ? 'editor' : 'results'
+  const current = widths.value
+  const next = { ...current, [pane]: value, [neighbor]: current[neighbor] + current[pane] - value }
+  widths.value = next
+  if (historyHidden.value) compactWidths = next
+  else {
+    desktopWidths = next
+    writeStoredSize(props.historyKey, next.history)
+  }
+  writeStoredSize(props.editorKey, next.editor)
+  writeStoredSize(resultKey, next.results)
+}
+
+onMounted(() => {
+  if (props.hideHistoryOnNarrow) {
+    narrowViewport = window.matchMedia(`(max-width: ${bounds.narrowViewport}px)`)
+    narrowViewport.addEventListener('change', measureWidth)
+  }
+  measureWidth()
+  observer = new ResizeObserver(measureWidth)
+  if (root.value) observer.observe(root.value)
+})
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  narrowViewport?.removeEventListener('change', measureWidth)
+})
 </script>
 
 <template>
-  <div class="test-workspace">
+  <div ref="root" class="test-workspace">
     <ResizableSplit
-      v-model:size="width"
-      :persist-key="persistKey"
-      :min="minHistory"
-      :min-other="contentMinimum"
-      :fit-other="contentFloor"
+      class="workspace-split"
+      :class="{ 'history-hidden': historyHidden }"
+      :style="shellStyle"
+      :size="widths.history"
+      :range="historyRange"
       direction="horizontal"
-      label="拖动调整历史栏与测试区宽度"
+      label="拖动调整历史栏与填写区宽度"
+      @update:size="resizeNeighbor('history', $event)"
     >
       <template #first>
-        <div class="workspace-history"><slot name="history" /></div>
+        <div v-show="!historyHidden" class="workspace-history"><slot name="history" /></div>
       </template>
       <template #second>
-        <div class="workspace-content"><slot /></div>
+        <ResizableSplit
+          v-model:size="upperHeight"
+          direction="vertical"
+          :persist-key="assistantKey"
+          :min="bounds.upperMinHeight"
+          :min-other="bounds.assistantHeight.min"
+          :max-other="bounds.assistantHeight.max"
+          :fit-other="bounds.assistantHeight.min"
+          label="调整测试区与 AI 对话高度"
+        >
+          <template #first>
+            <ResizableSplit
+              :size="widths.editor"
+              :range="editorRange"
+              label="拖动调整填写区与结果区宽度"
+              @update:size="resizeNeighbor('editor', $event)"
+            >
+              <template #first><slot name="editor" /></template>
+              <template #second><slot name="results" /></template>
+            </ResizableSplit>
+          </template>
+          <template #second><slot name="assistant" /></template>
+        </ResizableSplit>
       </template>
     </ResizableSplit>
   </div>
@@ -76,15 +133,13 @@ width.value = restore()
 
 <style scoped>
 .test-workspace,
-.workspace-history,
-.workspace-content {
+.workspace-history {
   height: 100%;
   min-width: 0;
   min-height: 0;
 }
 
-.workspace-history,
-.workspace-content {
-  overflow: hidden;
-}
+.workspace-history { overflow: hidden; }
+.workspace-split { margin-inline-start: auto; }
+.history-hidden > :deep(.split-handle) { display: none; }
 </style>
