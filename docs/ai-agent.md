@@ -1,23 +1,34 @@
-# AI 编排使用说明
+# AI 编排与智能测试使用说明
 
-2026-11-16：文档驱动任务入口位于 `/testcases`，任务 API 位于 `backend/src/api_agent/tasks/`；既有 `/api/agent/runs` 闭环仍独立可用。
+2026-11-27：全站四个测试工作台（`/request` 接口测试、`/long-connection` 长连接测试、`/testcases` 智能群测、`/model-testing` 大模型测试）均已接入页面级隔离的 **小Y 工具调用 AI 助手**（`/api/assistant/*`）与后台持久化多轮测试运行器，支持冷却间隔（`cooldown_ms`，默认 `500 ms`）、单条带 `AI 测试` 标注的历史聚合、可点击 `CaseLinkBlock` 子用例只读回放、切页后台保活与自动重连、原子对话分叉以及向量知识库检索（`/api/knowledge/*`）。既有 `/api/agent/runs` 多轮补测闭环与 `/testcases` 文档任务继续独立可用。大模型服务默认开启（`LLM_MODE=openai`、`enabled=true`），支持按用途分别配置「小Y 对话模型」与可选「接口文档与 test 生成模型」。
 
-## 四条路径怎么选
+## 五条路径怎么选
 
-| 场景 | 用哪个页面 | 说明 |
+| 场景 | 用哪个页面 / 接口 | 说明 |
 | --- | --- | --- |
-| 测单条 HTTP 或 SSE 接口 | `/request` 接口测试 | SSE 有界观察在响应中展示事件 |
-| 调试 WebSocket 双向消息 | `/long-connection` 长连接测试 | 仅 WebSocket：连接、收发帧、关闭码与历史 |
-| 从 API 文档生成任务用例 | `/testcases` 任务测试 | 单一自动流程：上传、识别、保留原有用例、生成补充用例、执行 HTTP/SSE/WebSocket、AI 总结与导出 |
-| 使用原多轮 AI 补测闭环 | `/api/agent/runs` | 仍独立可用，不是 `/testcases` 当前生成器 |
+| 测单条 HTTP / SSE 接口或让小Y 发起多轮单接口测试 | `/request` 接口测试 | 支持实时 NDJSON SSE 观察、后台运行不断连、小Y 工具调用（`console` 作用域）与多轮子用例只读回放 |
+| 调试 WebSocket 双向消息或让小Y 运行多轮 WS 套件 | `/long-connection` 长连接测试 | 仅 WebSocket：双向收发、关闭码、事件回放、小Y 工具调用（`websocket` 作用域）与持久化断言判定 |
+| 从 API 文档生成并执行批量测试任务 | `/testcases` 智能群测 | 支持本机目录生成 OpenAPI 文档、上传识别、有状态变量提取与依赖链（`extract`/`depends_on`/`always_run`）、执行 HTTP/SSE/WebSocket、AI 总结、小Y 工具调用（`tasks` 作用域）与 Markdown 导出 |
+| 探测外部大模型供应商接口能力与模态 | `/model-testing` 大模型测试 | 支持多协议探测（流式 TTFT、工具调用、结构化输出、输入/输出模态）、持久化历史（绝不落库明文 `api_key`）、小Y 工具调用（`model_testing` 作用域） |
+| 使用原多轮 AI 补测闭环 | `/api/agent/runs` | 仍独立可用，适用于基于契约的生成 → 执行 → 诊断 → 单因素补测闭环 |
 
-单接口不并入 AI 闭环的原因：没有多轮补测语义，且通常没有契约依据，交由模型推断会使全部期望降级为 `inferred`。
+## 页面级小Y 工具测试架构（`/api/assistant/*`）
+
+四个测试工作台底部的 `小Y` 助手统一接入 `AssistantRunManager` 与 `AssistantToolRegistry`，具备以下安全与交互约束：
+
+1. **严格页面作用域隔离**：四个页面分别绑定 `scope = "console" | "websocket" | "tasks" | "model_testing"`，每个作用域只能调用自身对应的测试工具与只读知识库查询，禁止跨页调用其他工作台工具。
+2. **后台多跳运行与无损重连**：`POST /api/assistant/runs` 返回 `202` 与 `Location`，前端通过 `GET /api/assistant/runs/{run_id}/live` 订阅 NDJSON 帧；切换页面或刷新时客户端断流**绝不取消**后台测试，返回页面后通过 `GET /api/assistant/runs/active` 与各工作台 `/active` 接口自动重连，仅显式点击停止才调用 `POST /api/assistant/runs/{run_id}/cancel`。
+3. **冷却间隔与单条标注历史**：多轮 AI 测试统一遵守工作台设置的 `cooldown_ms`（默认 `500 ms`，范围 `0–60000 ms`），整场多轮测试仅生成**单条**带有 `AI 测试` 徽标与轮次标记的历史记录，并在内部持久化有序子用例。
+4. **可点击 `CaseLinkBlock` 只读回放与原子分叉**：小Y 回复中内嵌可点击的用例卡片（`CaseLinkBlock`），点击即载入该子用例的完整脱敏快照并锁定工作台表单为只读；点击「再次测试」解锁表单并递增草稿版本开启新会话；当用户在已有历史线程里发起新测试并触发 `run_bound` 时，服务端原子分叉出独立的新线程绑定到新历史 ID，旧历史对话不受污染。
+5. **零明文密钥与向量知识库**：大模型测试仅在请求内存中使用临时凭据（`ephemeral_api_key`），数据库与助手消息均自动脱敏、不落库明文 `api_key`；小Y 可通过 `/api/knowledge/*` 检索项目功能与使用指南知识库（已构建向量索引时走向量检索，未构建时自动词法回退）。
 
 ## 开始使用
 
-1. 按根 README 启动后端，在系统设置页配置并启用 OpenAI 兼容服务。优先使用数据库设置；只有未创建数据库配置记录时才回落到环境配置。已保存但禁用的配置不会被环境变量悄悄覆盖。
-2. 将被测服务的数字回环 origin 加入 `TARGET_ALLOWED_ORIGINS`，例如 `["http://127.0.0.1:8088"]`。模型服务的远端 Base URL 与被测 origin 是两个不同概念。
-3. 打开 `/testcases`，上传 `.json`、`.yaml`、`.yml` 或 UTF-8 文本（上限 512 KiB）。标准 OpenAPI/Swagger 文档在本地识别，非标准文本由模型结构化识别。填写并确认目标 origin；文档服务器 URL 不自动作为目标。写请求与 WebSocket 主动发送默认跳过，显式勾选后执行。任务历史与逐用例证据持久化，可取消并下载 Markdown 总结。
+1. 按根 README 启动后端（端口 `8010`）。大模型服务默认开启；在「系统设置」页填写 OpenAI 兼容服务的 `Base URL`、模型名及所需密钥后保存即可生效。数据库配置优先于环境配置；只有未创建数据库配置记录时才回落到环境配置，已保存但显式停用的配置不会被环境变量覆盖。
+   - **双模型分工**：「小Y 对话模型」（`model`）用于 AI 对话、工具调度与 AI 总结，并可在小Y 输入框右侧经 `PATCH /api/settings/llm/model` 快捷切换；「接口文档与 test 生成模型」（`generation_model`）默认跟随小Y，开启「自定义模型」后可独立指定。
+2. 如需限制可测目标范围，可将目标 origin 加入 `TARGET_ALLOWED_ORIGINS`（留空 `[]` 表示允许任意合法目标地址，可按需配置显式白名单）；模型服务的远端 Base URL 与被测 origin 是两个不同概念。
+3. 打开 `/testcases`，可上传 `.json`、`.yaml`、`.yml` 或 UTF-8 文本（上限 512 KiB），也可点击「生成接口文档」（`POST /api/tasks/generate-document`，仅限本机浏览器）通过本机目录选择器临时扫描源码并输出 `API/openapi<时间>.json`。标准 OpenAPI/Swagger 文档在本地识别，非标准文本由模型结构化识别。填写并确认目标 origin；文档服务器 URL 可预填但仍须人工确认后开始执行。写请求与 WebSocket 主动发送在后端 `StartTask` 中默认关闭、需显式传 `allow_writes=true`（前端工作台首次默认勾选开启，可在设置中关闭）。静态 Token 任务历史支持通过内存临时凭据缓存直接重测，也可在 `/api/tasks/{id}/rerun` 中传入 `runtime_headers` 覆盖请求头（落库快照始终保持 `[REDACTED]`）。任务历史、文档附件与逐用例证据持久化，可编辑重测、取消并下载 Markdown 总结。
+4. 四个测试工作台底部均提供小Y 助手（持久化线程 `/api/assistant/threads/{scope}/{history_id}`，兼容保留 `POST /api/tasks/chat`），支持 `Enter` 直接发送、`Shift + Enter` 换行（输入法组合态不误触）；发送前若输出区停留在最后一行（或尚无输出），后续流式输出自动跟进到底部，若用户主动向上翻看则停止拉回。
 
 有效模型配置可通过 `/api/llm/status` 核验，数据库配置优先于环境配置。文档识别的输出预算为 16,000 token，其他结构化调用从 6,000 token 开始。模型以 `length` 结束时，下次修复调用将输出预算翻倍，最高 32,000 token，仍计入原有调用次数和时间限制。推理模型的思考 token 也可能占用该预算。
 
@@ -85,8 +96,8 @@ Set-Location backend
 
 辅助脚本创建自有无状态注册校验接口，刻意让 12 位手机号返回 500；不会创建用户、接触 CRM 或修改目标授权配置。2026-11-02 实测 `deepseek-v4.1-flash`：生成/诊断/补测/诊断/报告五次调用均接受，两轮共 7 个请求，初轮状态 `[200,500,400,400,400]`，补测 `[400,400]`；按两轮上限停止。token 用量与实际模型名称保存在本地证据，未配置可靠价格，费用未知。供应商嵌套 token details 已兼容，归一化保留整数计数。
 
-侧边栏将入口分为“接口管理”（接口测试、长连接测试）和“任务测试”（用例测试），其后为项目区域。长连接测试仅负责 WebSocket 调试；SSE 由接口测试或文档任务用例测试。
+侧边栏将入口分为「单点测试」（接口测试、长连接测试）、「智能群测」（`/testcases`）、「大模型测试」（`/model-testing`）、「记录」（执行结果，含四类页签）和「设置」（系统设置）；原项目快照页已迁出并重定向至 `/testcases`。长连接测试仅负责 WebSocket 调试；SSE 由接口测试或智能群测任务执行。
 
-`/testcases` 文档任务与 `/api/agent/runs` 多轮 AI 闭环相互独立：上传 API 文档后，标准 OpenAPI/Swagger JSON/YAML 由本地识别，非标准 UTF-8 文本交由已配置模型结构化识别；识别结果保留原有用例，由内置生成器补充操作基线及部分参数边界用例，再按序复用 HTTP/SSE 与 WebSocket 执行类，最后由 LLM 汇总证据。任务结果持久化并可导出 Markdown。当前不集成 Schemathesis/RESTler；完整 schema mutation、状态序列和跨接口依赖仍未实现。图标资源使用本地打包的 Iconify 图标数据，不依赖运行时远端服务。
+`/testcases` 文档任务与 `/api/agent/runs` 多轮 AI 闭环相互独立：上传 API 文档后，标准 OpenAPI/Swagger JSON/YAML 由本地识别，非标准 UTF-8 文本交由已配置模型结构化识别；识别结果保留原有用例，由内置生成器补充操作基线及部分参数边界用例，并支持受控多步骤变量提取与依赖链（`variables` / `extract` / `depends_on` / `always_run`），再按序复用 HTTP/SSE 与 WebSocket 执行类，最后由 LLM 汇总证据。任务结果持久化并可导出 Markdown。当前不集成 Schemathesis/RESTler；完整确定性 OpenAPI IR 与自动数据库断言仍未实现。图标资源使用本地打包的 Iconify 图标数据，不依赖运行时远端服务。
 
 模型客户端的 HTTP 传输和响应解析分别由 `llm/client.py`、`llm/response.py` 负责。畸形结构、非法 Unicode 或工具参数中的非有限数字会转为 `LLMResponseError`，`/api/llm/chat` 返回 502；错误文本不包含供应方原始响应。填写完整 `/chat/completions` 地址也可正确查询同一服务的 `/models`。

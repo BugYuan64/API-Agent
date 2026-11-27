@@ -13,19 +13,27 @@ from api_agent import __version__
 from api_agent.agent.manager import AgentManager
 from api_agent.agent.routes import router as agent_router
 from api_agent.agent.store import AgentStore
+from api_agent.assistant.routes import router as assistant_router
+from api_agent.assistant.runner import AssistantRunManager
+from api_agent.assistant.thread_store import AssistantThreadRepository
 from api_agent.console.routes import router as console_router
+from api_agent.console.runner import ConsoleRunManager
 from api_agent.execution.routes import router as executions_router
 from api_agent.infrastructure.api import error_response, install_api_handlers
 from api_agent.infrastructure.config import Settings, load_settings
 from api_agent.infrastructure.database import Database
 from api_agent.infrastructure.history import sanitize_history
 from api_agent.infrastructure.logging import configure_logging
+from api_agent.knowledge.routes import router as knowledge_router
+from api_agent.knowledge.service import KnowledgeBaseService
 from api_agent.llm.routes import router as llm_router
+from api_agent.llm.testing_manager import ModelTestManager
 from api_agent.projects.document_routes import router as documents_router
 from api_agent.projects.document_store import DocumentStore
 from api_agent.projects.documents import DocumentManager
 from api_agent.projects.routes import router as projects_router
 from api_agent.streams.routes import router as streams_router
+from api_agent.streams.runner import StreamSuiteRunner
 from api_agent.streams.service import StreamManager
 from api_agent.tasks.routes import router as tasks_router
 from api_agent.tasks.service import TaskManager
@@ -94,6 +102,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await sanitize_history(database)
             app.state.database = database
 
+            assistant_threads = AssistantThreadRepository(database)
+            app.state.assistant_threads = assistant_threads
+
             streams = StreamManager(database, settings)
             app.state.streams = streams
             resources.push_async_callback(streams.shutdown)
@@ -111,6 +122,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.documents = documents
             resources.push_async_callback(documents.shutdown)
             documents.store.recover()
+            knowledge = KnowledgeBaseService(settings)
+            app.state.knowledge = knowledge
+            resources.callback(knowledge.close)
+
+            console_runs = ConsoleRunManager(database, settings)
+            app.state.console_runs = console_runs
+            resources.push_async_callback(console_runs.shutdown)
+            await console_runs.recover()
+
+            stream_suites = StreamSuiteRunner(streams)
+            app.state.stream_suites = stream_suites
+            resources.push_async_callback(stream_suites.shutdown)
+            await stream_suites.recover()
+
+            model_tests = ModelTestManager(database, settings)
+            app.state.model_tests = model_tests
+            resources.push_async_callback(model_tests.shutdown)
+            await model_tests.recover()
+
+            assistant_runs = AssistantRunManager(
+                database=database,
+                settings=settings,
+                threads=assistant_threads,
+                console_runs=console_runs,
+                stream_suites=stream_suites,
+                tasks=tasks,
+                model_tests=model_tests,
+                knowledge=knowledge,
+            )
+            app.state.assistant_runs = assistant_runs
+            resources.push_async_callback(assistant_runs.shutdown)
             yield
 
     app.router.lifespan_context = lifespan
@@ -120,8 +162,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(streams_router)
     app.include_router(executions_router)
     app.include_router(llm_router)
+    app.include_router(knowledge_router)
     app.include_router(agent_router)
     app.include_router(tasks_router)
+    app.include_router(assistant_router)
 
     @app.get("/health", response_model=HealthResponse, tags=["health"])
     async def health() -> HealthResponse:

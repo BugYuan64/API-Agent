@@ -12,11 +12,12 @@ def load_settings(**kwargs):
 def test_defaults_need_no_key_and_paths_do_not_follow_shell_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     settings = load_settings(env_file=None)
-    assert settings.llm_mode == "disabled"
+    assert settings.llm_mode == "openai"
     assert settings.llm_api_key is None
     assert settings.database_path == settings.project_root / "data/api_agent.db"
     assert settings.artifact_dir == settings.project_root / "data/artifacts"
     assert not (tmp_path / "data").exists()
+    assert load_settings(env_file=None, llm_mode="disabled").llm_mode == "disabled"
 
 
 def test_env_file_and_process_override_and_secret_repr(tmp_path, monkeypatch):
@@ -74,3 +75,22 @@ def test_explicit_project_root_and_allowed_origins(tmp_path):
     assert settings.database_path == tmp_path / "local/state.db"
     assert settings.artifact_dir == tmp_path / "evidence"
     assert settings.target_allowed_origins == ["http://127.0.0.1:9000", "https://example.com"]
+
+
+def test_trust_system_proxy_defaults_false_and_controls_postman_env(tmp_path, monkeypatch):
+    from api_agent.execution.postman import process_environment
+
+    assert load_settings(env_file=None).trust_system_proxy is False
+    monkeypatch.setenv("TRUST_SYSTEM_PROXY", "true")
+    assert load_settings(env_file=None).trust_system_proxy is True
+
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    isolated = process_environment(tmp_path, trust_env=False)
+    assert isolated["NO_PROXY"] == "*"
+    assert "HTTP_PROXY" not in isolated
+
+    proxied = process_environment(tmp_path, trust_env=True)
+    assert proxied["HTTP_PROXY"] == "http://127.0.0.1:7890"
+    assert proxied["HTTPS_PROXY"] == "http://127.0.0.1:7890"
+    assert proxied.get("NO_PROXY") != "*"

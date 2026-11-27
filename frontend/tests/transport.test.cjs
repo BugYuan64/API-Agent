@@ -160,3 +160,18 @@ test('live console reports an interrupted stream when no final frame arrives', a
     readResponse: response => module.readConsoleFrames(response, () => {}),
   }), error => error.code === 'incomplete_stream')
 })
+
+test('describeError includes sanitized validation field details alongside request_id', () => {
+  const module = load('api/client.ts')
+  const error = new module.ApiError(
+    422,
+    'validation_error',
+    'Request validation failed',
+    [{ field: 'generation_model', reason: 'Extra inputs are not permitted' }],
+    'ea6bea6c-1234-5678-9abc-def012345678',
+  )
+  assert.equal(
+    module.describeError(error),
+    'Request validation failed：generation_model: Extra inputs are not permitted（request_id ea6bea6c）',
+  )
+})

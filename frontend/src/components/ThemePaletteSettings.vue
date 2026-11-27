@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** Live editor for the active light/dark palette; edits are scoped to that theme. */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Check, RotateCcw } from 'lucide-vue-next'
 import { COLOR_GROUPS, COLOR_LABELS, DEFAULT_PALETTES, getPalette, resetPalette, savePalette, type PaletteTheme } from '@/lib/palette'
 
@@ -8,6 +8,7 @@ const theme = ref<PaletteTheme>('dark')
 const palette = ref<Record<string, string>>(getPalette('dark'))
 const saved = ref(false)
 const title = computed(() => theme.value === 'dark' ? '暗色主题' : '亮色主题')
+let themeObserver: MutationObserver | null = null
 
 /** Load the active theme and refresh the editor when the OS-independent theme changes. */
 function syncTheme() {
@@ -30,7 +31,14 @@ function resetCurrentTheme() {
   saved.value = false
 }
 
-onMounted(syncTheme)
+onMounted(() => {
+  syncTheme()
+  if (typeof MutationObserver !== 'undefined') {
+    themeObserver = new MutationObserver(syncTheme)
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
+  }
+})
+onBeforeUnmount(() => { themeObserver?.disconnect(); themeObserver = null })
 </script>
 
 <template>

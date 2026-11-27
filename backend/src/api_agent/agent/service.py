@@ -29,7 +29,7 @@ from api_agent.agent.schemas import (
     Proposal,
     ReportCommentary,
 )
-from api_agent.execution.schemas import RequestCase
+from api_agent.execution.schemas import RequestCase, origin_allowed
 from api_agent.execution.service import ExecutionService, PlanError
 from api_agent.infrastructure.config import Settings
 from api_agent.infrastructure.json_pointer import is_valid as is_valid_pointer
@@ -328,7 +328,7 @@ class AgentService:
         校验，失败由结构化调用修复或抛 AgentError/PlanError，不发送目标请求。
         """
         budget = budget if budget is not None else CallBudget(2)
-        if request.scope.origin not in self.settings.target_allowed_origins:
+        if not origin_allowed(request.scope.origin, self.settings.target_allowed_origins):
             raise AgentError("origin_not_allowed")
         if (
             request.scope.auth_ref

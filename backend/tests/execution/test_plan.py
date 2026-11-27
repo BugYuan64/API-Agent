@@ -58,24 +58,41 @@ def test_unsafe_paths_are_rejected(path):
 
 def test_scope_and_local_secret_permissions_are_independent_of_plan():
     plan = ExecutionPlan.model_validate(plan_data())
+    # 白名单为空时默认放行合法 origin；配置白名单时严格限制
+    validate_scope(plan, [], [])
     with pytest.raises(ValueError, match="origin_not_allowed"):
-        validate_scope(plan, [], [])
+        validate_scope(plan, ["http://127.0.0.1:9999"], [])
     data = plan_data(auth_ref={"kind": "header", "header_name": "token", "env_var": "OTHER_KEY"})
     with pytest.raises(ValueError, match="auth_reference_not_allowed"):
         validate_scope(ExecutionPlan.model_validate(data), [plan.origin], ["CRM_TEST_TOKEN"])
 
 
 @pytest.mark.parametrize(
+    ("raw_origin", "normalized"),
+    [
+        ("https://API.Example.com", "https://api.example.com"),
+        ("http://localhost:8080", "http://localhost:8080"),
+        ("http://192.168.1.10:8080/", "http://192.168.1.10:8080"),
+        ("https://8.8.8.8", "https://8.8.8.8"),
+    ],
+)
+def test_execution_plan_accepts_valid_domains_and_ips(raw_origin, normalized):
+    plan = ExecutionPlan.model_validate(plan_data(origin=raw_origin))
+    assert plan.origin == normalized
+
+
+@pytest.mark.parametrize(
     "change",
     [
-        {"origin": "https://example.com"},
-        {"origin": "http://localhost:8080"},
+        {"origin": "ftp://example.com"},
+        {"origin": "https://user:pass@example.com"},
         {"origin": "http://127.0.0.1:8080/path"},
+        {"origin": "http://bad host:8080"},
         {"max_requests": 0},
         {"script": "pm.sendRequest('x')"},
     ],
 )
-def test_reject_remote_origins_and_arbitrary_fields(change):
+def test_reject_invalid_origins_and_arbitrary_fields(change):
     with pytest.raises(ValidationError):
         ExecutionPlan.model_validate(plan_data(**change))
 

@@ -211,11 +211,29 @@ async def test_websocket_rejection_is_recorded(client, target):
     )
 
 
-async def test_stream_rejects_non_loopback_and_sse(client, target):
-    remote = await client.post(
+async def test_stream_policy_enforces_credentials_allowlist_and_domain_normalization(
+    client, app, target
+):
+    from api_agent.infrastructure.targets import STREAM_SCHEMES, validate_target
+    from api_agent.streams.service import _canonical_stream_url
+
+    parsed, origin = validate_target("wss://API.Example.com:8443/ws?mode=1", [], STREAM_SCHEMES)
+    assert origin == "wss://api.example.com:8443"
+    assert _canonical_stream_url(parsed) == "wss://api.example.com:8443/ws?mode=1"
+
+    creds = await client.post(
+        "/api/streams", json={"kind": "websocket", "url": "ws://user:pass@example.com/ws"}
+    )
+    assert creds.status_code == 400
+    assert creds.json()["error"]["code"] == "target_credentials_not_allowed"
+
+    app.state.settings.target_allowed_origins = ["http://127.0.0.1:9999"]
+    blocked = await client.post(
         "/api/streams", json={"kind": "websocket", "url": "ws://example.com/ws"}
     )
-    assert remote.status_code == 400
+    assert blocked.status_code == 400
+    assert blocked.json()["error"]["code"] == "target_origin_not_allowed"
+
     rejected = await client.post(
         "/api/streams", json={"kind": "sse", "url": f"{target.base_url}/sse"}
     )

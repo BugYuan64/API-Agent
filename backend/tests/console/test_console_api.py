@@ -88,11 +88,11 @@ async def test_live_console_preserves_target_and_policy_results(client, target):
     assert completed.json()["result"]["response"]["status"] == 200
     rejected = await client.post(
         "/api/console/requests/live",
-        json={"url": "http://localhost:8010/health"},
+        json={"url": "http://user:pass@127.0.0.1:8010/health"},
     )
     assert rejected.json()["type"] == "error"
     assert rejected.json()["status"] == 400
-    assert rejected.json()["error"]["code"] == "target_not_loopback"
+    assert rejected.json()["error"]["code"] == "target_credentials_not_allowed"
     assert len((await client.get("/api/console/history")).json()["items"]) == 1
 
 
@@ -190,15 +190,15 @@ async def test_console_does_not_follow_redirects_by_default(client, target):
 @pytest.mark.parametrize(
     ("url", "code"),
     [
-        ("http://localhost:8080/json", "target_not_loopback"),
-        ("http://192.168.1.10:8080/json", "target_not_loopback"),
         ("http://127.0.0.1:8080/json#frag", "target_url_invalid"),
+        ("http://bad host/json", "target_url_invalid"),
         ("http://user:pass@127.0.0.1:8080/json", "target_credentials_not_allowed"),
+        ("http://user:pass@example.com/json", "target_credentials_not_allowed"),
         ("ftp://127.0.0.1/json", "target_scheme_not_allowed"),
     ],
 )
 async def test_console_rejects_out_of_scope_targets(client, url, code):
-    """非回环或带凭据等不合法目标必须在发请求前被拒绝。
+    """非法协议、带内嵌凭据或格式非法目标必须在发请求前被拒绝。
 
     实现：策略拒绝走 400 并带固定错误码，响应体是统一的 ``error`` 结构，
     这样界面能按 code 分支提示，而不是解析自然语言。
@@ -206,6 +206,98 @@ async def test_console_rejects_out_of_scope_targets(client, url, code):
     response = await client.post("/api/console/requests", json={"method": "GET", "url": url})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == code
+
+
+def test_target_policy_accepts_domains_lan_public_and_enforces_optional_allowlist():
+    """默认放行合法域名、局域网 IP、回环与公网 IP；显式配置白名单时仍严格收口。"""
+    from api_agent.console.service import build_url
+
+    for raw_url, expected_origin in (
+        ("https://API.GitHub.com/repos?page=1", "https://api.github.com"),
+        ("http://localhost:8080/health", "http://localhost:8080"),
+        ("http://192.168.1.10:8080/json", "http://192.168.1.10:8080"),
+        ("https://8.8.8.8/dns-query", "https://8.8.8.8"),
+        ("http://[::1]:8080/x", "http://[::1]:8080"),
+    ):
+        parsed, origin = validate_target(raw_url, [])
+        assert origin == expected_origin
+        assert build_url(parsed).startswith(expected_origin)
+
+    validate_target("https://api.github.com/repos", ["https://api.github.com"])
+    with pytest.raises(TargetError, match="target_origin_not_allowed"):
+        validate_target("https://example.com/repos", ["https://api.github.com"])
+
+
+async def test_console_respects_trust_system_proxy_setting(app, client, target, monkeypatch):
+    """系统代理开关应透传为 httpx.AsyncClient 的 trust_env 参数。"""
+    seen_trust_env: list[bool] = []
+    original_client = httpx.AsyncClient
+
+    def tracking_client(*args, **kwargs):
+        seen_trust_env.append(bool(kwargs.get("trust_env")))
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", tracking_client)
+
+    app.state.settings.trust_system_proxy = False
+    first = await client.post(
+        "/api/console/requests", json={"method": "GET", "url": f"{target.base_url}/json"}
+    )
+    assert first.status_code == 200
+    assert seen_trust_env[-1] is False
+
+    app.state.settings.trust_system_proxy = True
+    second = await client.post(
+        "/api/console/requests", json={"method": "GET", "url": f"{target.base_url}/json"}
+    )
+    assert second.status_code == 200
+    assert seen_trust_env[-1] is True
+
+
+async def test_cross_origin_redirect_strips_credentials(client):
+    """跟随跨源重定向时必须剥离 Authorization、Cookie 与自定义头，防止凭据泄漏。"""
+    from fastapi import Request
+    from fastapi.responses import RedirectResponse
+
+    receiver = FastAPI()
+
+    @receiver.get("/check")
+    async def check(request: Request):
+        return {k.lower(): v for k, v in request.headers.items()}
+
+    other = await LocalServer(receiver).start()
+    redirector = FastAPI()
+
+    @redirector.get("/bounce")
+    async def bounce():
+        return RedirectResponse(url=f"{other.base_url}/check", status_code=302)
+
+    source = await LocalServer(redirector).start()
+    try:
+        response = await client.post(
+            "/api/console/requests",
+            json={
+                "method": "GET",
+                "url": f"{source.base_url}/bounce",
+                "headers": {
+                    "Authorization": "Bearer top-secret",
+                    "Cookie": "sid=secret",
+                    "X-Custom": "drop-me",
+                },
+                "follow_redirects": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["response"]["redirects"][0]["cross_origin"] is True
+        seen_headers = json.loads(payload["response"]["body"])
+        assert "authorization" not in seen_headers
+        assert "cookie" not in seen_headers
+        assert "x-custom" not in seen_headers
+    finally:
+        await source.stop()
+        await other.stop()
 
 
 async def test_console_rejects_reserved_and_invalid_headers(client):

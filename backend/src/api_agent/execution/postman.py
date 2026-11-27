@@ -16,16 +16,28 @@ from api_agent.execution.collection import compile_collection
 from api_agent.execution.report import normalize_report
 from api_agent.execution.schemas import ExecutionPlan, RunResult, empty_result
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
 
-def process_environment(workspace: Path) -> dict[str, str]:
+
+def process_environment(workspace: Path, *, trust_env: bool = False) -> dict[str, str]:
     """为子进程构造一个“最小且隔离”的环境变量集合。
 
     作用：既让 Windows 上的可执行文件能找到系统 DLL（因此保留 SYSTEMROOT/WINDIR/
     COMSPEC/PATH/PATHEXT），又把用户目录、临时目录全部重定向到本次临时工作区，
-    并关闭代理、遥测和网络跟踪，避免把宿主环境信息或用户数据带进目标进程。
+    并关闭遥测和网络跟踪；默认关闭代理（``NO_PROXY=*``），当 ``trust_env=True`` 时
+    显式透传宿主代理环境变量。
     实现：先按白名单从 ``os.environ`` 挑出系统必需变量，再覆盖写入
     HOME/USERPROFILE/APPDATA/LOCALAPPDATA/TEMP/TMP（都指向 workspace）、
-    ``NO_PROXY=*``（不走代理）、``DO_NOT_TRACK``/``POSTMAN_DISABLE_TELEMETRY``（关遥测）。
+    ``DO_NOT_TRACK``/``POSTMAN_DISABLE_TELEMETRY``（关遥测）。
 
     注意：这里刻意不继承路径里可能存在的凭据类变量，目标鉴权变量由调用方单独注入。
     """
@@ -42,12 +54,17 @@ def process_environment(workspace: Path) -> dict[str, str]:
             "LOCALAPPDATA": str(workspace),
             "TEMP": str(workspace),
             "TMP": str(workspace),
-            "NO_PROXY": "*",
-            "no_proxy": "*",
             "DO_NOT_TRACK": "1",
             "POSTMAN_DISABLE_TELEMETRY": "1",
         }
     )
+    if trust_env:
+        for key in _PROXY_ENV_KEYS:
+            if key in os.environ:
+                environment[key] = os.environ[key]
+    else:
+        environment["NO_PROXY"] = "*"
+        environment["no_proxy"] = "*"
     return environment
 
 
@@ -131,8 +148,15 @@ class PostmanRunner:
 
     name = "postman-cli"
 
-    def __init__(self, executable: Path, temp_root: Path, omit_response_payload: bool = False):
-        """记录可执行文件、临时根目录与是否裁剪响应负载。
+    def __init__(
+        self,
+        executable: Path,
+        temp_root: Path,
+        omit_response_payload: bool = False,
+        *,
+        trust_env: bool = False,
+    ):
+        """记录可执行文件、临时根目录、响应负载裁剪与系统代理开关。
 
         实现：``resolve()`` 把可执行文件路径固化成绝对路径，
         避免后续子进程以别的 cwd 启动时相对路径解析到别处；
@@ -143,6 +167,7 @@ class PostmanRunner:
         self.executable = executable.resolve()
         self.temp_root = temp_root
         self.omit_response_payload = omit_response_payload
+        self.trust_env = trust_env
 
     def available(self) -> bool:
         """判断 CLI 是否可用（足够开始一次运行）。
@@ -193,36 +218,21 @@ class PostmanRunner:
                     await stop_process(process, job)
         return {"available": False, "error_kind": "cli_unavailable"}
 
-    async def run(self, plan: ExecutionPlan, secrets: dict[str, str]) -> RunResult:
-        """在临时工作区里执行这份计划，并返回归一化后的结果。
-
-        实现流程：
-        ① 不可用则立刻返回 ``cli_unavailable``（此时不消耗任何预算）；
-        ② 建临时目录，把编译好的集合写成 ``collection.json``，
-           报告预先指定写到 ``report.json``；
-        ③ 组装 CLI 参数，关键几项是：只输出 JSON 报告并采用 newman 结构、
-           ``--ignore-redirects``（禁止跳转到授权范围外）、
-           ``--no-insecure-file-read``（禁止读取本地文件）、单次迭代、
-           以及从计划带入的三档超时和请求间隔；
-           ``--reporter-json-omitAllHeadersAndBody`` 只在
-           ``omit_response_payload`` 为真时追加——默认保留响应头与响应体，
-           否则运行结果里看不到目标真实返回了什么；
-        ④ 启动子进程并挂上 Job，用 ``plan.timeout_ms`` 做整体等待上限；
-        ⑤ 校验报告存在且不超过 20MB，再 ``json.loads`` 并确认是 dict，
-           交给 ``normalize_report`` 归一；
-        ⑥ 超时 → ``timed_out``，OSError/JSON 错误 → ``cli_execution_error``；
-        ⑦ ``finally`` 里清理进程，最后补上实际耗时。
-        """
-        if not self.available():
-            return empty_result(plan, "error", "cli_unavailable")
-        self.temp_root.mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
+    async def _run_collection(
+        self,
+        collection: dict,
+        plan: ExecutionPlan,
+        *,
+        timeout_ms: int,
+        secrets: set[str] | None = None,
+    ) -> tuple[RunResult, dict | None]:
+        """在独立临时目录中运行一次 Postman CLI 集合，返回归一化结果与原始报告。"""
         with tempfile.TemporaryDirectory(dir=self.temp_root) as directory:
             workspace = Path(directory)
             collection_path = workspace / "collection.json"
             report_path = workspace / "report.json"
             collection_path.write_text(
-                json.dumps(compile_collection(plan, secrets), ensure_ascii=True),
+                json.dumps(collection, ensure_ascii=True),
                 encoding="utf-8",
             )
             arguments = [
@@ -242,15 +252,15 @@ class PostmanRunner:
                 "--iteration-count",
                 "1",
                 "--timeout",
-                str(plan.timeout_ms),
+                str(max(100, timeout_ms)),
                 "--timeout-request",
                 str(plan.request_timeout_ms),
                 "--timeout-script",
                 "1000",
-                "--delay-request",
-                str(plan.delay_ms),
                 "--silent",
             ]
+            if plan.delay_ms > 0:
+                arguments.extend(["--delay-request", str(plan.delay_ms)])
             if self.omit_response_payload:
                 arguments.append("--reporter-json-omitAllHeadersAndBody")
             process = None
@@ -259,28 +269,56 @@ class PostmanRunner:
                 process = await asyncio.create_subprocess_exec(
                     *arguments,
                     cwd=workspace,
-                    env=process_environment(workspace),
+                    env=process_environment(workspace, trust_env=self.trust_env),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=os.name != "nt",
                 )
                 job = process_job(process.pid)
-                await asyncio.wait_for(process.wait(), plan.timeout_ms / 1000)
+                await asyncio.wait_for(process.wait(), max(0.1, timeout_ms / 1000))
                 if not report_path.is_file() or report_path.stat().st_size > 20 * 1024 * 1024:
-                    result = empty_result(plan, "error", "report_unavailable")
-                else:
-                    report = json.loads(report_path.read_text(encoding="utf-8"))
-                    if not isinstance(report, dict):
-                        raise ValueError
-                    result = normalize_report(
-                        report, plan, process.returncode, capture=not self.omit_response_payload
-                    )
+                    return empty_result(plan, "error", "report_unavailable"), None
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                if not isinstance(report, dict):
+                    raise ValueError
+                return (
+                    normalize_report(
+                        report,
+                        plan,
+                        process.returncode,
+                        capture=not self.omit_response_payload,
+                        secrets=secrets,
+                    ),
+                    report,
+                )
             except TimeoutError:
-                result = empty_result(plan, "timed_out", "deadline_exceeded")
+                return empty_result(plan, "timed_out", "deadline_exceeded"), None
             except (OSError, ValueError, KeyError):
-                result = empty_result(plan, "error", "cli_execution_error")
+                return empty_result(plan, "error", "cli_execution_error"), None
             finally:
                 if process is not None:
                     await stop_process(process, job)
-            result.duration_ms = round((time.monotonic() - started) * 1000, 2)
-            return result
+
+    async def run(self, plan: ExecutionPlan, secrets: dict[str, str]) -> RunResult:
+        """在临时工作区里通过单次 Postman CLI 进程执行计划并返回归一化结果。
+
+        实现流程：
+        ① 不可用则立刻返回 ``cli_unavailable``（此时不消耗任何预算）；
+        ② 统一由 ``compile_collection`` 编译集合：无状态计划保持最小结构，
+           有状态依赖链通过 ``prerequest`` 校验 ``depends_on``/``always_run``/变量与
+           运行期安全并经 ``pm.execution.skipRequest()`` 无回退跳过不就绪步骤；
+        ③ 在隔离临时目录执行单次 CLI 进程（仅 ``delay_ms > 0`` 时传入 ``--delay-request``），
+           并由 ``normalize_report`` 统一补齐断言观察值与非敏感变量回显。
+        """
+        if not self.available():
+            return empty_result(plan, "error", "cli_unavailable")
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        result, _ = await self._run_collection(
+            compile_collection(plan, secrets),
+            plan,
+            timeout_ms=plan.timeout_ms,
+            secrets=set(secrets.values()),
+        )
+        result.duration_ms = round((time.monotonic() - started) * 1000, 2)
+        return result

@@ -2,60 +2,77 @@
 /**
  * 三种测试共用的分栏外壳。页面通过插槽提供内容；外壳管理尺寸和拖动偏好。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import ResizableSplit from './ResizableSplit.vue'
 import { readStoredSize, writeStoredSize } from '@/lib/split'
-import { allocateWorkspaceWidth, adjacentWidthRange, WORKSPACE_LAYOUT_BOUNDS as bounds, workspaceMaxWidth, workspaceMinWidth, type WorkspaceWidths } from '@/lib/workspaceLayout'
+import { allocateWorkspaceWidth, adjacentWidthRange, getWorkspaceMaxWidth, resolveWorkspaceBounds, WORKSPACE_LAYOUT_BOUNDS as bounds, workspaceMinWidth, type WorkspaceWidths } from '@/lib/workspaceLayout'
 
-const props = withDefaults(
-  defineProps<{
-    historyKey: string
-    editorKey: string
-    assistantKey: string
-    historyWidth?: number
-    editorWidth: number
-    upperHeight?: number
-    hideHistoryOnNarrow?: boolean
-  }>(),
-  { historyWidth: 268, upperHeight: 260 },
-)
+const props = defineProps<{
+  historyKey: string
+  editorKey: string
+  assistantKey: string
+  editorWidth: number
+  hideHistoryOnNarrow?: boolean
+  /** 可选放宽结果区最大宽度（例如大模型能力矩阵传入 1400）；默认沿用 720。 */
+  resultsMax?: number
+}>()
 
 const root = ref<HTMLElement | null>(null)
-const upperHeight = ref(props.upperHeight)
+/** 无已保存尺寸时，上方占满余量，让小Y保持最小高度。 */
+const upperHeight = ref(Infinity)
 const historyHidden = ref(false)
-const widths = ref<WorkspaceWidths>({ history: props.historyWidth, editor: props.editorWidth, results: bounds.results.min })
+const widths = ref<WorkspaceWidths>({ history: bounds.history.min, editor: props.editorWidth, results: bounds.results.min })
 let desktopWidths: WorkspaceWidths | undefined
 let compactWidths: WorkspaceWidths | undefined
 let observer: ResizeObserver | undefined
 let narrowViewport: MediaQueryList | undefined
+let measuredWidth = 0
 const resultKey = `${props.editorKey}.second`
-const historyRange = computed(() => adjacentWidthRange(widths.value, 'history', historyHidden.value))
-const editorRange = computed(() => adjacentWidthRange(widths.value, 'editor', historyHidden.value))
-const shellStyle = computed(() => ({ maxWidth: `${workspaceMaxWidth - (historyHidden.value ? bounds.history.max : 0)}px` }))
+const effectiveResultsMax = computed(() => resolveWorkspaceBounds(props.resultsMax).results.max)
+const historyRange = computed(() => adjacentWidthRange(widths.value, 'history', historyHidden.value, props.resultsMax))
+const editorRange = computed(() => adjacentWidthRange(widths.value, 'editor', historyHidden.value, props.resultsMax))
+const shellStyle = computed(() => ({
+  maxWidth: `${widths.value.history + widths.value.editor + widths.value.results}px`,
+  '--workspace-results-max': `${effectiveResultsMax.value}px`,
+}))
 
 /** Distribute width changes without overwriting saved preferences or a layout temporarily squeezed below its minimum. */
 function measureWidth(): void {
   const total = root.value?.getBoundingClientRect().width ?? 0
   if (total <= 0) return
-  const hidden = narrowViewport?.matches ?? false
+  const hidden = Boolean(
+    props.hideHistoryOnNarrow &&
+      ((narrowViewport?.matches ?? false) || total < workspaceMinWidth(false)),
+  )
+  if (total === measuredWidth && hidden === historyHidden.value) return
+  measuredWidth = total
   historyHidden.value = hidden
+  const resultsMax = effectiveResultsMax.value
   let previous = hidden ? compactWidths : desktopWidths
+  let available = total
   if (!previous) {
-    const history = readStoredSize(props.historyKey, props.historyWidth)
+    const savedHistory = readStoredSize(props.historyKey, 0)
+    const history = savedHistory || bounds.history.min
+    if (!savedHistory && !hidden) available = Math.min(total, bounds.history.min + bounds.editor.max + resultsMax)
     const editor = readStoredSize(props.editorKey, props.editorWidth)
     previous = {
       history,
       editor,
-      results: readStoredSize(resultKey, Math.min(total, workspaceMaxWidth) - (hidden ? 0 : history) - editor),
+      results: readStoredSize(resultKey, Math.min(available, getWorkspaceMaxWidth(resultsMax)) - (hidden ? 0 : history) - editor),
     }
   }
-  const next = allocateWorkspaceWidth(total, previous, hidden)
+  const next = allocateWorkspaceWidth(available, previous, hidden, resultsMax)
   widths.value = next
   if (total >= workspaceMinWidth(hidden)) {
     if (hidden) compactWidths = next
     else desktopWidths = next
   }
 }
+
+watch(() => props.resultsMax, () => {
+  measuredWidth = 0
+  measureWidth()
+})
 
 /** Dragging the history divider trades width with the editor; dragging the editor divider trades with results. */
 function resizeNeighbor(pane: 'history' | 'editor', value: number): void {
@@ -64,12 +81,14 @@ function resizeNeighbor(pane: 'history' | 'editor', value: number): void {
   const next = { ...current, [pane]: value, [neighbor]: current[neighbor] + current[pane] - value }
   widths.value = next
   if (historyHidden.value) compactWidths = next
-  else {
-    desktopWidths = next
-    writeStoredSize(props.historyKey, next.history)
-  }
-  writeStoredSize(props.editorKey, next.editor)
-  writeStoredSize(resultKey, next.results)
+  else desktopWidths = next
+}
+
+function persistNeighbor(): void {
+  const current = widths.value
+  if (!historyHidden.value) writeStoredSize(props.historyKey, current.history)
+  writeStoredSize(props.editorKey, current.editor)
+  writeStoredSize(resultKey, current.results)
 }
 
 onMounted(() => {
@@ -98,6 +117,7 @@ onBeforeUnmount(() => {
       direction="horizontal"
       label="拖动调整历史栏与填写区宽度"
       @update:size="resizeNeighbor('history', $event)"
+      @size-commit="persistNeighbor"
     >
       <template #first>
         <div v-show="!historyHidden" class="workspace-history"><slot name="history" /></div>
@@ -119,6 +139,7 @@ onBeforeUnmount(() => {
               :range="editorRange"
               label="拖动调整填写区与结果区宽度"
               @update:size="resizeNeighbor('editor', $event)"
+              @size-commit="persistNeighbor"
             >
               <template #first><slot name="editor" /></template>
               <template #second><slot name="results" /></template>

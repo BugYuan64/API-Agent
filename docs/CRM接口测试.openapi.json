@@ -1,0 +1,1074 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CRM 系统接口文档（测试用例版）",
+    "version": "1.0.0",
+    "description": "根据 docs/CRM接口测试清单.md 与 crm-backend WebSocket 实现生成，供 API-Agent /testcases 文档识别与自动用例执行（覆盖 HTTP、SSE 与 WebSocket /api/ws/chat）。\n\n使用方式：\n1. 登录换取 token：POST http://127.0.0.1:8088/api/user/login  body {\"email\":\"admin@elcrms.com\",\"password\":\"123456\"}\n2. 把本文件中所有 REPLACE_WITH_TOKEN 字符串替换为真实 token（24h 有效）。\n3. 在 /testcases 上传本文件，origin 填 http://127.0.0.1:8088。\n4. 默认跳过写用例（POST/PUT/DELETE 及带发送消息的 WebSocket）；要跑写用例与 WebSocket 发消息需勾选 allow_writes，并在事后清理写入数据（见清单第八节）。\n\n注意：CRM HTTP 业务错误的 HTTP 状态码仍是 200，断言必须看 body.code（字符串），不能只看 HTTP status；WebSocket 握手升级成功状态为 101，携带非法 token 时握手返回 401。"
+  },
+  "x-target-origin": "http://127.0.0.1:8088",
+  "x-auth-note": "HTTP 鉴权请求头名为 token（不是 Authorization: Bearer），白名单：/api/user/register、/api/user/login、/api/ws/**、/error。WebSocket /api/ws/chat 由专用握手拦截器校验 token（请求头 token / Authorization: Bearer / 查询参数 ?token），带非法 token 返 401，未带 token 允许外部调试端接入。",
+  "paths": {
+    "/api/user/login": {
+      "post": {
+        "summary": "登录换取 JWT",
+        "operationId": "login",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              },
+              "example": {
+                "email": "admin@elcrms.com",
+                "password": "123456"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "登录成功（业务错误也返回 HTTP 200，需断言 body.code）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "登录成功-admin",
+            "method": "POST",
+            "path": "/api/user/login",
+            "body": {
+              "email": "admin@elcrms.com",
+              "password": "123456"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "200"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/data/name",
+                "expected": "系统管理员"
+              }
+            ]
+          },
+          {
+            "name": "登录-密码错误",
+            "method": "POST",
+            "path": "/api/user/login",
+            "body": {
+              "email": "admin@elcrms.com",
+              "password": "wrong-password"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/msg",
+                "expected": "邮箱或密码错误"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/api/user/register": {
+      "post": {
+        "summary": "用户注册",
+        "operationId": "register",
+        "description": "写操作用例使用 apireg+*@example.com 邮箱段，跑完需按清单第八节清理。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              },
+              "example": {
+                "name": "接口测试用户",
+                "email": "apireg-openapi@example.com",
+                "phone": "13900003333",
+                "company": "测试公司",
+                "password": "test123456",
+                "confirmPassword": "test123456"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "注册结果",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Result"
+                }
+              }
+            }
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "注册-邮箱已注册",
+            "method": "POST",
+            "path": "/api/user/register",
+            "body": {
+              "name": "重复邮箱",
+              "email": "admin@elcrms.com",
+              "phone": "13900003333",
+              "company": "测试公司",
+              "password": "test123456",
+              "confirmPassword": "test123456"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "contains",
+                "expected": "该邮箱已被注册"
+              }
+            ]
+          },
+          {
+            "name": "注册-成功（写操作，需 allow_writes + 事后清理）",
+            "method": "POST",
+            "path": "/api/user/register",
+            "body": {
+              "name": "接口测试用户",
+              "email": "apireg-openapi@example.com",
+              "phone": "13900003333",
+              "company": "测试公司",
+              "password": "test123456",
+              "confirmPassword": "test123456"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "200"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/api/customer/list": {
+      "get": {
+        "summary": "客户分页 + 关键词查询",
+        "operationId": "customerList",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "header",
+            "required": true,
+            "description": "登录返回的 JWT；跑测试前替换为真实 token",
+            "schema": {
+              "type": "string"
+            },
+            "example": "REPLACE_WITH_TOKEN"
+          },
+          {
+            "name": "keyword",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "华为"
+          },
+          {
+            "name": "pageNum",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "example": 1
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 10
+            },
+            "example": 3
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "分页结果（PageHelper PageInfo）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PageResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "未登录 / token 失效"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "客户列表-无 token 拦截",
+            "method": "GET",
+            "path": "/api/customer/list",
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 401
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "401"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/msg",
+                "expected": "未登录，请先登录"
+              }
+            ]
+          },
+          {
+            "name": "客户列表-默认分页",
+            "method": "GET",
+            "path": "/api/customer/list?pageNum=1&pageSize=3",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "200"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/data/pageNum",
+                "expected": 1
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/data/pageSize",
+                "expected": 3
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/api/customer/{id}": {
+      "parameters": [
+        {
+          "name": "token",
+          "in": "header",
+          "required": true,
+          "description": "登录返回的 JWT；跑测试前替换为真实 token",
+          "schema": {
+            "type": "string"
+          },
+          "example": "REPLACE_WITH_TOKEN"
+        },
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          },
+          "example": 1
+        }
+      ],
+      "get": {
+        "summary": "客户详情",
+        "operationId": "customerDetail",
+        "responses": {
+          "200": {
+            "description": "客户详情（id 不存在也返回 HTTP 200 + code=500）"
+          },
+          "401": {
+            "description": "未登录"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "客户详情-id=1 成功",
+            "method": "GET",
+            "path": "/api/customer/1",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "200"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/data/id",
+                "expected": 1
+              }
+            ]
+          },
+          {
+            "name": "客户详情-id 不存在（HTTP 200 + code 500）",
+            "method": "GET",
+            "path": "/api/customer/999999",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/msg",
+                "expected": "客户不存在"
+              }
+            ]
+          }
+        ]
+      },
+      "put": {
+        "summary": "编辑客户（乐观锁 + 全量覆盖）",
+        "operationId": "updateCustomer",
+        "description": "写操作。注意已知缺陷：不传 status 会触发 Column 'status' cannot be null 并泄露 SQL 堆栈。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomerRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "编辑结果"
+          },
+          "401": {
+            "description": "未登录"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "编辑-不传 status 触发 NOT NULL 缺陷（已知缺陷回归）",
+            "method": "PUT",
+            "path": "/api/customer/6",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "body": {
+              "name": "缺陷回归",
+              "company": "缺陷回归公司",
+              "email": "bug-status@example.com",
+              "phone": "13900009999"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "contains",
+                "expected": "status"
+              }
+            ]
+          },
+          {
+            "name": "编辑-id 不存在",
+            "method": "PUT",
+            "path": "/api/customer/999999",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "body": {
+              "name": "不存在",
+              "company": "不存在公司",
+              "email": "no-such@example.com",
+              "phone": "13900009999",
+              "status": "active"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/msg",
+                "expected": "客户不存在"
+              }
+            ]
+          }
+        ]
+      },
+      "delete": {
+        "summary": "软删除客户",
+        "operationId": "deleteCustomer",
+        "description": "写操作。软删除（UPDATE status='inactive'），关联商机客户拒绝删除，重复删除幂等。",
+        "responses": {
+          "200": {
+            "description": "删除结果"
+          },
+          "401": {
+            "description": "未登录"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "删除-有关联商机被拒绝（id=1 李明/华为 3 个商机）",
+            "method": "DELETE",
+            "path": "/api/customer/1",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "contains",
+                "expected": "关联商机"
+              }
+            ]
+          },
+          {
+            "name": "删除-id 不存在",
+            "method": "DELETE",
+            "path": "/api/customer/999999",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "500"
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/msg",
+                "expected": "客户不存在"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/api/customer": {
+      "post": {
+        "summary": "新增客户",
+        "operationId": "createCustomer",
+        "description": "写操作。新增不返回新 id；email 是 DB 唯一键；不传 status 自动填 potential。测试邮箱用 apitester+*@example.com 段。",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "header",
+            "required": true,
+            "description": "登录返回的 JWT；跑测试前替换为真实 token",
+            "schema": {
+              "type": "string"
+            },
+            "example": "REPLACE_WITH_TOKEN"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomerRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "新增结果"
+          },
+          "401": {
+            "description": "未登录"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "新增-缺 name",
+            "method": "POST",
+            "path": "/api/customer",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "body": {
+              "company": "缺姓名公司",
+              "email": "apitester-noname@example.com",
+              "phone": "13900001111"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "400"
+              }
+            ]
+          },
+          {
+            "name": "新增-email 与已有客户重复",
+            "method": "POST",
+            "path": "/api/customer",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "body": {
+              "name": "重复邮箱",
+              "company": "重复邮箱公司",
+              "email": "liming@huawei.com",
+              "phone": "13900001111"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "400"
+              },
+              {
+                "kind": "contains",
+                "expected": "该邮箱已被注册"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/api/chat/ask/stream": {
+      "get": {
+        "summary": "流式问答（SSE，后端转发 RAG）",
+        "operationId": "chatAskStream",
+        "x-protocol": "sse",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "header",
+            "required": true,
+            "description": "登录返回的 JWT；跑测试前替换为真实 token",
+            "schema": {
+              "type": "string"
+            },
+            "example": "REPLACE_WITH_TOKEN"
+          },
+          {
+            "name": "question",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "CRM系统有哪些核心功能模块？"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE 事件流（data:<分片>\\n\\n）",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "401": {
+            "description": "未登录"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "SSE-无 token 拦截",
+            "method": "GET",
+            "path": "/api/chat/ask/stream?question=hi",
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 401
+              },
+              {
+                "kind": "json_equals",
+                "pointer": "/code",
+                "expected": "401"
+              }
+            ]
+          },
+          {
+            "name": "SSE-正常提问（需 RAG 在线）",
+            "method": "GET",
+            "protocol": "sse",
+            "path": "/api/chat/ask/stream?question=%E4%BD%A0%E5%A5%BD",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 200
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "/api/ws/chat": {
+      "get": {
+        "summary": "实时双向对话（WebSocket）",
+        "operationId": "chatWebSocket",
+        "x-protocol": "websocket",
+        "x-messages": [
+          "{\"type\":\"ping\"}",
+          "{\"type\":\"peers\"}",
+          "你好，来自 API-Agent"
+        ],
+        "description": "实时双向 WebSocket 端点（ws://127.0.0.1:8088/api/ws/chat 或直连 ws://127.0.0.1:8081/api/ws/chat）。支持按房间隔离广播、welcome/join/leave 系统通知、ping/pong 心跳、peers 在线列表查询、纯文本与自定义 JSON 消息及空白消息 error 反馈；携带非法 token 时握手返回 HTTP 401，未带 token 允许外部调试端接入。",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "header",
+            "required": false,
+            "description": "可选 JWT（亦可放 Authorization: Bearer 或 ?token）；携带非法 token 握手返回 401",
+            "schema": {
+              "type": "string"
+            },
+            "example": "REPLACE_WITH_TOKEN"
+          },
+          {
+            "name": "room",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "lobby"
+            },
+            "example": "api-agent-test"
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "API测试端"
+          },
+          {
+            "name": "client",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "crm",
+                "external",
+                "api-agent"
+              ]
+            },
+            "example": "api-agent"
+          },
+          {
+            "name": "echo",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ],
+              "default": "true"
+            },
+            "example": "true"
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket 握手升级成功"
+          },
+          "401": {
+            "description": "携带非法或过期 token，拒绝握手"
+          }
+        },
+        "x-test-cases": [
+          {
+            "name": "WebSocket-鉴权建连与心跳/成员查询",
+            "method": "GET",
+            "protocol": "websocket",
+            "path": "/api/ws/chat?room=api-agent-test&client=crm",
+            "headers": {
+              "token": "REPLACE_WITH_TOKEN"
+            },
+            "messages": [
+              "{\"type\":\"ping\"}",
+              "{\"type\":\"peers\"}",
+              "你好，来自 API-Agent 鉴权端"
+            ],
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 101
+              },
+              {
+                "kind": "event_count",
+                "expected": 3
+              },
+              {
+                "kind": "message_contains",
+                "expected": "\"type\":\"welcome\""
+              },
+              {
+                "kind": "message_contains",
+                "expected": "\"type\":\"pong\""
+              }
+            ]
+          },
+          {
+            "name": "WebSocket-外部匿名端自定义JSON与空白错误校验",
+            "method": "GET",
+            "protocol": "websocket",
+            "path": "/api/ws/chat?room=api-agent-test&name=ExternalPeer&client=external",
+            "messages": [
+              "{\"customKey\":\"customVal\",\"n\":42}",
+              "   "
+            ],
+            "assertions": [
+              {
+                "kind": "status",
+                "expected": 101
+              },
+              {
+                "kind": "message_contains",
+                "expected": "\"type\":\"welcome\""
+              },
+              {
+                "kind": "message_contains",
+                "expected": "\"format\":\"json\""
+              },
+              {
+                "kind": "message_contains",
+                "expected": "消息内容不能为空"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "LoginRequest": {
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "example": "admin@elcrms.com"
+          },
+          "password": {
+            "type": "string",
+            "example": "123456"
+          }
+        }
+      },
+      "RegisterRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "email",
+          "phone",
+          "company",
+          "password",
+          "confirmPassword"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "phone": {
+            "type": "string",
+            "pattern": "^1[3-9]\\d{9}$"
+          },
+          "company": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "password": {
+            "type": "string",
+            "minLength": 6,
+            "maxLength": 32
+          },
+          "confirmPassword": {
+            "type": "string"
+          }
+        }
+      },
+      "CustomerRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "company",
+          "email",
+          "phone"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "company": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "phone": {
+            "type": "string",
+            "pattern": "^1[3-9]\\d{9}$"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "potential",
+              "inactive"
+            ]
+          },
+          "lastContact": {
+            "type": "string",
+            "format": "date"
+          }
+        }
+      },
+      "Result": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "200",
+              "400",
+              "401",
+              "500"
+            ]
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {}
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "token": {
+                "type": "string"
+              },
+              "userId": {
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "email": {
+                "type": "string"
+              },
+              "company": {
+                "type": "string"
+              },
+              "phone": {
+                "type": "string"
+              },
+              "perms": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "CustomerVO": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "company": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "potential",
+              "inactive"
+            ]
+          },
+          "totalSales": {
+            "type": "number"
+          },
+          "points": {
+            "type": "integer"
+          },
+          "lastContact": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        }
+      },
+      "PageResult": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "msg": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "pageNum": {
+                "type": "integer"
+              },
+              "pageSize": {
+                "type": "integer"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "total": {
+                "type": "integer"
+              },
+              "pages": {
+                "type": "integer"
+              },
+              "list": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CustomerVO"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-rag-note": "RAG 直连 8002 的 /health、/ask、/ask/stream 属于不同 origin，请在 /testcases 单独建任务执行（origin=http://127.0.0.1:8002），不要与 8088 混在一个任务里。RAG 的 HTTP 状态码语义规范（400/422），与 Java 后端不同。"
+}

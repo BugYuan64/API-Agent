@@ -77,7 +77,7 @@ class LLMSettingService:
                 ),
                 model=settings.llm_model if settings else "gpt-4o",
                 timeout_seconds=settings.llm_timeout_seconds if settings else 60.0,
-                enabled=settings.llm_mode != "disabled" if settings else False,
+                enabled=settings.llm_mode != "disabled" if settings else True,
                 updated_at=utc_now(),
             )
         return record
@@ -97,15 +97,19 @@ class LLMSettingService:
 
     async def get_response(self) -> LLMConfigResponse:
         """把有效配置转换为脱敏响应，仅返回密钥是否存在，不暴露密钥文本。"""
-        record = await self.get_effective_record()
-        has_key = bool(record.api_key and record.api_key.strip())
+        return self.config_response(await self.get_effective_record())
+
+    @staticmethod
+    def config_response(record: LLMSettingRecord) -> LLMConfigResponse:
+        """Use the same redacted representation for reads, full saves and model switches."""
         return LLMConfigResponse(
             enabled=record.enabled,
             provider=record.provider,
             base_url=record.base_url,
             model=record.model,
+            generation_model=record.generation_model,
             timeout_seconds=record.timeout_seconds,
-            has_api_key=has_key,
+            has_api_key=bool(record.api_key and record.api_key.strip()),
         )
 
     async def select_model(self, model: str) -> LLMConfigResponse:
@@ -130,6 +134,8 @@ class LLMSettingService:
                 record.api_key = None
             record.base_url = target
         record.model = data.model.strip()
+        if "generation_model" in data.model_fields_set:
+            record.generation_model = data.generation_model
         record.timeout_seconds = data.timeout_seconds
 
         if data.api_key is not None:
@@ -139,25 +145,19 @@ class LLMSettingService:
         await self.session.commit()
         await self.session.refresh(record)
 
-        has_key = bool(record.api_key and record.api_key.strip())
-        return LLMConfigResponse(
-            enabled=record.enabled,
-            provider=record.provider,
-            base_url=record.base_url,
-            model=record.model,
-            timeout_seconds=record.timeout_seconds,
-            has_api_key=has_key,
-        )
+        return self.config_response(record)
 
-    async def get_client(self) -> OpenAIClient:
-        """根据显式配置或环境回退构建客户端，不写数据库，也不探测端点。"""
+    async def get_client(self, *, for_generation: bool = False) -> OpenAIClient:
+        """Build a read-only client; only document and test generation may use the override."""
         record = await self.get_effective_record()
+        model = record.generation_model if for_generation else None
         return OpenAIClient(
             base_url=record.base_url,
             api_key=record.api_key,
-            model=record.model,
+            model=model or record.model,
             timeout_seconds=record.timeout_seconds,
             enabled=record.enabled,
+            trust_env=bool(self.settings and self.settings.trust_system_proxy),
         )
 
     async def get_preview_client(
@@ -167,7 +167,7 @@ class LLMSettingService:
         api_key: str | None = None,
         model: str | None = None,
     ) -> OpenAIClient:
-        """合并预览字段与有效配置，返回启用且超时最多 15 秒的临时客户端。
+        """合并预览字段与有效配置，返回启用且遵循系统超时（上限 90 秒）的临时客户端。
 
         未显式传密钥时只对同源地址沿用旧密钥，空字符串表示无鉴权；
         不保存预览、不发起网络请求，数据库读取错误仍向外传播。
@@ -183,6 +183,7 @@ class LLMSettingService:
             base_url=target,
             api_key=key,
             model=model.strip() if model and model.strip() else record.model,
-            timeout_seconds=min(15.0, record.timeout_seconds),
+            timeout_seconds=min(90.0, record.timeout_seconds),
             enabled=True,
+            trust_env=bool(self.settings and self.settings.trust_system_proxy),
         )

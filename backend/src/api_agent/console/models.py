@@ -1,6 +1,6 @@
 """Console history with scrubbed replay inputs and bounded response previews."""
 
-from sqlalchemy import JSON, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, ForeignKey, Integer, String, Text, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from api_agent.infrastructure.orm import Base, CreatedAtMixin, IdMixin
@@ -34,3 +34,68 @@ class ConsoleRequestRecord(IdMixin, CreatedAtMixin, Base):
     response_headers: Mapped[dict] = mapped_column(JSON, default=dict)
     response_preview: Mapped[str | None] = mapped_column(Text)
     response_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual", server_default="manual"
+    )
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    badge: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="completed", server_default="completed"
+    )
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    total_rounds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    cooldown_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=500, server_default="500"
+    )
+    http_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    response_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    redirects_json: Mapped[list | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    sse_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+
+
+class ConsoleSubCaseRecord(IdMixin, CreatedAtMixin, Base):
+    """AI 多轮接口测试中单个子用例的执行快照。
+
+    作用：挂在单条 ``console_requests`` 父历史记录之下，按 ``(round_index, case_index)``
+    保留每个子用例的脱敏请求与响应证据，供点击子用例链接时只读回放。
+    """
+
+    __tablename__ = "console_request_cases"
+
+    parent_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey(
+            "console_requests.id",
+            name="fk_console_request_cases_parent_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
+    round_index: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    case_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    label: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default="")
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    url: Mapped[str] = mapped_column(String(2000), nullable=False)
+    request_headers: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    body_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="none", server_default="none"
+    )
+    request_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_headers: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    response_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    http_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    response_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    redirects_json: Mapped[list | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    sse_json: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)
+    assertion_summary: Mapped[dict | None] = mapped_column(JSON(none_as_null=True), nullable=True)

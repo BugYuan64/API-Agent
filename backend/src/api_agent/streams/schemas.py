@@ -1,4 +1,4 @@
-"""Input and response contracts for long-connection test sessions."""
+"""Input and response contracts for long-connection test sessions and AI suites."""
 
 from typing import Annotated, Literal
 
@@ -88,6 +88,17 @@ class StreamSessionResponse(ApiModel, OutcomeFields):
     truncated_count: int
     opened_at: UtcDatetime | None
     closed_at: UtcDatetime | None
+    source: str = "manual"
+    title: str | None = None
+    badge: str | None = None
+    parent_session_id: str | None = None
+    round_index: int = 1
+    case_index: int = 0
+    case_label: str | None = None
+    cooldown_ms: int = 500
+    total_rounds: int = 1
+    summary: str | None = None
+    sub_case_count: int = 0
 
 
 class StreamEventResponse(ApiModel):
@@ -159,6 +170,17 @@ class StreamHistoryResponse(ApiModel, OutcomeFields):
     opened_at: UtcDatetime | None
     closed_at: UtcDatetime | None
     created_at: UtcDatetime
+    source: str = "manual"
+    title: str | None = None
+    badge: str | None = None
+    parent_session_id: str | None = None
+    round_index: int = 1
+    case_index: int = 0
+    case_label: str | None = None
+    cooldown_ms: int = 500
+    total_rounds: int = 1
+    summary: str | None = None
+    sub_case_count: int = 0
 
 
 class StreamReplayInputs(ApiModel):
@@ -168,3 +190,161 @@ class StreamReplayInputs(ApiModel):
     request_headers: dict
     subprotocols: list[str]
     scheduled_messages: list[str] | None
+
+
+class StreamAiCaseSpec(ApiInput):
+    """AI 驱动的多轮 WebSocket 套件中的单条测试子用例规格。"""
+
+    label: str = Field(min_length=1, max_length=200)
+    url: str | None = Field(default=None, min_length=1, max_length=2000)
+    headers: dict[str, str] = Field(default_factory=dict, max_length=20)
+    subprotocols: list[str] = Field(default_factory=list, max_length=5)
+    send: list[Annotated[str, Field(max_length=65_536)]] = Field(
+        default_factory=list, max_length=20
+    )
+    send_interval_ms: int = Field(default=200, ge=0, le=60_000)
+    max_events: int = Field(default=50, ge=1, le=2000)
+    max_duration_ms: int = Field(default=5_000, ge=1000, le=900_000)
+    connect_timeout_ms: int = Field(default=10_000, ge=100, le=60_000)
+    ping_interval_ms: int = Field(default=20_000, ge=0, le=300_000)
+    expect_contains: str | None = Field(default=None, max_length=500)
+    expect_min_events: int | None = Field(default=None, ge=0, le=2000)
+    expect_close_code: int | None = Field(default=None, ge=1000, le=4999)
+    expect_handshake_reject: bool = False
+
+    @field_validator("headers")
+    @classmethod
+    def safe_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        """复用 StreamStart 请求头安全校验，禁止覆盖传输层保留头。"""
+        return StreamStart.safe_headers(value)
+
+    @field_validator("subprotocols")
+    @classmethod
+    def valid_subprotocols(cls, values: list[str]) -> list[str]:
+        """复用 StreamStart 子协议校验。"""
+        return StreamStart.valid_subprotocols(values)
+
+
+class StreamAiSuiteSpec(ApiInput):
+    """AI 驱动的多轮 WebSocket 测试套件启动规格。"""
+
+    url: str = Field(min_length=1, max_length=2000)
+    title: str | None = Field(default=None, max_length=200)
+    headers: dict[str, str] = Field(default_factory=dict, max_length=20)
+    subprotocols: list[str] = Field(default_factory=list, max_length=5)
+    cases: list[StreamAiCaseSpec] = Field(min_length=1, max_length=50)
+    rounds: int = Field(default=1, ge=1, le=20)
+    cooldown_ms: int = Field(default=500, ge=0, le=60_000)
+    project_id: str | None = None
+    badge: str = Field(default="AI 测试", max_length=40)
+
+    @field_validator("headers")
+    @classmethod
+    def safe_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        """复用 StreamStart 请求头安全校验。"""
+        return StreamStart.safe_headers(value)
+
+    @field_validator("subprotocols")
+    @classmethod
+    def valid_subprotocols(cls, values: list[str]) -> list[str]:
+        """复用 StreamStart 子协议校验。"""
+        return StreamStart.valid_subprotocols(values)
+
+
+class StreamSubCaseSummary(ApiModel, OutcomeFields):
+    """归属于一条 AI WebSocket 历史记录的单个子用例摘要。"""
+
+    id: str
+    parent_session_id: str
+    round_index: int
+    case_index: int
+    case_label: str | None = None
+    label: str
+    url: str
+    status: str
+    stop_reason: str | None = None
+    error_kind: str | None = None
+    error_message: str | None = None
+    http_status: int | None = None
+    subprotocol: str | None = None
+    close_code: int | None = None
+    close_reason: str | None = None
+    event_count: int = 0
+    byte_count: int = 0
+    sent_count: int = 0
+    truncated_count: int = 0
+    opened_at: UtcDatetime | None = None
+    closed_at: UtcDatetime | None = None
+    created_at: UtcDatetime
+
+
+class StreamSubCaseListResponse(ApiModel):
+    """一条分组 AI WebSocket 历史下的全部子用例列表。"""
+
+    session_id: str
+    items: list[StreamSubCaseSummary] = Field(default_factory=list)
+    total: int = 0
+
+
+class StreamSubCaseReplayResponse(ApiModel):
+    """单条 WebSocket 子用例的完整只读回放快照（连接参数 + 会话状态 + 事件流）。"""
+
+    session_id: str
+    case_id: str
+    round_index: int
+    case_index: int
+    case_label: str | None = None
+    label: str
+    readonly: bool = True
+    inputs: StreamReplayInputs
+    session: StreamSessionResponse
+    events: list[StreamEventResponse] = Field(default_factory=list)
+
+
+class ActiveStreamItem(ApiModel):
+    """跨页切回重连时暴露的单个活跃长连接或 AI 套件运行摘要。"""
+
+    id: str
+    kind: Literal["manual", "ai_suite"]
+    source: str = "manual"
+    url: str
+    title: str | None = None
+    badge: str | None = None
+    status: str
+    stage: str | None = None
+    current_round: int = 1
+    total_rounds: int = 1
+    completed_cases: int = 0
+    total_cases: int = 0
+    cooldown_ms: int = 500
+    cooldown_remaining_ms: int | None = None
+    opened_at: UtcDatetime | None = None
+
+
+class ActiveStreamsResponse(ApiModel):
+    """当前正在后台运行的手动长连接与 AI 多轮测试套件列表。"""
+
+    items: list[ActiveStreamItem] = Field(default_factory=list)
+    manual_sessions: list[ActiveStreamItem] = Field(default_factory=list)
+    ai_suites: list[ActiveStreamItem] = Field(default_factory=list)
+
+
+class StreamSuiteStatusResponse(ApiModel):
+    """AI WebSocket 多轮测试套件的状态与进度快照。"""
+
+    id: str
+    status: str
+    stage: str
+    source: str = "ai"
+    title: str | None = None
+    badge: str | None = None
+    url: str
+    current_round: int = 1
+    total_rounds: int = 1
+    completed_cases: int = 0
+    total_cases: int = 0
+    cooldown_ms: int = 500
+    cooldown_remaining_ms: int | None = None
+    summary: str | None = None
+    error_kind: str | None = None
+    error_message: str | None = None

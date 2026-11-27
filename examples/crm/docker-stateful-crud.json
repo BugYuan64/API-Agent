@@ -1,0 +1,175 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8088",
+  "allowed_methods": ["GET", "POST", "PUT", "DELETE"],
+  "path_templates": [
+    "/api/user/login",
+    "/api/customer",
+    "/api/customer/list",
+    "/api/customer/{id}"
+  ],
+  "variables": {
+    "customer_email": "apitester-chain@example.com",
+    "customer_phone": "13900008899"
+  },
+  "max_requests": 11,
+  "requests": [
+    {
+      "id": "login-admin",
+      "method": "POST",
+      "path": "/api/user/login",
+      "body": {"email": "admin@elcrms.com", "password": "123456"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "content_type", "expected": "application/json"},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_exists", "pointer": "/data/token"}
+      ],
+      "extract": [
+        {"name": "crm_token", "source": "json", "pointer": "/data/token", "sensitive": true}
+      ]
+    },
+    {
+      "id": "create-customer",
+      "method": "POST",
+      "path": "/api/customer",
+      "headers": {"token": "{{crm_token}}"},
+      "body": {
+        "name": "链式测试客户",
+        "company": "API-Agent 自动化",
+        "email": "{{customer_email}}",
+        "phone": "{{customer_phone}}",
+        "status": "potential"
+      },
+      "depends_on": ["login-admin"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"}
+      ]
+    },
+    {
+      "id": "find-created-customer",
+      "method": "GET",
+      "path": "/api/customer/list",
+      "query": {"keyword": "{{customer_email}}", "pageNum": "1", "pageSize": "5"},
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["create-customer"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_equals", "pointer": "/data/total", "expected": 1},
+        {"kind": "json_equals", "pointer": "/data/list/0/email", "expected": "{{customer_email}}"}
+      ],
+      "extract": [
+        {"name": "customer_id", "source": "json", "pointer": "/data/list/0/id"}
+      ]
+    },
+    {
+      "id": "get-created-customer",
+      "method": "GET",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["find-created-customer"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_equals", "pointer": "/data/id", "expected": "{{customer_id}}"},
+        {"kind": "json_equals", "pointer": "/data/email", "expected": "{{customer_email}}"}
+      ]
+    },
+    {
+      "id": "update-customer-ok",
+      "method": "PUT",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "body": {
+        "name": "链式测试客户-已更新",
+        "company": "API-Agent 自动化",
+        "email": "{{customer_email}}",
+        "phone": "{{customer_phone}}",
+        "status": "active"
+      },
+      "depends_on": ["get-created-customer"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"}
+      ]
+    },
+    {
+      "id": "verify-updated-customer",
+      "method": "GET",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["update-customer-ok"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_equals", "pointer": "/data/name", "expected": "链式测试客户-已更新"},
+        {"kind": "json_equals", "pointer": "/data/status", "expected": "active"}
+      ]
+    },
+    {
+      "id": "repro-put-missing-status-defect",
+      "method": "PUT",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "body": {
+        "name": "缺status缺陷复现",
+        "company": "API-Agent 自动化",
+        "email": "{{customer_email}}",
+        "phone": "{{customer_phone}}"
+      },
+      "depends_on": ["verify-updated-customer"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "500"}
+      ]
+    },
+    {
+      "id": "delete-blocked-by-opportunities",
+      "method": "DELETE",
+      "path": "/api/customer/1",
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["login-admin"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "500"}
+      ]
+    },
+    {
+      "id": "soft-delete-created-customer",
+      "method": "DELETE",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["find-created-customer"],
+      "always_run": true,
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"}
+      ]
+    },
+    {
+      "id": "soft-delete-idempotent",
+      "method": "DELETE",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["soft-delete-created-customer"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"}
+      ]
+    },
+    {
+      "id": "verify-soft-deleted-status",
+      "method": "GET",
+      "path": "/api/customer/{{customer_id}}",
+      "headers": {"token": "{{crm_token}}"},
+      "depends_on": ["soft-delete-idempotent"],
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "200"},
+        {"kind": "json_equals", "pointer": "/data/status", "expected": "inactive"}
+      ]
+    }
+  ]
+}

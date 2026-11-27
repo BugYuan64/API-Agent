@@ -1,22 +1,21 @@
 <script setup lang="ts">
 /**
  * 侧边导航统一承载路由入口、主题与折叠偏好。
- * 折叠只收窄外壳并隐藏文字，保留导航分组与每行高度，保证所有图标纵向位置一致。
+ * 点击项目信号动画 Logo 即可切换侧栏收起/展开，悬停时以气泡显示项目名称。
  */
 import { ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   Braces,
-  Boxes,
   Cable,
+  Cpu,
   History,
   ListTree,
   Moon,
-  PanelLeftClose,
-  PanelLeftOpen,
   Settings as SettingsIcon,
   Sun,
 } from 'lucide-vue-next'
+import ProjectLogo from './ProjectLogo.vue'
 import {
   readSidebarCollapsed, readTheme, transitionTheme, writeSidebarCollapsed, writeTheme,
 } from '@/lib/appearance'
@@ -32,6 +31,12 @@ const groups = [
     ],
   },
   { label: COPY.navigation.intelligentTests, items: [{ to: '/testcases', label: COPY.navigation.intelligentTests, icon: ListTree }] },
+  {
+    label: COPY.navigation.modelTesting,
+    items: [
+      { to: '/model-testing', label: COPY.navigation.modelTesting, icon: Cpu },
+    ],
+  },
   {
     label: COPY.navigation.records,
     items: [
@@ -57,7 +62,7 @@ function toggleTheme(event?: MouseEvent): void {
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
 }
 
-/** 切换侧栏宽度，两个状态都保留相同路由链接与图标占位。 */
+/** 点击项目 Logo 切换侧栏宽度，两个状态都保留相同路由链接与图标占位。 */
 function toggleCollapsed(): void {
   collapsed.value = !collapsed.value
 }
@@ -73,11 +78,19 @@ watch(collapsed, writeSidebarCollapsed)
 <template>
   <aside class="sidebar" :class="{ 'sidebar-collapsed': collapsed }" aria-label="应用侧边栏">
     <div class="brand">
-      <div class="brand-mark" aria-hidden="true"><Boxes :size="18" :stroke-width="1.8" /></div>
-      <div class="brand-text sidebar-label">
-        <span class="brand-name">{{ COPY.app.name }}</span>
-        <span class="brand-sub">{{ COPY.app.subtitle }}</span>
-      </div>
+      <button
+        class="brand-trigger"
+        type="button"
+        :aria-label="`${COPY.app.name}，${collapsed ? '展开侧边栏' : '折叠侧边栏'}`"
+        :aria-expanded="!collapsed"
+        @click="toggleCollapsed"
+      >
+        <ProjectLogo :size="32" />
+        <span class="brand-tooltip" role="tooltip">
+          <span class="brand-tooltip-name">API-Agent · {{ COPY.app.name }}</span>
+          <span class="brand-tooltip-hint">{{ collapsed ? '点击展开侧边栏' : '点击收起侧边栏' }}</span>
+        </span>
+      </button>
     </div>
 
     <nav class="nav scroll-y" aria-label="主导航">
@@ -115,32 +128,20 @@ watch(collapsed, writeSidebarCollapsed)
         </span>
         <span class="sidebar-label">{{ theme === 'dark' ? '亮色主题' : '暗色主题' }}</span>
       </button>
-      <button
-        class="sidebar-control sidebar-toggle"
-        type="button"
-        :title="collapsed ? '展开侧边栏' : '折叠侧边栏'"
-        :aria-label="collapsed ? '展开侧边栏' : '折叠侧边栏'"
-        :aria-expanded="!collapsed"
-        @click="toggleCollapsed"
-      >
-        <span class="sidebar-icon" aria-hidden="true">
-          <PanelLeftOpen v-if="collapsed" :size="17" :stroke-width="1.8" />
-          <PanelLeftClose v-else :size="17" :stroke-width="1.8" />
-        </span>
-        <span class="sidebar-label">{{ collapsed ? '展开侧边栏' : '折叠侧边栏' }}</span>
-      </button>
     </div>
   </aside>
 </template>
 
 <style scoped>
 .sidebar {
+  position: relative;
+  z-index: 30;
   display: flex;
   flex: none;
   flex-direction: column;
   width: var(--sidebar-width);
   height: 100%;
-  overflow: hidden;
+  overflow: visible;
   color: var(--text-primary);
   background: var(--bg-sidebar, var(--bg-surface));
   transition: width 560ms cubic-bezier(.22,.75,.2,1), background 560ms ease, color 560ms ease;
@@ -149,33 +150,99 @@ watch(collapsed, writeSidebarCollapsed)
 .sidebar-collapsed { width: var(--sidebar-collapsed-width); }
 
 .brand {
+  position: relative;
+  z-index: 40;
   display: flex;
   flex: none;
   align-items: center;
-  gap: 11px;
   height: calc(var(--topbar-height) + 14px);
-  padding: 0 16px;
+  padding: 0 13px;
+  overflow: visible;
 }
 
-.brand-mark {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  color: var(--text-on-accent, var(--text-primary));
-  background: var(--brand-fill);
-  box-shadow: inset 0 0 0 1px var(--border-highlight), var(--shadow-sm);
+.brand-trigger {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  cursor: pointer;
   transform: translateX(0) scale(1);
-  transition: transform 560ms cubic-bezier(.22,.75,.2,1), box-shadow 560ms ease;
+  transition: transform 240ms cubic-bezier(.22,.75,.2,1);
 }
 
-.brand-text { line-height: 1.4; }
-.brand-name { display: block; font-size: 14px; font-weight: 650; }
-.brand-sub { display: block; color: var(--text-tertiary); font-size: 10.5px; }
+.brand-trigger:hover {
+  transform: scale(1.05);
+}
 
-/* 文本仍参与固定高度的行布局，只渐隐并由外壳裁剪。 */
+.brand-trigger:active {
+  transform: scale(0.96);
+}
+
+.brand-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* 悬停或聚焦 Logo 时在侧栏右侧弹出项目名称气泡，折叠与展开态均可完整展示。 */
+.brand-tooltip {
+  position: absolute;
+  top: 50%;
+  left: calc(100% + 12px);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 11px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-md);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transform: translate(-6px, -50%);
+  transition: opacity 160ms ease, transform 160ms ease, visibility 160ms ease;
+}
+
+.brand-tooltip::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: -5px;
+  width: 8px;
+  height: 8px;
+  border-left: 1px solid var(--border-default);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  transform: translateY(-50%) rotate(45deg);
+}
+
+.brand-trigger:hover .brand-tooltip,
+.brand-trigger:focus-visible .brand-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(0, -50%);
+}
+
+.brand-tooltip-name {
+  font-size: 12.5px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.brand-tooltip-hint {
+  color: var(--text-tertiary);
+  font-size: 10.5px;
+  line-height: 1.2;
+}
+
+/* 文本仍参与固定高度的行布局，只渐隐并由子容器裁剪。 */
 .sidebar-label {
   min-width: 0;
   overflow: hidden;
@@ -183,11 +250,8 @@ watch(collapsed, writeSidebarCollapsed)
   transition: opacity 280ms ease, transform 560ms cubic-bezier(.22,.75,.2,1);
 }
 .sidebar-collapsed .sidebar-label { opacity: 0; pointer-events: none; }
-.sidebar-collapsed .brand-mark { transform: translateX(-1px) scale(.94); }
-.brand-text,
 .nav-group,
 .sidebar-foot { transform: translateX(0); transition: transform 560ms cubic-bezier(.22,.75,.2,1); }
-.sidebar-collapsed .brand-text,
 .sidebar-collapsed .nav-group,
 .sidebar-collapsed .sidebar-foot { transform: translateX(-7px); }
 
@@ -228,6 +292,7 @@ watch(collapsed, writeSidebarCollapsed)
   flex-direction: column;
   gap: 4px;
   padding: 12px 9px;
+  overflow: hidden;
 }
 .sidebar-control { border: 0; color: var(--text-secondary); background: transparent; text-align: left; font-size: 12px; transition: color var(--motion-fast, 140ms) ease, background var(--motion-fast, 140ms) ease; }
 .sidebar-control:hover { color: var(--text-primary); background: var(--bg-hover); }
@@ -238,14 +303,12 @@ watch(collapsed, writeSidebarCollapsed)
 @media (max-width: 720px) {
   .sidebar { width: var(--sidebar-collapsed-width); }
   .sidebar-label { opacity: 0; pointer-events: none; }
-  .sidebar-toggle { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .sidebar,
   .sidebar .sidebar-label,
-  .sidebar .brand-mark,
-  .sidebar .brand-text,
+  .sidebar .brand-trigger,
   .sidebar .nav-group,
   .sidebar .sidebar-foot {
     transition-duration: 560ms !important;

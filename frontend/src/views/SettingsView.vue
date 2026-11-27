@@ -10,6 +10,7 @@ import {
   Eye,
   EyeOff,
   KeyRound,
+  Link2,
   Loader2,
   LogOut,
   Radio,
@@ -20,6 +21,7 @@ import {
   Server,
   Settings as SettingsIcon,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Terminal,
   Trash2,
@@ -28,8 +30,11 @@ import {
 } from 'lucide-vue-next'
 import AppModal from '@/components/AppModal.vue'
 import CopyButton from '@/components/CopyButton.vue'
+import KnowledgeBaseSettings from '@/components/KnowledgeBaseSettings.vue'
+import ModelPicker from '@/components/ModelPicker.vue'
 import TestSettingsFields from '@/components/TestSettingsFields.vue'
 import ThemePaletteSettings from '@/components/ThemePaletteSettings.vue'
+import UrlInput from '@/components/UrlInput.vue'
 import { describeError } from '@/api/client'
 import {
   getLLMConfig,
@@ -38,7 +43,10 @@ import {
   updateLLMConfig,
 } from '@/api/endpoints'
 import type { LLMConfig } from '@/api/types'
+import { COPY } from '@/lib/copy'
 import { engineMeta, useEngineSelection } from '@/lib/engines'
+import { joinTargetUrl, urlSuffix } from '@/lib/urlPrefixes'
+import { resetWorkbench } from '@/lib/workbenchReset'
 import { useToastStore } from '@/stores/toasts'
 
 const PRESETS = [
@@ -75,10 +83,12 @@ const PRESETS = [
 ]
 
 const form = reactive({
-  enabled: false,
+  enabled: true,
   baseUrl: '',
   apiKey: '',
   model: 'gpt-4o',
+  generationModel: '',
+  customGenerationModel: false,
   timeoutSeconds: 60,
 })
 
@@ -87,6 +97,8 @@ const saving = ref(false)
 const testing = ref(false)
 const showKey = ref(false)
 const hasSavedKey = ref(false)
+const hasSavedGenerationModel = ref(false)
+const urlPrefix = ref('')
 
 const pingStatus = ref<{
   tested: boolean
@@ -95,8 +107,23 @@ const pingStatus = ref<{
   message: string
 } | null>(null)
 
+/** 将选中的 URL 前缀与可编辑后缀拼接为提交用的 Base URL。 */
+const effectiveBaseUrl = computed(() => joinTargetUrl(urlPrefix.value, form.baseUrl))
+
+/** 切换 URL 前缀时按新旧前缀同步调整可编辑地址后缀。 */
+function selectUrlPrefix(prefix: string) {
+  const previous = urlPrefix.value
+  urlPrefix.value = prefix
+  form.baseUrl = prefix ? urlSuffix(form.baseUrl, prefix, previous) : (joinTargetUrl(previous, form.baseUrl) || form.baseUrl)
+}
+
 /** 仅判断当前表单是否填写 Base URL；不表示配置已保存或服务可连通。 */
-const isConfigured = computed(() => !!form.baseUrl.trim())
+const isConfigured = computed(() => !!effectiveBaseUrl.value)
+const modelCopy = COPY.modelSettings
+const generationModel = computed({
+  get: () => form.customGenerationModel ? form.generationModel : form.model,
+  set: (value: string) => { if (form.customGenerationModel) form.generationModel = value },
+})
 
 /** 读取已保存模型配置填入表单，密钥仅保留存在标志且清空明文输入；失败提示并解除 loading。 */
 async function loadSettings() {
@@ -104,8 +131,12 @@ async function loadSettings() {
   try {
     const config: LLMConfig = await getLLMConfig()
     form.enabled = config.enabled
+    urlPrefix.value = ''
     form.baseUrl = config.base_url ?? ''
     form.model = config.model ?? 'gpt-4o'
+    form.generationModel = config.generation_model ?? ''
+    form.customGenerationModel = !!config.generation_model
+    hasSavedGenerationModel.value = !!config.generation_model
     form.timeoutSeconds = config.timeout_seconds ?? 60
     hasSavedKey.value = config.has_api_key
     form.apiKey = '' // 绝不在前端回显真实密钥明文
@@ -116,11 +147,10 @@ async function loadSettings() {
   }
 }
 
-/** 从下拉框选定模型后回写表单并提示。 */
-function onModelPicked(event: Event): void {
-  const value = (event.target as HTMLSelectElement).value
-  form.model = value
-  useToastStore().push('info', `已选择模型 ${value}`, '记得点击「保存模型配置」使其生效')
+/** Seed the first custom draft from the current assistant choice; keep it when toggled off. */
+function toggleGenerationModel(event: Event): void {
+  form.customGenerationModel = (event.target as HTMLInputElement).checked
+  if (form.customGenerationModel && !form.generationModel.trim()) form.generationModel = form.model
 }
 
 /** 切换密钥明文/密文，并给出与当前状态一致的提示。 */
@@ -135,6 +165,7 @@ function toggleKeyVisibility(): void {
 
 /** 将指定预设的地址和模型填入表单并清理旧探测结果；仅本地编辑，需要保存后才生效。 */
 function applyPreset(preset: (typeof PRESETS)[number]) {
+  urlPrefix.value = ''
   form.baseUrl = preset.url
   form.model = preset.model
   pingStatus.value = null
@@ -143,7 +174,7 @@ function applyPreset(preset: (typeof PRESETS)[number]) {
 
 /** 通过后端使用当前表单探测模型连通性；空地址拦截，接口或探测失败写入失败状态并提示，始终解除 testing。 */
 async function testConnection() {
-  if (!form.baseUrl.trim()) {
+  if (!effectiveBaseUrl.value) {
     useToastStore().push('warning', '请先填写接口 Base URL')
     return
   }
@@ -151,7 +182,7 @@ async function testConnection() {
   pingStatus.value = null
   try {
     const res = await pingLLM({
-      base_url: form.baseUrl.trim(),
+      base_url: effectiveBaseUrl.value,
       api_key: form.apiKey.trim() || undefined,
       model: form.model.trim() || undefined,
     })
@@ -188,14 +219,14 @@ const availableModels = ref<string[]>([])
 
 /** 按当前地址与可选新密钥读取可用模型；空地址拦截，空列表和服务失败分别提示，始终解除加载态。 */
 async function fetchModels() {
-  if (!form.baseUrl.trim()) {
+  if (!effectiveBaseUrl.value) {
     useToastStore().push('warning', '请先填写接口 Base URL')
     return
   }
   fetchingModels.value = true
   try {
     const res = await getLLMModels({
-      base_url: form.baseUrl.trim(),
+      base_url: effectiveBaseUrl.value,
       api_key: form.apiKey.trim() || undefined,
     })
     if (res.ok && res.models.length > 0) {
@@ -214,17 +245,30 @@ async function fetchModels() {
   }
 }
 
+/** 校验响应超时时间处于后端允许的 1~600 秒范围；空值或越界时返回 null。 */
+function validTimeoutSeconds(): number | null {
+  const value = Number(form.timeoutSeconds)
+  if (form.timeoutSeconds === ('' as unknown as number) || !Number.isFinite(value)) return null
+  if (value < 1 || value > 600) return null
+  return value
+}
+
 /** 经浏览器确认后发送空密钥清除已保存值，同时提交当前表单配置；失败提示，成功只回显密钥存在状态。 */
 async function clearApiKey() {
   if (!confirm('确定要清空已在本地保存的 API Key 吗？')) return
+  const timeout = validTimeoutSeconds()
+  if (timeout === null) {
+    useToastStore().push('warning', '响应超时时间需在 1 到 600 秒之间')
+    return
+  }
   try {
     const updated = await updateLLMConfig({
       enabled: form.enabled,
       provider: 'openai',
-      base_url: form.baseUrl.trim() || null,
+      base_url: effectiveBaseUrl.value || null,
       api_key: '', // 传空串通知后端置空
       model: form.model.trim() || 'gpt-4o',
-      timeout_seconds: form.timeoutSeconds,
+      timeout_seconds: timeout,
     })
     hasSavedKey.value = updated.has_api_key
     form.apiKey = ''
@@ -236,17 +280,31 @@ async function clearApiKey() {
 
 /** 保存当前模型配置；空密钥输入以 undefined 保留旧值，成功清空明文输入，失败提示并解除 saving。 */
 async function saveSettings() {
+  const override = form.customGenerationModel
+    ? form.generationModel.trim()
+    : (hasSavedGenerationModel.value ? null : undefined)
+  if (override === '') {
+    useToastStore().push('warning', modelCopy.required)
+    return
+  }
+  const timeout = validTimeoutSeconds()
+  if (timeout === null) {
+    useToastStore().push('warning', '响应超时时间需在 1 到 600 秒之间')
+    return
+  }
   saving.value = true
   try {
     const updated = await updateLLMConfig({
       enabled: form.enabled,
       provider: 'openai',
-      base_url: form.baseUrl.trim() || null,
+      base_url: effectiveBaseUrl.value || null,
       api_key: form.apiKey.trim() ? form.apiKey.trim() : undefined,
       model: form.model.trim() || 'gpt-4o',
-      timeout_seconds: form.timeoutSeconds,
+      generation_model: override,
+      timeout_seconds: timeout,
     })
     hasSavedKey.value = updated.has_api_key
+    hasSavedGenerationModel.value = !!updated.generation_model
     form.apiKey = '' // 提交后清空输入框，显示已保存状态
     useToastStore().push('success', '设置已保存', '配置已持久化至本地 SQLite 数据库')
   } catch (error) {
@@ -282,7 +340,7 @@ function selectEngine(id: string) {
   useToastStore().push(
     'info',
     `已选用「${engineMeta(id).name}」`,
-    '「用例计划」页下次打开时将默认使用该引擎',
+    '计划执行与 MCP 工具调用将默认使用该引擎',
   )
 }
 
@@ -370,6 +428,17 @@ const mcpConfigJson = computed(() => {
   )
 })
 
+/** 只重置浏览器内的工作台偏好，重新加载后统一读取默认值。 */
+async function resetLocalPreferences() {
+  if (!window.confirm(COPY.workbenchReset.confirm)) return
+  try {
+    await resetWorkbench(window.localStorage, window.caches)
+    window.location.reload()
+  } catch (error) {
+    useToastStore().push('danger', COPY.workbenchReset.failed, describeError(error))
+  }
+}
+
 /** 挂载后独立加载模型配置与引擎列表；各任务自行处理失败，不发起模型探测。 */
 onMounted(() => {
   loadSettings()
@@ -401,6 +470,9 @@ onMounted(() => {
               <p class="card-sub">与测试页共用配置，修改后自动保存在当前浏览器。</p>
             </div>
           </div>
+          <button type="button" class="btn btn-ghost btn-sm" @click="resetLocalPreferences">
+            <RotateCw :size="14" />{{ COPY.workbenchReset.action }}
+          </button>
         </div>
         <div class="card-body workbench-settings">
           <fieldset><legend>接口测试</legend><TestSettingsFields group="console" /></fieldset>
@@ -461,22 +533,26 @@ onMounted(() => {
           <!-- 表单网格 -->
           <div class="form-grid">
             <!-- Base URL -->
-            <label class="field field-full">
+            <div class="field field-full">
               <span class="field-label-row">
                 <span class="field-label">接口 Base URL <span class="required">*</span></span>
                 <span class="field-hint">支持任何兼容 OpenAI 规范的端点</span>
               </span>
-              <div class="input-with-icon">
-                <Server :size="15" class="input-prefix-icon" />
-                <input
-                  v-model="form.baseUrl"
-                  type="text"
-                  class="input mono with-icon"
-                  placeholder="https://api.openai.com/v1 或 https://api.deepseek.com/v1"
-                  spellcheck="false"
-                />
-              </div>
-            </label>
+              <UrlInput
+                v-model:address="form.baseUrl"
+                :model-value="urlPrefix"
+                label="接口 Base URL"
+                placeholder="https://api.openai.com/v1 或 https://api.deepseek.com/v1"
+                @update:model-value="selectUrlPrefix"
+                @submit="testConnection"
+              >
+                <template #leading>
+                  <span class="url-leading-icon" aria-hidden="true">
+                    <Server :size="15" />
+                  </span>
+                </template>
+              </UrlInput>
+            </div>
 
             <!-- API Key -->
             <label class="field field-full">
@@ -524,7 +600,7 @@ onMounted(() => {
             <!-- 模型名称与在线获取 -->
             <div class="field field-full">
               <span class="field-label-row">
-                <span class="field-label">模型名称 (Model) <span class="required">*</span></span>
+                <span class="field-label">{{ modelCopy.assistant }} <span class="required">*</span></span>
                 <div class="model-action-group">
                   <span v-if="availableModels.length > 0" class="tag tag-neutral">
                     已拉取 {{ availableModels.length }} 个模型
@@ -543,36 +619,28 @@ onMounted(() => {
                 </div>
               </span>
 
-              <div class="model-input-row">
-                <!-- 已拉取到列表时只保留下拉框（单一输入点，避免两个框同时出现）；
-                     未拉取时用文本框手动填写，因此任何模型标识都能录入。 -->
-                <select
-                  v-if="availableModels.length > 0"
-                  class="select model-select"
-                  :value="form.model"
-                  @change="onModelPicked"
-                >
-                  <option v-if="!availableModels.includes(form.model)" :value="form.model" disabled>
-                    {{ form.model || '请选择模型' }}
-                  </option>
-                  <option v-for="m in availableModels" :key="m" :value="m">{{ m }}</option>
-                </select>
-                <input
-                  v-else
-                  v-model="form.model"
-                  type="text"
-                  class="input mono model-input"
-                  placeholder="gpt-4o, deepseek-chat, qwen2.5:7b"
-                  spellcheck="false"
-                />
+              <ModelPicker v-model="form.model" :models="availableModels" :label="modelCopy.assistant" />
+              <span class="field-hint">{{ modelCopy.assistantUses }}</span>
+            </div>
+
+            <div class="field field-full">
+              <div class="field-label-row">
+                <span class="field-label">{{ modelCopy.generation }}</span>
+                <label class="switch-control" :title="form.customGenerationModel ? modelCopy.custom : modelCopy.follow">
+                  <input
+                    type="checkbox" role="switch" class="switch-input" :aria-label="modelCopy.toggle"
+                    :checked="form.customGenerationModel" @change="toggleGenerationModel"
+                  />
+                  <span class="switch-slider switch-slider--icon" aria-hidden="true">
+                    <SlidersHorizontal v-if="form.customGenerationModel" :size="12" class="switch-state-icon" />
+                    <Link2 v-else :size="12" class="switch-state-icon" />
+                  </span>
+                </label>
               </div>
-              <span class="field-hint">
-                {{
-                  availableModels.length > 0
-                    ? '从已拉取的列表中点选模型；如需其他标识，可清空列表后手动填写。'
-                    : '支持手动填入任何模型标识，或点击「获取模型列表」从 Base URL 端点拉取。'
-                }}
-              </span>
+              <ModelPicker
+                v-model="generationModel" :models="availableModels" :label="modelCopy.generation"
+                :disabled="!form.customGenerationModel"
+              />
             </div>
 
             <!-- 超时时间 -->
@@ -582,7 +650,7 @@ onMounted(() => {
                 v-model.number="form.timeoutSeconds"
                 type="number"
                 class="input"
-                min="5"
+                min="1"
                 max="600"
                 step="5"
               />
@@ -610,7 +678,7 @@ onMounted(() => {
             <ShieldCheck :size="15" class="banner-icon" />
             <div class="banner-text">
               <strong>安全保证</strong>：配置已持久化于本地 SQLite 数据库，
-              在界面中永不回显明文密钥；所有模型调用采用非流式 Response 模式，严格支持工具/函数声明与调用参数解析。
+              在界面中永不回显明文密钥。
             </div>
           </div>
         </div>
@@ -638,6 +706,22 @@ onMounted(() => {
             <span>{{ saving ? '保存中...' : '保存模型配置' }}</span>
           </button>
         </div>
+      </section>
+
+      <!-- 向量知识库准备与构建 -->
+      <section class="card" aria-labelledby="kb-card-title">
+        <div class="card-header">
+          <div class="card-title-group">
+            <Sparkles :size="17" class="accent-icon" />
+            <div>
+              <h2 id="kb-card-title" class="card-title">AI 助手小Y 向量知识库</h2>
+              <p class="card-sub">
+                覆盖 API-Agent 全部功能与使用方法的知识库，配置向量模型后可一键构建向量索引。
+              </p>
+            </div>
+          </div>
+        </div>
+        <div class="card-body"><KnowledgeBaseSettings /></div>
       </section>
 
       <!-- 第二部分：测试引擎选择器 -->
@@ -758,7 +842,7 @@ onMounted(() => {
             <span>{{ enginesLoading ? '正在探测...' : '刷新引擎状态' }}</span>
           </button>
           <div class="flex-fill" />
-          <span class="mcp-footer-hint">所选引擎会同步为「用例计划」页的默认执行引擎</span>
+          <span class="mcp-footer-hint">所选引擎会保存为计划执行与 MCP 调用的默认执行引擎</span>
         </div>
       </section>
 
@@ -830,7 +914,7 @@ onMounted(() => {
                     <span class="tool-tag tag-validate">结构校验</span>
                   </div>
                   <div class="tool-desc">
-                    离线校验 v1 ExecutionPlan 结构自洽性与本地回环白名单（零网络开销）。
+                    离线校验 v1 ExecutionPlan 结构自洽性与目标白名单策略（零网络开销）。
                   </div>
                 </div>
 
@@ -907,10 +991,24 @@ onMounted(() => {
                 </div>
                 <div class="tool-card">
                   <div class="tool-card-head">
+                    <code class="tool-name">json_exists</code>
+                    <span class="tool-tag tag-read">字段存在</span>
+                  </div>
+                  <div class="tool-desc">按 JSON Pointer 检查目标路径是否存在。</div>
+                </div>
+                <div class="tool-card">
+                  <div class="tool-card-head">
                     <code class="tool-name">content_type</code>
                     <span class="tool-tag tag-exec">响应类型</span>
                   </div>
                   <div class="tool-desc">校验 Content-Type 是否为 application/json。</div>
+                </div>
+                <div class="tool-card">
+                  <div class="tool-card-head">
+                    <code class="tool-name">response_time</code>
+                    <span class="tool-tag tag-validate">耗时上限</span>
+                  </div>
+                  <div class="tool-desc">校验单次请求耗时不超过设定的毫秒阈值。</div>
                 </div>
               </div>
             </div>
@@ -971,6 +1069,7 @@ onMounted(() => {
 }
 
 .workbench-settings { display: grid; gap: 12px; }
+.url-leading-icon { display: inline-flex; align-items: center; padding: 0 4px 0 10px; color: var(--text-tertiary); flex: none; }
 .workbench-settings fieldset { margin: 0; min-width: 0; padding: 8px 12px 12px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); }
 .workbench-settings legend { padding-inline: 4px; font-weight: 600; }
 
@@ -1213,22 +1312,6 @@ onMounted(() => {
   gap: 4px;
 }
 
-.model-input-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
-.model-input {
-  flex: 1;
-}
-
-.model-select {
-  flex: 1;
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
-
 .input-with-icon {
   position: relative;
   display: flex;
@@ -1394,6 +1477,28 @@ onMounted(() => {
 
 .switch-input:checked + .switch-slider::after {
   transform: translateX(16px);
+}
+
+.switch-slider--icon {
+  width: 42px;
+}
+
+.switch-slider--icon .switch-state-icon {
+  position: absolute;
+  top: 50%;
+  right: 5px;
+  transform: translateY(-50%);
+  color: var(--text-secondary);
+}
+
+.switch-input:checked + .switch-slider--icon::after {
+  transform: translateX(22px);
+}
+
+.switch-input:checked + .switch-slider--icon .switch-state-icon {
+  right: auto;
+  left: 5px;
+  color: var(--switch-thumb);
 }
 
 /* 退出登录行 */

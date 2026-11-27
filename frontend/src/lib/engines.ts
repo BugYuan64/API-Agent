@@ -34,6 +34,13 @@ const ENGINE_META: Record<string, EngineMeta> = {
       '编译受控 Postman Collection 后交由原生 CLI 在隔离沙箱中执行，产出 Newman 报告。提供工业级独立裁决与防作弊背书。',
     transports: 'stdio MCP → Postman CLI 子进程',
   },
+  'postman-cli': {
+    name: 'Postman CLI 引擎',
+    kind: 'MCP 服务',
+    description:
+      '编译受控 Postman Collection 后交由原生 CLI 在隔离沙箱中执行，产出 Newman 报告。提供工业级独立裁决与防作弊背书。',
+    transports: 'stdio MCP → Postman CLI 子进程',
+  },
 }
 
 const STORAGE_KEY = 'api-agent.engine'

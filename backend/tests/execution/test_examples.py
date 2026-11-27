@@ -16,12 +16,27 @@ def test_crm_examples_match_the_executable_schema():
         "rag",
         "docker-smoke",
         "docker-authenticated",
+        "docker-register-validation",
+        "docker-rag",
+        "docker-stateful-crud",
     }
     assert len(plans["smoke"].requests) == 8
     assert plans["authenticated"].auth_ref.header_name == "token"
     assert all(case.body == {"question": ""} for case in plans["rag"].requests[1:])
-    # Docker 样例指向容器统一入口（Nginx 8088），复用同一自定义 token 头约定。
+    # Docker 样例指向统一入口 8088 与 RAG 8002，复用自定义 token 头与受控变量链约定。
     assert plans["docker-smoke"].origin == "http://127.0.0.1:8088"
     assert plans["docker-authenticated"].origin == "http://127.0.0.1:8088"
     assert plans["docker-authenticated"].auth_ref.header_name == "token"
     assert all(case.method == "GET" for case in plans["docker-authenticated"].requests)
+    assert len(plans["docker-register-validation"].requests) == 6
+    assert plans["docker-rag"].origin == "http://127.0.0.1:8002"
+    assert len(plans["docker-stateful-crud"].requests) == 11
+    assert plans["docker-stateful-crud"].requests[0].extract[0].name == "crm_token"
+    assert plans["docker-stateful-crud"].requests[0].extract[0].sensitive is True
+
+    self_dir = Path(__file__).resolve().parents[3] / "examples/self"
+    self_plan = ExecutionPlan.model_validate(
+        json.loads((self_dir / "management-smoke.json").read_text(encoding="utf-8"))
+    )
+    assert self_plan.origin == "http://127.0.0.1:8010"
+    assert len(self_plan.requests) == 13

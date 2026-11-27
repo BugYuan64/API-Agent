@@ -89,19 +89,20 @@ def save_openapi(project: Path, text: str):
     return path.name
 
 
-async def create_project_document(request, agent):
-    """Use only the native picker's selection, and release source data after the request."""
+async def pick_local_project_dir() -> Path | None:
+    """Open the native desktop folder picker on a worker thread and return the selected path."""
     try:
-        project = await asyncio.to_thread(choose_directory)
+        return await asyncio.to_thread(choose_directory)
     except (OSError, subprocess.SubprocessError, UnicodeError):
         raise ApiError(
             503, "project_picker_unavailable", "无法打开本机目录选择器，请确认后端运行在桌面会话中"
         ) from None
-    if project is None:
-        return None
+
+
+async def generate_openapi_for_directory(project: Path, settings, documents, agent) -> dict:
+    """Scan a local project directory, analyze its routes with agent, and write OpenAPI JSON."""
     try:
         output = output_directory(project)
-        settings = request.app.state.settings
         snapshot = await asyncio.to_thread(
             scan_directory,
             project,
@@ -113,9 +114,7 @@ async def create_project_document(request, agent):
         ) from None
     try:
         async with asyncio.timeout(300):
-            record = await request.app.state.documents.analyze(
-                project.name, snapshot.model_dump(mode="json"), agent
-            )
+            record = await documents.analyze(project.name, snapshot.model_dump(mode="json"), agent)
     except TimeoutError:
         raise ApiError(504, "project_document_timeout", "项目文档生成超时，未写入文件") from None
     if record["status"] == "failed" or not record["endpoints"]:
@@ -136,3 +135,16 @@ async def create_project_document(request, agent):
         "text": text if len(text.encode()) <= 524288 else None,
         "partial": record["status"] == "partial",
     }
+
+
+async def create_project_document(request, agent):
+    """Use only the native picker's selection, and release source data after the request."""
+    project = await pick_local_project_dir()
+    if project is None:
+        return None
+    return await generate_openapi_for_directory(
+        project,
+        request.app.state.settings,
+        request.app.state.documents,
+        agent,
+    )

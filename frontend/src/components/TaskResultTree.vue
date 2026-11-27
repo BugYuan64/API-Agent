@@ -1,37 +1,83 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ChevronRight } from 'lucide-vue-next'
 import ResponseDetails from './ResponseDetails.vue'
 import type { TaskRecord } from '@/api/tasks'
 import type { ConsoleSseEvent } from '@/api/types'
 import { describeAssertionKind } from '@/lib/format'
 import { assertionVerdict, caseVerdict } from '@/lib/results'
-import { activeTaskWait, buildTaskResultTree, caseBodyText, savedRequestData, sseDataText, taskCaseLabel, taskCaseMessage, taskCaseProtocol, taskResponsePayload } from '@/lib/taskResults'
+import {
+  activeTaskWait,
+  buildTaskCaseId,
+  buildTaskResultTree,
+  caseBodyText,
+  findTaskCaseForResult,
+  resultRound,
+  savedRequestData,
+  sseDataText,
+  taskCaseLabel,
+  taskCaseMessage,
+  taskCaseProtocol,
+  taskResponsePayload,
+} from '@/lib/taskResults'
 
 const props = defineProps<{
   task: TaskRecord
-  streamWait: ReturnType<typeof activeTaskWait>
+  streamWait?: ReturnType<typeof activeTaskWait> | { index: number; label: string; round?: number; caseId?: string } | null
   liveEvents?: ConsoleSseEvent[]
   liveEventsSeen?: number
+  focusedCaseId?: string | null
 }>()
+
+const rootRef = ref<HTMLUListElement | null>(null)
 const openGroups = reactive(new Set<string>())
-const openCases = reactive(new Set<number>())
-const liveSseIndex = computed(() => props.task.active_stream === 'sse' ? props.streamWait?.index : undefined)
+const openCases = reactive(new Set<string>())
+const activeFocusedCaseId = ref<string | null>(props.focusedCaseId ?? null)
+
+const totalRounds = computed(() => {
+  const fromResults = props.task.results.reduce(
+    (max, item) => Math.max(max, resultRound(item, props.task.snapshot.cases.length)),
+    1,
+  )
+  return Math.max(1, props.task.total_rounds ?? 1, fromResults)
+})
+const isMultiRound = computed(() => totalRounds.value > 1)
+
+const streamWaitCaseId = computed(() => {
+  if (!props.streamWait) return undefined
+  if ('caseId' in props.streamWait && props.streamWait.caseId) return props.streamWait.caseId
+  const round = ('round' in props.streamWait && props.streamWait.round)
+    ? props.streamWait.round
+    : Math.max(1, props.task.current_round || 1)
+  return buildTaskCaseId(round, props.streamWait.index)
+})
+
+const liveSseCaseId = computed(() => props.task.active_stream === 'sse' ? streamWaitCaseId.value : undefined)
+const currentExecutingCaseId = computed(() => {
+  if (props.task.status !== 'running' || props.task.stage !== 'executing' || props.task.current_index == null) return undefined
+  return buildTaskCaseId(Math.max(1, props.task.current_round || 1), props.task.current_index)
+})
 const livePreview = computed(() => ({ events: props.liveEvents ?? [], total_events: props.liveEventsSeen }))
-const tree = computed(() => buildTaskResultTree(props.task.snapshot, props.task.results).map(group => ({
+
+const tree = computed(() => buildTaskResultTree(props.task.snapshot, props.task.results, {
+  totalRounds: props.task.total_rounds,
+}).map(group => ({
   ...group,
-  streamWait: group.cases.some(item => item.index === props.streamWait?.index) ? props.streamWait : null,
+  streamWait: streamWaitCaseId.value && group.cases.some(item => item.caseId === streamWaitCaseId.value)
+    ? props.streamWait : null,
   cases: group.cases.map(item => {
     const payload = taskResponsePayload(item.result)
-    const liveSse = item.index === liveSseIndex.value
+    const liveSse = item.caseId === liveSseCaseId.value
+    const isStreamWaiting = streamWaitCaseId.value === item.caseId
+    const isExecuting = currentExecutingCaseId.value === item.caseId
     return {
       ...item,
       payload,
       liveSse,
       sse: liveSse ? livePreview.value : payload.sse,
       verdict: item.result ? caseVerdict(item.result.status, item.result.reason)
-        : props.streamWait?.index === item.index ? { label: props.streamWait.label, tone: 'info', symbol: '◷' }
-        : props.task.status === 'running' && props.task.current_index === item.index
+        : isStreamWaiting && props.streamWait ? { label: props.streamWait.label, tone: 'info', symbol: '◷' }
+        : isExecuting
           ? { label: '执行中', tone: 'info', symbol: '◷' }
           : { label: ['queued', 'running'].includes(props.task.status) ? '待执行' : '尚无结果', tone: 'neutral', symbol: '—' },
     }
@@ -39,23 +85,77 @@ const tree = computed(() => buildTaskResultTree(props.task.snapshot, props.task.
 })))
 
 /** Open the receiving case once when its SSE stream starts and leave its result visible. */
-watch(liveSseIndex, index => {
-  if (index == null) return
-  const group = tree.value.find(item => item.cases.some(testCase => testCase.index === index))
+watch(liveSseCaseId, caseId => {
+  if (!caseId) return
+  const group = tree.value.find(item => item.cases.some(testCase => testCase.caseId === caseId))
   if (group) openGroups.add(group.key)
-  openCases.add(index)
+  openCases.add(caseId)
 }, { immediate: true })
+
+function resolveTreeCaseId(caseId: string | null | undefined): string | null {
+  if (!caseId) return null
+  const trimmed = caseId.trim()
+  if (!trimmed) return null
+  for (const group of tree.value) {
+    const exact = group.cases.find(item => item.caseId === trimmed)
+    if (exact) return exact.caseId
+  }
+  const resolved = findTaskCaseForResult(props.task, trimmed)
+  if (resolved) {
+    for (const group of tree.value) {
+      const matched = group.cases.find(
+        item => item.caseId === resolved.caseId || (item.round === resolved.round && item.caseIndex === resolved.caseIndex),
+      )
+      if (matched) return matched.caseId
+    }
+    return resolved.caseId
+  }
+  return trimmed
+}
+
+/** Expand the matching operation group and case card, highlight it, and scroll it into view. */
+function focusCase(caseId: string): boolean {
+  const targetId = resolveTreeCaseId(caseId)
+  activeFocusedCaseId.value = targetId
+  if (!targetId) return false
+  const group = tree.value.find(entry => entry.cases.some(item => item.caseId === targetId))
+  if (!group) return false
+  openGroups.add(group.key)
+  openCases.add(targetId)
+  void nextTick(() => {
+    const root = rootRef.value
+    if (!root || typeof root.querySelectorAll !== 'function') return
+    const candidates = root.querySelectorAll<HTMLElement>('[data-case-id]')
+    for (const element of candidates) {
+      if (element.dataset?.caseId === targetId || element.getAttribute('data-case-id') === targetId) {
+        element.scrollIntoView?.({ block: 'center', behavior: 'smooth' })
+        break
+      }
+    }
+  })
+  return true
+}
+
+watch(
+  () => [props.focusedCaseId, tree.value.length] as const,
+  ([caseId]) => {
+    if (caseId) focusCase(caseId)
+    else activeFocusedCaseId.value = null
+  },
+  { immediate: true },
+)
 
 function trackOpen<Key>(items: Set<Key>, key: Key, event: Event) {
   if ((event.currentTarget as HTMLDetailsElement).open) items.add(key)
   else items.delete(key)
 }
 
+defineExpose({ focusCase, openGroups, openCases })
 </script>
 
 <template>
   <p v-if="!tree.length" class="muted">任务没有可展示的接口或用例。</p>
-  <ul v-else class="operation-tree" aria-label="接口测试结果">
+  <ul v-else ref="rootRef" class="operation-tree" aria-label="接口测试结果">
     <li v-for="group in tree" :key="group.key">
       <details class="operation" :open="openGroups.has(group.key)" @toggle="trackOpen(openGroups, group.key, $event)">
         <summary class="operation-head">
@@ -88,16 +188,27 @@ function trackOpen<Key>(items: Set<Key>, key: Key, event: Event) {
             </div>
           </details>
           <ul class="branches" aria-label="测试用例">
-            <li v-for="(item, position) in group.cases" :key="item.index">
-              <details class="case outcome-card" :class="`outcome-${item.verdict.tone}`" :open="openCases.has(item.index)" @toggle="trackOpen(openCases, item.index, $event)">
+            <li v-for="(item, position) in group.cases" :key="item.caseId">
+              <details
+                class="case outcome-card"
+                :class="[`outcome-${item.verdict.tone}`, { 'case-focused': activeFocusedCaseId === item.caseId }]"
+                :data-case-id="item.caseId"
+                :data-round="item.round"
+                :data-focused="activeFocusedCaseId === item.caseId ? 'true' : undefined"
+                :open="openCases.has(item.caseId)"
+                @toggle="trackOpen(openCases, item.caseId, $event)"
+              >
                 <summary class="case-head">
                   <ChevronRight class="chevron" :size="15" aria-hidden="true" />
                   <span class="node-copy">
-                    <span class="case-name"><span class="muted">#{{ position + 1 }}</span> {{ item.input.name }} <span class="case-source muted">{{ taskCaseLabel(item.input, group.example) }}</span></span>
+                    <span class="case-name">
+                      <span v-if="isMultiRound || item.round > 1" class="tag tag-info round-badge">第 {{ item.round }} 轮</span>
+                      <span class="muted">#{{ position + 1 }}</span> {{ item.input.name }} <span class="case-source muted">{{ taskCaseLabel(item.input, group.example) }}</span>
+                    </span>
                   </span>
                   <span class="tag verdict" :class="`tag-${item.verdict.tone}`"><span aria-hidden="true">{{ item.verdict.symbol }}</span>{{ item.verdict.label }}</span>
                 </summary>
-                <div v-if="openCases.has(item.index)" class="case-body">
+                <div v-if="openCases.has(item.caseId)" class="case-body">
                   <section class="detail">
                     <h4>测试数据</h4>
                     <p class="signature"><code>{{ taskCaseProtocol(item.input, item.result).toUpperCase() }} · {{ item.input.method }} {{ item.input.path }}</code></p>
@@ -123,6 +234,17 @@ function trackOpen<Key>(items: Set<Key>, key: Key, event: Event) {
                     </template>
                     <template v-if="item.result">
                       <p v-if="taskCaseMessage(item.result)" class="reason">{{ taskCaseMessage(item.result) }}</p>
+                      <div v-if="item.result.extracted?.length" class="extracted-vars" aria-label="已提取变量">
+                        <div v-for="ext in item.result.extracted" :key="ext.name" class="assertion-row">
+                          <span class="tag verdict" :class="ext.ok ? 'tag-success' : 'tag-danger'">
+                            <span aria-hidden="true">{{ ext.ok ? '✓' : '✕' }}</span>{{ ext.ok ? '已提取' : '提取失败' }}
+                          </span>
+                          <div>
+                            <strong>{{ ext.name }}</strong> <code class="muted">{{ ext.source }}</code>
+                            <div class="muted">{{ ext.ok ? `值 ${JSON.stringify(ext.value) ?? '—'}` : (ext.message || '未命中') }}</div>
+                          </div>
+                        </div>
+                      </div>
                       <p v-if="!item.payload.sse && !item.result.assertions.length" class="muted">没有记录断言结果。</p>
                       <div v-for="(assertion, index) in item.payload.sse ? [] : item.result.assertions" :key="index" class="assertion-row">
                         <span class="tag verdict" :class="`tag-${assertionVerdict(assertion.passed).tone}`">
@@ -170,8 +292,9 @@ details[open] > summary > .chevron { transform: rotate(90deg); }
 .node-copy { flex: 1; min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 6px; overflow-wrap: anywhere; }
 .route { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .route code { min-width: 0; font-weight: 600; }
-.case-name { font-weight: 600; }
+.case-name { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; font-weight: 600; }
 .case-name .muted { font-variant-numeric: tabular-nums; }
+.round-badge { flex: none; font-weight: 500; }
 .case-source { font-weight: 400; margin-inline-start: 4px; }
 .operation-tree :deep(.tag) { height: 18px; padding-inline: 5px; }
 .case.outcome-card {
@@ -179,6 +302,11 @@ details[open] > summary > .chevron { transform: rotate(90deg); }
   border-color: color-mix(in srgb, var(--outcome-rail) 45%, var(--border-subtle));
   border-inline-start: 4px solid var(--outcome-rail);
   background: color-mix(in srgb, var(--outcome-surface) 76%, var(--bg-surface));
+}
+.case.case-focused {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 .total { white-space: nowrap; }
 .operation-body { padding: 8px 10px 9px; border-top: 1px solid var(--accent-border); }

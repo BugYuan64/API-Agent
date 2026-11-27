@@ -1,4 +1,4 @@
-"""Validated HTTP sends issued by the local console (loopback targets only)."""
+"""Validated HTTP sends issued by the local console for authorized targets."""
 
 import asyncio
 import json
@@ -20,7 +20,11 @@ from api_agent.infrastructure.http import (
     group_headers,
 )
 from api_agent.infrastructure.outcomes import OutcomeFields, outcome_for, transport_error_kind
-from api_agent.infrastructure.targets import validate_headers, validate_target
+from api_agent.infrastructure.targets import (
+    format_host_literal,
+    validate_headers,
+    validate_target,
+)
 
 
 class ConsoleRequest(ApiInput):
@@ -128,18 +132,14 @@ class ConsoleResult(ApiInput, OutcomeFields):
 
 
 def build_url(parsed) -> str:
-    """用规范化后的 origin + 路径 + 查询串重建实际请求 URL。
+    """用规范化后的 origin + 路径 + 查询串重建实际请求 URL（支持域名与 IPv4/IPv6）。
 
     实现：没有路径时补 ``/``；查询串原样保留（不重排序），
     避免把用户精心构造的参数顺序打乱。
     """
-    host = parsed.hostname or ""
-    from ipaddress import ip_address
-
-    address = ip_address(host)
-    literal = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    literal = format_host_literal(parsed.hostname or "")
     netloc = literal + (f":{parsed.port}" if parsed.port is not None else "")
-    return f"{parsed.scheme}://{netloc}{parsed.path or '/'}" + (
+    return f"{parsed.scheme.lower()}://{netloc}{parsed.path or '/'}" + (
         f"?{parsed.query}" if parsed.query else ""
     )
 
@@ -154,7 +154,7 @@ async def _send(
     实现：先 ``validate_target``；再按 ``body_mode`` 组装内容并补默认 Content-Type；
     用 ``httpx.AsyncClient`` 且默认 ``follow_redirects=False``——
     目标若返回 3xx，界面会看到 302 本身，而不会被静默带到授权范围之外；
-    ``trust_env=False`` 保证不读取系统代理配置。
+    是否跟随系统代理受 ``settings.trust_system_proxy`` 控制。
     """
     parsed, _origin = validate_target(payload.url, settings.target_allowed_origins)
     url = build_url(parsed)
@@ -173,7 +173,7 @@ async def _send(
 
     started = time.monotonic()
     request_summary = {"method": payload.method, "url": url, "at": None}
-    sse_options = (payload.sse_max_events, min(payload.sse_duration_ms, payload.timeout_ms // 2))
+    sse_options = (payload.sse_max_events, min(payload.sse_duration_ms, payload.timeout_ms))
     try:
         # 所有跳转及完整正文共享挂钟预算，不能靠持续小片数据重置读超时。
         async with (
@@ -181,7 +181,7 @@ async def _send(
             httpx.AsyncClient(
                 timeout=payload.timeout_ms / 1000,
                 follow_redirects=False,
-                trust_env=False,
+                trust_env=settings.trust_system_proxy,
             ) as client,
         ):
             request = client.build_request(payload.method, url, headers=headers, content=content)

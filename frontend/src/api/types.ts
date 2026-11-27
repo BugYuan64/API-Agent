@@ -3,6 +3,10 @@
  *  可空字段允许值为 null，可选字段允许省略；两者含义不同。
  *  类型声明不执行运行时校验，页面需显式处理历史记录与缺失值。 */
 
+import type { PageScope } from '@/stores/workbenchRuns'
+
+export type { PageScope }
+
 /** 控制台允许选择的 HTTP 方法；后端仍需校验方法与目标授权范围。 */
 export type HttpMethod = 'GET' | 'HEAD' | 'OPTIONS' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 /** 请求正文编码选项；none 表示不发送正文，其他值由后端按对应格式处理。 */
@@ -140,9 +144,18 @@ export interface RedirectHop {
   cross_origin: boolean
 }
 
+/** 控制台历史详情与子用例中使用的重定向跳点别名。 */
+export type ConsoleRedirect = RedirectHop
+
 export interface ConsoleSseEvent {
   event: string
   data: string
+}
+
+/** 控制台 SSE 响应快照结构。 */
+export interface ConsoleSseResult {
+  events: ConsoleSseEvent[]
+  stop_reason: string
 }
 
 export type ConsoleSseProgress = { type: 'sse_start' } | { type: 'sse_event'; event: ConsoleSseEvent }
@@ -159,7 +172,7 @@ export interface ConsoleResponse {
   body_encoding: string | null
   elapsed_ms: number
   redirects: RedirectHop[]
-  sse?: { events: ConsoleSseEvent[]; stop_reason: string } | null
+  sse?: ConsoleSseResult | null
 }
 
 /** 目标请求结果：ok 描述传输结果，HTTP 状态仍需单独查看；失败时 response 可空。 */
@@ -171,6 +184,42 @@ export interface ConsoleResult extends ResultMetadata {
   error_kind: string | null
   error_message: string | null
   elapsed_ms: number
+}
+
+/** AI 多轮接口测试中单条子用例的脱敏只读回放快照。 */
+export interface ConsoleSubCase extends ResultMetadata {
+  id: string
+  parent_id: string
+  round_index: number
+  case_index: number
+  label: string
+  method: string
+  url: string
+  request_headers: Record<string, unknown>
+  body_mode: string
+  request_body: string | null
+  ok: boolean
+  status_code: number | null
+  elapsed_ms: number | null
+  error_kind: string | null
+  error_message: string | null
+  response_headers: Record<string, unknown>
+  response_preview: string | null
+  response_bytes: number
+  http_version: string | null
+  response_reason: string | null
+  redirects: ConsoleRedirect[]
+  sse: ConsoleSseResult | null
+  assertion_summary: {
+    passed: boolean
+    checks: Array<{
+      kind: string
+      expected: unknown
+      actual: unknown
+      passed: boolean
+    }>
+  } | null
+  created_at: string
 }
 
 /** 脱敏 HTTP 历史预览；正文和头不能当作完整原始请求或响应用于无损还原。 */
@@ -191,8 +240,103 @@ export interface ConsoleHistory extends ResultMetadata {
   response_headers: Record<string, unknown>
   response_preview: string | null
   response_bytes: number
+  source?: 'manual' | 'ai'
+  title?: string | null
+  badge?: string | null
+  status?: string
+  summary?: string | null
+  total_rounds?: number
+  cooldown_ms?: number
+  sub_case_count?: number
+  http_version?: string | null
+  response_reason?: string | null
+  redirects?: ConsoleRedirect[] | null
+  sse?: ConsoleSseResult | null
+  sub_cases?: ConsoleSubCase[]
   created_at: string
 }
+
+/** 控制台历史列表项别名（与 ConsoleHistory 保持完全兼容）。 */
+export type ConsoleHistoryItem = ConsoleHistory
+
+/** 控制台单条历史详情，包含完整请求体、重定向、SSE 快照及子用例列表。 */
+export interface ConsoleHistoryDetail extends ConsoleHistory {
+  request_body?: string | null
+  redirects?: ConsoleRedirect[] | null
+  sse?: ConsoleSseResult | null
+  sub_cases?: ConsoleSubCase[]
+}
+
+/** 后台控制台单次请求或 AI 多轮套件的运行摘要（启动响应与跨页重连共用）。 */
+export interface ConsoleRunSummary extends ResultMetadata {
+  id: string
+  source: 'manual' | 'ai' | string
+  title: string | null
+  badge: string | null
+  status: string
+  stage: string
+  method: string
+  url: string
+  ok: boolean
+  status_code: number | null
+  elapsed_ms: number
+  error_kind: string | null
+  error_message: string | null
+  total_rounds: number
+  current_round: number
+  total_cases: number
+  completed_cases: number
+  cooldown_ms: number
+  cooldown_remaining_ms: number | null
+  summary: string | null
+  created_at: string | null
+}
+
+/** 当前仍在后台执行的控制台运行列表。 */
+export interface ConsoleActiveRunsResponse {
+  items: ConsoleRunSummary[]
+}
+
+/** 控制台后台运行可重连 NDJSON 实时帧。 */
+export type ConsoleRunLiveFrame =
+  | ConsoleSseProgress
+  | ({ type: 'progress' } & ConsoleRunSummary)
+  | {
+      type: 'case_done'
+      run_id: string
+      round: number
+      case_index: number
+      completed_cases: number
+      total_cases: number
+      case: ConsoleSubCase
+      case_link: CaseLinkBlock
+    }
+  | {
+      type: 'cooling_down'
+      run_id: string
+      round: number
+      cooldown_ms: number
+      cooldown_remaining_ms: number
+    }
+  | { type: 'result'; result: ConsoleResult }
+  | {
+      type: 'done'
+      run_id: string
+      status: string
+      ok: boolean
+      error_kind?: string | null
+      summary?: string | null
+      case_links?: CaseLinkBlock[]
+      record?: ConsoleHistoryDetail
+    }
+  | {
+      type: 'error'
+      status?: number
+      code?: string
+      message?: string
+      error?: { code: string; message: string; request_id?: string }
+    }
+  | { type: 'heartbeat' }
 
 /* ---------- 长连接 ---------- */
 
@@ -212,7 +356,16 @@ export interface StreamStartInput {
 }
 
 /** 会话连接状态；事件是否读尽另看分页 has_more，不能仅凭状态判断回放结束。 */
-export type StreamStatus = 'connecting' | 'open' | 'closed' | 'error' | 'cancelled'
+export type StreamStatus =
+  | 'queued'
+  | 'connecting'
+  | 'running'
+  | 'open'
+  | 'closed'
+  | 'completed'
+  | 'error'
+  | 'cancelled'
+  | 'interrupted'
 
 /** 长连接会话摘要与计数；finished、stop_reason 和错误字段共同描述终止边界。 */
 export interface StreamSession extends ResultMetadata {
@@ -235,6 +388,17 @@ export interface StreamSession extends ResultMetadata {
   truncated_count: number
   opened_at: string | null
   closed_at: string | null
+  source?: 'manual' | 'ai' | string
+  title?: string | null
+  badge?: string | null
+  parent_session_id?: string | null
+  round_index?: number
+  case_index?: number
+  case_label?: string | null
+  cooldown_ms?: number
+  total_rounds?: number
+  summary?: string | null
+  sub_case_count?: number
 }
 
 /** 带方向、序号与相对耗时的事件证据；data 可能截断，二进制事件使用编码文本。 */
@@ -289,7 +453,136 @@ export interface StreamHistory extends ResultMetadata {
   opened_at: string | null
   closed_at: string | null
   created_at: string
+  source?: 'manual' | 'ai' | string
+  title?: string | null
+  badge?: string | null
+  parent_session_id?: string | null
+  round_index?: number
+  case_index?: number
+  case_label?: string | null
+  cooldown_ms?: number
+  total_rounds?: number
+  summary?: string | null
+  sub_case_count?: number
 }
+
+/** 长连接历史列表项别名（与 StreamHistory 保持完全兼容）。 */
+export type StreamHistoryItem = StreamHistory
+
+/** 跨页切回重连时暴露的单个活跃长连接或 AI 套件运行摘要。 */
+export interface ActiveStreamItem {
+  id: string
+  kind: 'manual' | 'ai_suite'
+  source: 'manual' | 'ai' | string
+  url: string
+  title: string | null
+  badge: string | null
+  status: string
+  stage: string | null
+  current_round: number
+  total_rounds: number
+  completed_cases: number
+  total_cases: number
+  cooldown_ms: number
+  cooldown_remaining_ms: number | null
+  opened_at: string | null
+}
+
+/** 当前正在后台运行的手动长连接与 AI 多轮测试套件列表。 */
+export interface StreamActiveResponse {
+  items: ActiveStreamItem[]
+  manual_sessions: ActiveStreamItem[]
+  ai_suites: ActiveStreamItem[]
+}
+
+/** 归属于一条 AI WebSocket 历史记录的单个子用例摘要。 */
+export interface StreamSubCaseSummary extends ResultMetadata {
+  id: string
+  parent_session_id: string
+  round_index: number
+  case_index: number
+  case_label: string | null
+  label: string
+  url: string
+  status: string
+  stop_reason: string | null
+  error_kind: string | null
+  error_message: string | null
+  http_status: number | null
+  subprotocol: string | null
+  close_code: number | null
+  close_reason: string | null
+  event_count: number
+  byte_count: number
+  sent_count: number
+  truncated_count: number
+  opened_at: string | null
+  closed_at: string | null
+  created_at: string
+}
+
+/** 一条分组 AI WebSocket 历史下的全部子用例列表。 */
+export interface StreamSubCaseListResponse {
+  session_id: string
+  items: StreamSubCaseSummary[]
+  total: number
+}
+
+/** 单条 WebSocket 子用例的完整只读回放快照（连接参数 + 会话状态 + 事件流）。 */
+export interface StreamSubCaseDetail {
+  session_id: string
+  case_id: string
+  round_index: number
+  case_index: number
+  case_label: string | null
+  label: string
+  readonly: boolean
+  inputs: StreamReplayInputs
+  session: StreamSession
+  events: StreamEvent[]
+}
+
+/** AI WebSocket 多轮测试套件的状态与进度快照。 */
+export interface StreamSuiteStatus {
+  id: string
+  status: string
+  stage: string
+  source: 'manual' | 'ai' | string
+  title: string | null
+  badge: string | null
+  url: string
+  current_round: number
+  total_rounds: number
+  completed_cases: number
+  total_cases: number
+  passed_cases?: number
+  failed_cases?: number
+  error_cases?: number
+  cooldown_ms: number
+  cooldown_remaining_ms: number | null
+  current_case_index?: number | null
+  current_case_label?: string | null
+  summary: string | null
+  error_kind: string | null
+  error_message: string | null
+  case_links?: CaseLinkBlock[]
+}
+
+/** AI WebSocket 多轮测试套件的可重连 NDJSON 实时帧。 */
+export type StreamSuiteLiveFrame =
+  | ({ type: 'progress'; suite_id: string } & Omit<StreamSuiteStatus, 'case_links'>)
+  | { type: 'case_done'; suite_id: string; case_link: CaseLinkBlock }
+  | {
+      type: 'cooling_down'
+      suite_id: string
+      current_round: number
+      total_rounds: number
+      cooldown_ms: number
+      cooldown_remaining_ms: number | null
+    }
+  | ({ type: 'done'; suite_id: string } & StreamSuiteStatus)
+  | { type: 'heartbeat' }
+  | { type: 'error'; code?: string; message?: string }
 
 /* ---------- 计划执行 ---------- */
 
@@ -301,14 +594,25 @@ export interface AssertionResult {
   message: string | null
 }
 
+/** 单条提取变量的脱敏观测结果。 */
+export interface ExtractedVariable {
+  name: string
+  source: 'json' | 'header' | 'status'
+  ok: boolean
+  sensitive: boolean
+  value: unknown
+  message: string | null
+}
+
 /** 单个请求用例的执行观测及断言；未知请求和异常必须保留，不能自动当作断言失败。 */
 export interface CaseResult extends ResultMetadata {
   id: string
-  status: 'passed' | 'failed' | 'timed_out' | 'cancelled' | 'error' | 'unknown'
+  status: 'passed' | 'failed' | 'timed_out' | 'cancelled' | 'error' | 'skipped' | 'unknown'
   http_status: number | null
   response_time_ms: number | null
   error_kind: string | null
   assertions: AssertionResult[]
+  extracted?: ExtractedVariable[]
 }
 
 /** 已落库的计划执行结果及预算观测；旧记录的计划可能缺失，状态由后端裁决。 */
@@ -352,6 +656,7 @@ export interface LLMConfig {
   provider: string
   base_url: string | null
   model: string
+  generation_model: string | null
   timeout_seconds: number
   has_api_key: boolean
 }
@@ -363,6 +668,7 @@ export interface LLMConfigUpdate {
   base_url: string | null
   api_key?: string | null
   model: string
+  generation_model?: string | null
   timeout_seconds?: number
 }
 
@@ -380,6 +686,488 @@ export interface LLMModelListResult {
   count: number
   message: string | null
 }
+
+/* ---------- AI 助手小Y 向量知识库 ---------- */
+
+export type KnowledgeIndexStatus = 'unconfigured' | 'unbuilt' | 'stale' | 'ready'
+export type KnowledgeRetrievalMode = 'vector' | 'lexical_fallback'
+
+export interface EmbeddingConfig {
+  enabled: boolean
+  use_llm_endpoint: boolean
+  base_url: string | null
+  effective_base_url: string | null
+  model: string
+  dimensions: number | null
+  top_k: number
+  timeout_seconds: number
+  has_api_key: boolean
+  has_effective_api_key: boolean
+}
+
+export interface EmbeddingConfigUpdate {
+  enabled: boolean
+  use_llm_endpoint: boolean
+  base_url?: string | null
+  api_key?: string | null
+  model: string
+  dimensions?: number | null
+  top_k: number
+  timeout_seconds?: number
+}
+
+export interface KnowledgeDocumentSummary {
+  doc_id: string
+  category: string
+  title: string
+  sections: string[]
+  chunk_count: number
+}
+
+export interface KnowledgeStatus {
+  status: KnowledgeIndexStatus
+  configured: boolean
+  ready: boolean
+  vector_store?: string
+  collection_name?: string
+  retrieval_mode: KnowledgeRetrievalMode
+  corpus_hash: string
+  chunk_count: number
+  vector_count: number
+  embedding_model: string | null
+  embedding_dimensions: number | null
+  built_at: string | null
+  last_error: string | null
+  config: EmbeddingConfig
+  documents: KnowledgeDocumentSummary[]
+}
+
+export interface KnowledgeBuildResult {
+  ok: boolean
+  status: KnowledgeIndexStatus
+  vector_store?: string
+  collection_name?: string
+  chunk_count: number
+  vector_count: number
+  embedding_model: string
+  embedding_dimensions: number
+  corpus_hash: string
+  built_at: string
+  duration_ms: number
+  message: string
+}
+
+export interface KnowledgeSearchHit {
+  chunk_id: string
+  doc_id: string
+  category: string
+  title: string
+  section: string
+  score: number
+  snippet: string
+  content: string
+}
+
+export interface KnowledgeSearchResult {
+  query: string
+  mode: KnowledgeRetrievalMode
+  hits: KnowledgeSearchHit[]
+}
+
+/* ---------- 大模型测试 ---------- */
+
+export type ModelProtocol = 'auto' | 'openai' | 'anthropic' | 'gemini'
+export type ResolvedModelProtocol = 'openai' | 'anthropic' | 'gemini'
+
+export type ModelCategory =
+  | 'chat'
+  | 'reasoning'
+  | 'embedding'
+  | 'rerank'
+  | 'image'
+  | 'audio'
+  | 'video'
+  | 'moderation'
+  | 'unknown'
+
+export type ProbeStatus =
+  | 'untested'
+  | 'supported'
+  | 'partial'
+  | 'unsupported'
+  | 'available'
+  | 'unavailable'
+  | 'inferred'
+  | 'unknown'
+  | 'error'
+
+export type ProbeCheckName =
+  | 'availability'
+  | 'tool_calling'
+  | 'input_modalities'
+  | 'output_modalities'
+  | 'streaming'
+  | 'structured_output'
+
+export interface CapabilityResult {
+  status: ProbeStatus
+  source: 'probed' | 'metadata' | 'inferred' | 'untested'
+  latency_ms: number | null
+  ttft_ms?: number | null
+  detail: string | null
+}
+
+export interface ModalityItem {
+  modality: 'text' | 'image' | 'audio' | 'video' | 'file' | 'reasoning' | 'embedding' | 'json'
+  status: ProbeStatus
+  source: 'probed' | 'metadata' | 'inferred' | 'untested'
+  detail: string | null
+}
+
+export interface ModelProfile {
+  id: string
+  owned_by: string | null
+  created: number | null
+  model_type: ModelCategory
+  type_source: 'probed' | 'metadata' | 'inferred' | 'unknown'
+  availability: CapabilityResult
+  tool_calling: CapabilityResult
+  streaming?: CapabilityResult
+  structured_output?: CapabilityResult
+  input_modalities: ModalityItem[]
+  output_modalities: ModalityItem[]
+  raw_metadata: Record<string, unknown>
+}
+
+export interface ModelDiscoverResult {
+  ok: boolean
+  protocol?: ResolvedModelProtocol
+  base_url: string | null
+  http_status: number | null
+  latency_ms: number
+  count: number
+  message: string
+  models: ModelProfile[]
+}
+
+export interface ModelProbeResult {
+  ok: boolean
+  protocol?: ResolvedModelProtocol
+  base_url: string
+  tested_count: number
+  available_count: number
+  tool_supported_count: number
+  streaming_supported_count?: number
+  structured_output_supported_count?: number
+  message: string
+  results: ModelProfile[]
+}
+
+export type ModelProbeStreamFrame =
+  | {
+      type: 'start'
+      protocol: ResolvedModelProtocol
+      base_url: string
+      models: string[]
+      total: number
+      concurrency: number
+    }
+  | {
+      type: 'model_start'
+      model_id: string
+    }
+  | {
+      type: 'model_result'
+      model_id: string
+      model: ModelProfile
+      completed: number
+      total: number
+    }
+  | {
+      type: 'heartbeat'
+    }
+  | {
+      type: 'done'
+      result: ModelProbeResult
+    }
+  | {
+      type: 'error'
+      code?: string
+      message?: string
+    }
+
+/** 持久化模型探测任务的来源标识。 */
+export type ModelTestRunSource = 'manual' | 'ai'
+
+/** 持久化模型探测任务的生命周期状态。 */
+export type ModelTestRunStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'cancelled'
+  | 'error'
+  | 'interrupted'
+
+/** 启动持久化后台模型探测任务请求（临时 api_key 仅驻留内存，绝不落库）。 */
+export interface ModelTestRunStartRequest {
+  base_url?: string | null
+  api_key?: string | null
+  use_saved_key?: boolean
+  protocol?: ModelProtocol
+  models: string[]
+  checks?: ProbeCheckName[]
+  timeout_seconds?: number
+  concurrency?: number
+  cooldown_ms?: number
+  rounds?: number
+  title?: string | null
+  source?: ModelTestRunSource
+  badge?: string | null
+  discover_meta?: Record<string, unknown> | null
+  discovered_profiles?: ModelProfile[] | null
+}
+
+/** 单轮单个模型的只读回放快照，供历史查看与 AI 子用例链接点击回放。 */
+export interface ModelTestSubCaseSnapshot {
+  case_id: string
+  round_index: number
+  case_index: number
+  label: string
+  model_id: string
+  checks: ProbeCheckName[]
+  status: string
+  latency_ms: number | null
+  ttft_ms: number | null
+  request_snapshot: Record<string, unknown>
+  observation: Record<string, unknown>
+  profile: ModelProfile
+  created_at: string | null
+}
+
+/** 单次模型探测任务（支持多轮）的结构化汇总指标。 */
+export interface ModelTestRunSummary {
+  tested_count: number
+  total_cases: number
+  completed_cases: number
+  available_count: number
+  unavailable_count: number
+  error_count: number
+  tool_supported_count: number
+  streaming_supported_count: number
+  structured_output_supported_count: number
+  vision_supported_count: number
+  avg_latency_ms: number | null
+  avg_ttft_ms: number | null
+  completed_rounds: number
+  total_rounds: number
+  message: string
+}
+
+/** 持久化模型探测历史列表项（不包含明文密钥）。 */
+export interface ModelTestRunListItem {
+  id: string
+  title: string | null
+  source: ModelTestRunSource
+  badge: string | null
+  status: ModelTestRunStatus
+  error_message: string | null
+  base_url: string
+  protocol: ModelProtocol
+  resolved_protocol: ResolvedModelProtocol | null
+  used_saved_key: boolean
+  has_custom_api_key: boolean
+  timeout_seconds: number
+  concurrency: number
+  checks: ProbeCheckName[]
+  target_models: string[]
+  cooldown_ms: number
+  total_rounds: number
+  completed_rounds: number
+  sub_case_count: number
+  summary: ModelTestRunSummary | null
+  summary_text: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** 单次模型探测任务完整详情，包含最终画像快照、各轮汇总与子用例快照。 */
+export interface ModelTestRunDetail extends ModelTestRunListItem {
+  discover_meta: Record<string, unknown> | null
+  models_snapshot: ModelProfile[]
+  rounds: Array<Record<string, unknown>>
+  sub_cases: ModelTestSubCaseSnapshot[]
+}
+
+/** 分页的模型探测任务历史列表响应。 */
+export interface ModelTestRunListResponse {
+  items: ModelTestRunListItem[]
+  page: PageInfo
+}
+
+/** 跨页切回重连所需的单个活跃模型探测任务摘要。 */
+export interface ModelTestActiveRunItem {
+  id: string
+  title: string | null
+  source: ModelTestRunSource
+  badge: string | null
+  status: ModelTestRunStatus
+  stage: string
+  base_url: string
+  protocol: ModelProtocol
+  resolved_protocol: ResolvedModelProtocol | null
+  target_models: string[]
+  checks: ProbeCheckName[]
+  current_round: number
+  total_rounds: number
+  completed_rounds: number
+  cooldown_ms: number
+  cooldown_remaining_ms: number | null
+  current_models: string[]
+  completed_cases: number
+  total_cases: number
+  started_at: string | null
+  created_at: string
+}
+
+/** 当前仍在后台运行的模型探测任务列表。 */
+export interface ModelTestActiveRunsResponse {
+  items: ModelTestActiveRunItem[]
+}
+
+/** 后台模型探测任务实时流共享快照字段。 */
+export interface ModelTestLiveSnapshot {
+  run_id: string
+  title: string | null
+  source: ModelTestRunSource
+  badge: string | null
+  status: ModelTestRunStatus
+  stage: string
+  base_url: string
+  protocol: ModelProtocol
+  resolved_protocol: ResolvedModelProtocol | null
+  current_round: number
+  total_rounds: number
+  completed_rounds: number
+  cooldown_ms: number
+  cooldown_remaining_ms: number | null
+  current_models: string[]
+  completed_cases: number
+  total_cases: number
+  models_snapshot: ModelProfile[]
+  new_sub_cases: ModelTestSubCaseSnapshot[]
+  summary: ModelTestRunSummary | null
+  summary_text: string | null
+  error_message: string | null
+  snapshot?: boolean
+}
+
+/** 后台模型探测可重连 NDJSON 实时帧。 */
+export type ModelTestLiveFrame =
+  | ({ type: 'progress' } & ModelTestLiveSnapshot)
+  | ({ type: 'cooling_down' } & ModelTestLiveSnapshot)
+  | ({ type: 'done'; run?: ModelTestRunDetail } & ModelTestLiveSnapshot)
+  | { type: 'heartbeat' }
+  | { type: 'error'; code?: string; message?: string }
+
+/* ---------- AI 助手小Y 后台运行与持久化对话线程 ---------- */
+
+export type CaseLinkTone = 'success' | 'danger' | 'warning' | 'info' | 'neutral'
+
+/** AI 回复中嵌入的可点击子用例只读回放块，跨四页统一契约。 */
+export interface CaseLinkBlock {
+  type: 'case_link'
+  scope: PageScope
+  history_id: string
+  case_id: string
+  round: number
+  label: string
+  status: string
+  tone: CaseLinkTone
+}
+
+/** 启动后台 AI 助手运行的请求契约。 */
+export interface AssistantRunStartRequest {
+  scope: PageScope
+  history_id?: string | null
+  task_id?: string | null
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  current_test?: Record<string, unknown> | null
+  settings?: Record<string, unknown> | null
+  model?: string | null
+  base_catalog?: unknown | null
+  ephemeral_api_key?: string | null
+}
+
+/** 启动后台 AI 助手运行的受理响应（202）。 */
+export interface AssistantRunStartResponse {
+  run_id: string
+  scope: PageScope
+  history_id: string | null
+  status: string
+}
+
+/** 当前仍在后台运行的 AI 助手任务摘要。 */
+export interface AssistantActiveRun {
+  run_id: string
+  scope: PageScope
+  history_id: string | null
+  status: string
+  phase?: string | null
+  started_at?: string | null
+}
+
+/** 当前活跃 AI 助手运行列表响应。 */
+export interface AssistantActiveRunsResponse {
+  items: AssistantActiveRun[]
+}
+
+/** 服务端持久化的单条 AI 助手消息（可携带结构化子用例链接块）。 */
+export interface AssistantThreadMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  blocks?: CaseLinkBlock[]
+  run_id?: string | null
+  created_at?: string | null
+}
+
+/** 绑定到 (scope, history_id) 的服务端持久化 AI 助手对话线程。 */
+export interface AssistantThread {
+  id: string | null
+  scope: PageScope
+  history_id: string
+  title: string | null
+  active_run_id: string | null
+  messages: AssistantThreadMessage[]
+}
+
+/** AI 助手创建或分叉新测试历史时下发的绑定载荷。 */
+export interface AssistantRunBoundPayload {
+  scope: PageScope
+  history_id: string
+  previous_history_id: string | null
+  badge?: string | null
+  title?: string | null
+  forked: boolean
+  run_id?: string
+}
+
+/** 后台 AI 助手可重连 NDJSON 实时帧。 */
+export type AssistantLiveFrame =
+  | {
+      type: 'status'
+      phase: 'thinking' | 'reading_data' | 'testing' | 'cooling_down'
+      message?: string
+      tool?: string
+    }
+  | ({ type: 'run_bound' } & AssistantRunBoundPayload)
+  | { type: 'case_link'; block: CaseLinkBlock }
+  | { type: 'text'; text: string }
+  | { type: 'done'; text: string; history_id: string | null; blocks?: CaseLinkBlock[] }
+  | { type: 'error'; code: string; message?: string }
+  | { type: 'heartbeat' }
 
 
 

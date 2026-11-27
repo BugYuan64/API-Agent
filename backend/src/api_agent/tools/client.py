@@ -33,10 +33,24 @@ async def open_client(settings: Settings):
         "TARGET_AUTH_ENV_VARS": json.dumps(settings.target_auth_env_vars),
         "POSTMAN_CLI_PATH": str(settings.postman_cli_path) if settings.postman_cli_path else "",
         "OMIT_RESPONSE_PAYLOAD": str(settings.omit_response_payload).lower(),
+        "TRUST_SYSTEM_PROXY": str(settings.trust_system_proxy).lower(),
         "PYTHONUNBUFFERED": "1",
         "PYTHONIOENCODING": "utf-8",
         "LOG_LEVEL": "ERROR",
     }
+    if settings.trust_system_proxy:
+        for proxy_key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ):
+            if proxy_key in os.environ:
+                environment[proxy_key] = os.environ[proxy_key]
     for name in settings.target_auth_env_vars:
         if name in os.environ:
             environment[name] = os.environ[name]

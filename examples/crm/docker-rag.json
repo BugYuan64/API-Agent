@@ -1,0 +1,69 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8002",
+  "allowed_methods": ["GET", "POST"],
+  "path_templates": ["/health", "/ask", "/ask/stream"],
+  "max_requests": 6,
+  "requests": [
+    {
+      "id": "rag-health",
+      "method": "GET",
+      "path": "/health",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "content_type", "expected": "application/json"},
+        {"kind": "json_equals", "pointer": "/status", "expected": "ok"}
+      ]
+    },
+    {
+      "id": "rag-ask-missing-question",
+      "method": "POST",
+      "path": "/ask",
+      "body": {},
+      "assertions": [
+        {"kind": "status", "expected": 422},
+        {"kind": "json_exists", "pointer": "/detail/0/loc"}
+      ]
+    },
+    {
+      "id": "rag-ask-empty-question",
+      "method": "POST",
+      "path": "/ask",
+      "body": {"question": ""},
+      "assertions": [
+        {"kind": "status", "expected": 400},
+        {"kind": "json_equals", "pointer": "/detail", "expected": "问题不能为空"}
+      ]
+    },
+    {
+      "id": "rag-ask-invalid-type",
+      "method": "POST",
+      "path": "/ask",
+      "body": {"question": 123},
+      "assertions": [
+        {"kind": "status", "expected": 422},
+        {"kind": "json_equals", "pointer": "/detail/0/type", "expected": "string_type"}
+      ]
+    },
+    {
+      "id": "rag-stream-empty-question",
+      "method": "POST",
+      "path": "/ask/stream",
+      "body": {"question": ""},
+      "assertions": [
+        {"kind": "status", "expected": 400},
+        {"kind": "json_equals", "pointer": "/detail", "expected": "问题不能为空"}
+      ]
+    },
+    {
+      "id": "rag-stream-missing-question",
+      "method": "POST",
+      "path": "/ask/stream",
+      "body": {},
+      "assertions": [
+        {"kind": "status", "expected": 422},
+        {"kind": "json_exists", "pointer": "/detail/0/loc"}
+      ]
+    }
+  ]
+}

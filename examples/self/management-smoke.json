@@ -1,0 +1,157 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8010",
+  "allowed_methods": ["GET", "POST"],
+  "path_templates": [
+    "/health",
+    "/openapi.json",
+    "/api/projects",
+    "/api/projects/{id}",
+    "/api/executions/engine/list",
+    "/api/executions/engine/status",
+    "/api/settings/llm",
+    "/api/llm/status",
+    "/api/console/history",
+    "/api/streams",
+    "/api/tasks",
+    "/api/model-testing/discover"
+  ],
+  "max_requests": 13,
+  "requests": [
+    {
+      "id": "self-health",
+      "method": "GET",
+      "path": "/health",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "content_type", "expected": "application/json"},
+        {"kind": "json_equals", "pointer": "/status", "expected": "ok"},
+        {"kind": "json_exists", "pointer": "/service"},
+        {"kind": "json_exists", "pointer": "/version"}
+      ]
+    },
+    {
+      "id": "self-openapi",
+      "method": "GET",
+      "path": "/openapi.json",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "content_type", "expected": "application/json"},
+        {"kind": "json_exists", "pointer": "/openapi"},
+        {"kind": "json_exists", "pointer": "/paths"}
+      ]
+    },
+    {
+      "id": "self-projects-list",
+      "method": "GET",
+      "path": "/api/projects",
+      "query": {"limit": "10", "offset": "0"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_exists", "pointer": "/items"},
+        {"kind": "json_exists", "pointer": "/page/total"}
+      ]
+    },
+    {
+      "id": "self-project-not-found",
+      "method": "GET",
+      "path": "/api/projects/00000000-0000-0000-0000-000000000000",
+      "assertions": [
+        {"kind": "status", "expected": 404},
+        {"kind": "json_equals", "pointer": "/error/code", "expected": "not_found"}
+      ]
+    },
+    {
+      "id": "self-engine-list",
+      "method": "GET",
+      "path": "/api/executions/engine/list",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/default", "expected": "native"},
+        {"kind": "json_exists", "pointer": "/items/0/id"}
+      ]
+    },
+    {
+      "id": "self-engine-status-native",
+      "method": "GET",
+      "path": "/api/executions/engine/status",
+      "query": {"engine": "native"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/available", "expected": true},
+        {"kind": "json_equals", "pointer": "/engine", "expected": "native"}
+      ]
+    },
+    {
+      "id": "self-llm-settings",
+      "method": "GET",
+      "path": "/api/settings/llm",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_exists", "pointer": "/enabled"},
+        {"kind": "json_exists", "pointer": "/has_api_key"}
+      ]
+    },
+    {
+      "id": "self-llm-status",
+      "method": "GET",
+      "path": "/api/llm/status",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_exists", "pointer": "/configured"},
+        {"kind": "json_exists", "pointer": "/mode"}
+      ]
+    },
+    {
+      "id": "self-console-history",
+      "method": "GET",
+      "path": "/api/console/history",
+      "query": {"limit": "5", "offset": "0"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_exists", "pointer": "/items"},
+        {"kind": "json_exists", "pointer": "/page/limit"}
+      ]
+    },
+    {
+      "id": "self-console-history-invalid-limit",
+      "method": "GET",
+      "path": "/api/console/history",
+      "query": {"limit": "0"},
+      "assertions": [
+        {"kind": "status", "expected": 422},
+        {"kind": "json_equals", "pointer": "/error/code", "expected": "validation_error"}
+      ]
+    },
+    {
+      "id": "self-streams-list",
+      "method": "GET",
+      "path": "/api/streams",
+      "query": {"limit": "5", "offset": "0"},
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_exists", "pointer": "/items"},
+        {"kind": "json_exists", "pointer": "/page/total"}
+      ]
+    },
+    {
+      "id": "self-tasks-list",
+      "method": "GET",
+      "path": "/api/tasks",
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_exists", "pointer": "/items"}
+      ]
+    },
+    {
+      "id": "self-model-testing-invalid-url",
+      "method": "POST",
+      "path": "/api/model-testing/discover",
+      "body": {"base_url": "not-a-valid-url"},
+      "assertions": [
+        {"kind": "status", "expected": 400},
+        {"kind": "json_equals", "pointer": "/error/code", "expected": "invalid_base_url"}
+      ]
+    }
+  ]
+}

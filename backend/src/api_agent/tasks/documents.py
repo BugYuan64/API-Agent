@@ -149,9 +149,6 @@ def recognize(text, *, operations=None):
                 body = media.get("example", sample(media.get("schema", {}), root))
             responses = operation.get("responses", {})
             responses = {str(code): response for code, response in responses.items()}
-            statuses = [
-                int(code) for code in responses if str(code).isdigit() and 200 <= int(code) < 300
-            ]
             protocol = operation.get("x-protocol", "http")
             if protocol == "http" and (
                 any(
@@ -161,6 +158,12 @@ def recognize(text, *, operations=None):
                 or "text/event-stream" in operation.get("produces", [])
             ):
                 protocol = "sse"
+            statuses = [
+                int(code)
+                for code in responses
+                if str(code).isdigit()
+                and (200 <= int(code) < 300 or (protocol == "websocket" and int(code) == 101))
+            ]
             original = operation.get("x-test-cases", operation.get("test_cases", []))
             generated = _boundary_cases(
                 {**operation, "parameters": parameters},
@@ -199,6 +202,7 @@ def recognize(text, *, operations=None):
                         else [],
                         "messages": operation.get("x-messages", []),
                         "headers": headers,
+                        "extract": operation.get("x-extract", []),
                         "cases": [
                             {
                                 "path": request_path,
@@ -218,6 +222,7 @@ def recognize(text, *, operations=None):
         format="openapi" if root.get("openapi") else "swagger",
         title=title,
         server_url=document_server(root),
+        variables=root.get("x-variables", {}) if isinstance(root.get("x-variables"), dict) else {},
         endpoints=endpoints,
         cases=root.get("x-test-cases", root.get("test_cases", [])),
         warnings=warnings,

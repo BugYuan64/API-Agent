@@ -1,7 +1,15 @@
 /** 前端页面路由表与标题同步：依赖 Vue Router，延迟加载页面并兼容旧入口。history 路由刷新依赖服务端 SPA 回落；此处不处理页面数据请求。 */
 import { createRouter, createWebHistory } from 'vue-router'
+import type { PageScope } from '@/stores/workbenchRuns'
 
-/** 路由即页面。标题写进 meta 供顶栏与 document.title 使用。
+declare module 'vue-router' {
+  interface RouteMeta {
+    title?: string
+    scope?: PageScope
+  }
+}
+
+/** 路由即页面。标题与页面作用域写进 meta 供顶栏、document.title 与跨页助手/运行态隔离使用。
  *  采用 history 模式：后端已为未匹配路径回落 index.html（见 main.py 的 SPA 处理）。 */
 export const router = createRouter({
   history: createWebHistory(),
@@ -11,13 +19,13 @@ export const router = createRouter({
       path: '/request',
       name: 'request',
       component: () => import('@/views/RequestConsole.vue'),
-      meta: { title: '接口测试' },
+      meta: { title: '接口测试', scope: 'console' },
     },
     {
       path: '/testcases',
       name: 'testcases',
       component: () => import('@/views/TestCasesView.vue'),
-      meta: { title: '智能群测' },
+      meta: { title: '智能群测', scope: 'tasks' },
     },
     // 旧入口统一进入文档驱动任务测试。
     { path: '/plan', redirect: '/testcases' },
@@ -26,7 +34,13 @@ export const router = createRouter({
       path: '/long-connection',
       name: 'long-connection',
       component: () => import('@/views/LongConnection.vue'),
-      meta: { title: 'WebSocket 调试' },
+      meta: { title: 'WebSocket 调试', scope: 'websocket' },
+    },
+    {
+      path: '/model-testing',
+      name: 'model-testing',
+      component: () => import('@/views/ModelTestingView.vue'),
+      meta: { title: '大模型测试', scope: 'model_testing' },
     },
     {
       path: '/projects',

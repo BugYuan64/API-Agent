@@ -38,11 +38,20 @@ new Function('exports', ts.transpileModule(
   fs.readFileSync(path.join(__dirname, '../src/lib/copy.ts'), 'utf8'),
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
 ).outputText)(copyExports)
-const chatHistoryExports = {}
+const assistantContextExports = {}
 new Function('exports', ts.transpileModule(
+  fs.readFileSync(path.join(__dirname, '../src/lib/assistantContext.ts'), 'utf8'),
+  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
+).outputText)(assistantContextExports)
+const chatHistoryJs = ts.transpileModule(
   fs.readFileSync(path.join(__dirname, '../src/lib/chatHistory.ts'), 'utf8'),
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
-).outputText)(chatHistoryExports)
+).outputText
+function loadChatHistory(storage) {
+  const exports = {}
+  new Function('exports', 'window', chatHistoryJs)(exports, { localStorage: storage })
+  return exports
+}
 const taskExports = {}
 new Function('exports', 'require', ts.transpileModule(
   fs.readFileSync(path.join(__dirname, '../src/api/tasks.ts'), 'utf8'),
@@ -62,34 +71,32 @@ function deferred() {
 function memoryStorage(initial = {}) {
   const values = new Map(Object.entries(initial))
   return {
+    get length() { return values.size },
+    key: index => [...values.keys()][index] ?? null,
     getItem: key => values.get(key) ?? null,
     setItem: (key, value) => values.set(key, String(value)),
     removeItem: key => values.delete(key),
   }
 }
 
-test('execution promotion moves the assistant transcript and removes the AI-only label', () => {
+test('previously linked test chats remain readable and can be removed with the test', () => {
   const storage = memoryStorage({
     'api-agent.chat.console.chat-one': '[{"role":"user","content":"你好"}]',
-    'api-agent.chat-history.console': JSON.stringify([{ id: 'chat-one', title: '问候', created_at: '2026-11-20T00:00:00Z' }]),
+    'api-agent.chat-execution.console.request-one': 'chat-one',
+    'api-agent.chat.console.chat-only': '[]',
   })
-  const previousWindow = globalThis.window
-  globalThis.window = { localStorage: storage }
-  try {
-    chatHistoryExports.attachChatToExecution('console', 'chat-one', 'request-one')
-    assert.equal(storage.getItem('api-agent.chat-execution.console.request-one'), 'chat-one')
-    assert.equal(chatHistoryExports.chatTranscriptKey('console', 'request-one'), 'api-agent.chat.console.chat-one')
-    assert.equal(storage.getItem('api-agent.chat.console.chat-one'), '[{"role":"user","content":"你好"}]')
-    assert.deepEqual(chatHistoryExports.listChatHistories('console'), [])
-  } finally {
-    globalThis.window = previousWindow
-  }
+  const { chatTranscriptKey, removeTestChat } = loadChatHistory(storage)
+  assert.equal(chatTranscriptKey('console', 'request-one'), 'api-agent.chat.console.chat-one')
+  removeTestChat('console', 'request-one')
+  assert.equal(storage.getItem('api-agent.chat-execution.console.request-one'), null)
+  assert.equal(storage.getItem('api-agent.chat.console.chat-one'), null)
+  assert.equal(storage.getItem('api-agent.chat.console.chat-only'), '[]')
 })
 
 function load(name, names, mocks = {}, directory = 'views') {
   const sfc = fs.readFileSync(path.join(__dirname, '../src', directory, `${name}.vue`), 'utf8')
   const source = sfc.split('<script setup lang="ts">')[1].split('</script>')[0]
-    .replace(/import[\s\S]*?from\s+['"][^'"]+['"]\r?\n/g, '')
+    .replace(/^\s*import[\s\S]*?from\s+['"][^'"]+['"]\r?\n/gm, '')
   const js = ts.transpileModule(source, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText
@@ -101,7 +108,8 @@ function load(name, names, mocks = {}, directory = 'views') {
   const env = {
     ...vue,
     ...copyExports,
-    ...chatHistoryExports,
+    ...assistantContextExports,
+    ...loadChatHistory(storage),
     ...resultExports,
     ...taskResultExports,
     ...prefixExports,
@@ -365,7 +373,7 @@ test('WebSocket settings start collapsed and carry their values into new session
   const payloadSettings = ({ send_interval_ms, max_events, connect_timeout_ms, max_duration_ms, ping_interval_ms }) =>
     [send_interval_ms, max_events, connect_timeout_ms, max_duration_ms, ping_interval_ms]
   assert.deepEqual(sessions.map(payloadSettings), [
-    [1200, 200, 10000, 60000, 20000],
+    [1200, 200, 60000, 900000, 20000],
     [0, 350, 8000, 45000, 0],
     [0, 350, 8000, 45000, 0],
   ])
@@ -410,6 +418,20 @@ test('new tests clear workbench state and ignore replies from the previous test'
   assert.equal(task.run.value, null)
 })
 
+test('fresh workbench settings match the defaults in system settings', context => {
+  const page = load('TestCasesView', ['taskSettings'], { storage: memoryStorage() })
+  context.after(page.dispose)
+  assert.deepEqual({ ...page.taskSettings }, { allowWrites: true, testsPerUrl: 3, observationMs: 30000, wallTimeSeconds: 3600, cooldownMs: 500 })
+  const http = load('RequestConsole', ['consoleSettings'], { storage: memoryStorage() })
+  context.after(http.dispose)
+  assert.deepEqual({ ...http.consoleSettings }, { sseDurationMs: 30000, sseMaxEvents: 50, timeoutMs: 60000, cooldownMs: 500, followRedirects: false })
+  const websocket = load('LongConnection', ['webSocketSettings'], { storage: memoryStorage() })
+  context.after(websocket.dispose)
+  assert.deepEqual({ ...websocket.webSocketSettings }, {
+    sendIntervalMs: 500, maxEvents: 200, connectTimeoutMs: 60000, maxDurationMs: 900000, pingIntervalMs: 20000, cooldownMs: 500,
+  })
+})
+
 test('settings edits clamp to the nearest boundary and report the correction', context => {
   const storage = memoryStorage()
   const notifications = []
@@ -421,7 +443,7 @@ test('settings edits clamp to the nearest boundary and report the correction', c
     }, 'components')
     context.after(page.dispose)
     const field = page.fields.value.find(item => item.key === key)
-    for (const [raw, expected] of [[max + 1, max], [min - 1, min]]) {
+    for (const [raw, expected] of [[min - 1, min], [max + 1, max]]) {
       const input = { valueAsNumber: raw, value: String(raw) }
       page.updateNumber({ currentTarget: input }, field)
       assert.equal(input.value, String(expected))
@@ -572,12 +594,11 @@ test('the assistant uses the saved model, sends without a task and blocks overla
   const storage = memoryStorage()
   let savedModel = 'system-model'
   const assistant = load('TaskChat', ['readModel', 'selectModel', 'send', 'input', 'model', 'sending'], {
-    defineProps: () => ({ scope: 'tasks', conversationKey: 'history-one' }),
-    window: { localStorage: storage },
+    storage,
+    defineProps: () => ({ scope: 'tasks', executionId: 'history-one' }),
     useId: () => 'assistant-model-menu',
     getLLMConfig: async () => ({ model: savedModel }),
     selectLLMModel: async model => ({ model: (savedModel = model) }),
-    generateChatTitle: async () => ({ title: 'AI 对话测试' }),
     chatWithAssistant: (taskId, messages, onText) => {
       requests.push({ taskId, messages, model: savedModel })
       onText('回复片段')
@@ -606,42 +627,78 @@ test('the assistant uses the saved model, sends without a task and blocks overla
   assert.equal(assistant.sending.value, false)
 })
 
-test('the first assistant message creates one history and later turns keep its id', async context => {
+test('ordinary assistant turns support follow-ups without writing browser history', async context => {
   const storage = memoryStorage()
-  const created = []
-  const titled = []
-  const previousWindow = globalThis.window
-  globalThis.window = { localStorage: storage }
-  context.after(() => { globalThis.window = previousWindow })
-  const assistant = load('TaskChat', ['send', 'input', 'activeConversationKey'], {
-    defineProps: () => ({ scope: 'console', conversationKey: 'draft-new' }),
-    defineEmits: () => (...args) => {
-      if (args[0] === 'history-created') created.push(args[1])
-      if (args[0] === 'history-titled') titled.push(args[1])
-    },
-    window: { localStorage: storage },
+  const requests = []
+  const props = vue.reactive({ scope: 'console', draftVersion: 0 })
+  const options = {
+    storage,
+    defineProps: () => props,
     useId: () => 'chat-test',
-    getLLMConfig: async () => ({ model: 'fixture' }),
-    generateChatTitle: async () => ({ title: 'SSE 接口测试问题' }),
-    chatWithAssistant: async (_taskId, messages) => `答复：${messages.at(-1).content}`,
-  }, 'components')
+    chatWithAssistant: async (_taskId, messages) => {
+      requests.push(messages)
+      return `答复：${messages.at(-1).content}`
+    },
+  }
+  const assistant = load('TaskChat', ['send', 'input', 'turns'], options, 'components')
   context.after(assistant.dispose)
-  assistant.input.value = '请解释 SSE 测试结果'
+  assistant.input.value = '你好'
   await assistant.send()
-  assert.equal(created.length, 1)
-  assert.equal(created[0].title, 'AI 对话')
-  const firstId = created[0].id
-  assert.equal(assistant.activeConversationKey.value, firstId)
-  assert.equal(JSON.parse(storage.getItem('api-agent.chat-history.console'))[0].title, 'SSE 接口测试问题')
-  assert.equal(titled[0].title, 'SSE 接口测试问题')
   assistant.input.value = '再补充一下'
   await assistant.send()
-  assert.equal(created.length, 1)
-  assert.equal(titled.length, 1)
-  assert.equal(assistant.activeConversationKey.value, firstId)
-  assert.equal(JSON.parse(storage.getItem('api-agent.chat-history.console'))[0].title, 'SSE 接口测试问题')
-  assert.equal(JSON.parse(storage.getItem('api-agent.chat-history.console')).length, 1)
-  assert.equal(JSON.parse(storage.getItem(`api-agent.chat.console.${firstId}`)).length, 4)
+  assert.equal(assistant.turns.value.length, 4)
+  assert.deepEqual(requests[1].map(turn => turn.content), ['你好', '答复：你好', '再补充一下'])
+  assert.equal(storage.length, 0)
+  const reopened = load('TaskChat', ['turns'], options, 'components')
+  context.after(reopened.dispose)
+  assert.deepEqual(reopened.turns.value, [])
+  props.draftVersion++
+  await vue.nextTick()
+  assert.deepEqual(assistant.turns.value, [])
+})
+
+test('an in-flight reply never enters a different test history or recreates a deleted transcript', async context => {
+  const storage = memoryStorage()
+  const props = vue.reactive({ scope: 'tasks', draftVersion: 0, executionId: null, taskId: undefined })
+  let reply = deferred()
+  const taskIds = []
+  const assistant = load('TaskChat', ['send', 'input', 'turns'], {
+    storage, defineProps: () => props, useId: () => 'chat-test',
+    chatWithAssistant: taskId => { taskIds.push(taskId); return reply.promise },
+  }, 'components')
+  context.after(assistant.dispose)
+  assistant.input.value = '普通对话'
+  const draft = assistant.send()
+  Object.assign(props, { executionId: 'test-one', taskId: 'test-one' })
+  await vue.nextTick()
+  reply.resolve('普通回复')
+  await draft
+  assert.equal(storage.length, 0)
+  assert.deepEqual(assistant.turns.value, [])
+
+  reply = deferred()
+  assistant.input.value = '测试一的问题'
+  const testOne = assistant.send()
+  Object.assign(props, { executionId: 'test-two', taskId: 'test-two' })
+  await vue.nextTick()
+  reply.resolve('测试一的回复')
+  await testOne
+  assert.equal(storage.getItem('api-agent.chat.tasks.test-two'), null)
+  assert.deepEqual(assistant.turns.value, [])
+  Object.assign(props, { executionId: 'test-one', taskId: 'test-one' })
+  await vue.nextTick()
+  assert.deepEqual(assistant.turns.value.map(turn => turn.content), ['测试一的问题', '测试一的回复'])
+
+  reply = deferred()
+  assistant.input.value = '另一个问题'
+  const deleted = assistant.send()
+  loadChatHistory(storage).removeTestChat('tasks', 'test-one')
+  Object.assign(props, { executionId: null, taskId: undefined })
+  reply.resolve('迟到的回复')
+  await deleted
+  assert.deepEqual(taskIds, [undefined, 'test-one', 'test-one'])
+  assert.equal(storage.length, 0)
+  assert.deepEqual(assistant.turns.value, [])
 })
 
 test('shared AI Markdown renders streamed sections and escapes model HTML', async context => {
@@ -699,7 +756,7 @@ test('task limits and write permission survive history selection and reopening w
     return page
   }
   const first = open()
-  assert.equal(first.taskSettings.allowWrites, false)
+  assert.equal(first.taskSettings.allowWrites, true)
   Object.assign(first.taskSettings, { allowWrites: true, observationMs: 4800, wallTimeSeconds: 75 })
   await first.selectHistory('old')
   await first.submit()
@@ -939,4 +996,1131 @@ test('task cancellation cannot be overwritten by an in-flight running snapshot',
   assert.equal(page.run.value.status, 'cancelled')
   assert.equal(page.timerCount(), 0)
   page.dispose()
+})
+
+test('settings defaults to enabled, validates timeout, and only sends generation_model when active or clearing', async context => {
+  const payloads = []
+  const toasts = []
+  const page = load('SettingsView', ['form', 'loadSettings', 'saveSettings'], {
+    getLLMConfig: async () => ({
+      enabled: true,
+      provider: 'openai',
+      base_url: 'https://api.example/v1',
+      model: 'gpt-4o',
+      generation_model: null,
+      timeout_seconds: 60,
+      has_api_key: true,
+    }),
+    updateLLMConfig: async body => {
+      payloads.push(JSON.parse(JSON.stringify(body)))
+      return {
+        enabled: body.enabled,
+        provider: 'openai',
+        base_url: body.base_url,
+        model: body.model,
+        generation_model: body.generation_model ?? null,
+        timeout_seconds: body.timeout_seconds,
+        has_api_key: true,
+      }
+    },
+    useToastStore: () => ({ push: (...args) => toasts.push(args) }),
+  })
+  context.after(page.dispose)
+  assert.equal(page.form.enabled, true)
+
+  await page.loadSettings()
+  page.form.timeoutSeconds = ''
+  await page.saveSettings()
+  assert.equal(payloads.length, 0)
+  assert.match(toasts.at(-1)[1], /超时时间/)
+
+  page.form.timeoutSeconds = 90
+  await page.saveSettings()
+  assert.equal('generation_model' in payloads[0], false)
+  assert.equal(payloads[0].enabled, true)
+
+  page.form.customGenerationModel = true
+  page.form.generationModel = 'gen-model'
+  await page.saveSettings()
+  assert.equal(payloads[1].generation_model, 'gen-model')
+
+  page.form.customGenerationModel = false
+  await page.saveSettings()
+  assert.equal(payloads[2].generation_model, null)
+})
+
+test('assistant composer sends on Enter and keeps newline for Shift+Enter or IME composition', async context => {
+  const sent = []
+  const assistant = load('TaskChat', ['input', 'onInputKeydown'], {
+    defineProps: () => ({ scope: 'console' }),
+    useId: () => 'chat-enter-test',
+    chatWithAssistant: async (_taskId, messages) => {
+      sent.push(messages.at(-1).content)
+      return '收到'
+    },
+  }, 'components')
+  context.after(assistant.dispose)
+
+  assistant.input.value = '第一行'
+  let prevented = false
+  assistant.onInputKeydown({ key: 'Enter', shiftKey: true, isComposing: false, preventDefault: () => { prevented = true } })
+  assert.equal(prevented, false)
+  assert.deepEqual(sent, [])
+
+  assistant.onInputKeydown({ key: 'Enter', shiftKey: false, isComposing: true, preventDefault: () => { prevented = true } })
+  assert.equal(prevented, false)
+  assert.deepEqual(sent, [])
+
+  assistant.onInputKeydown({ key: 'Enter', shiftKey: false, isComposing: false, preventDefault: () => { prevented = true } })
+  assert.equal(prevented, true)
+  await Promise.resolve()
+  assert.deepEqual(sent, ['第一行'])
+})
+
+test('assistant output auto-follows only when at bottom or empty before sending, and stops when scrolled up', async context => {
+  let reply = deferred()
+  let emitChunk = () => {}
+  const makeScrollBox = (clientHeight, scrollHeight, scrollTop = 0) => {
+    let top = scrollTop
+    return {
+      clientHeight,
+      scrollHeight,
+      get scrollTop() { return top },
+      set scrollTop(value) { top = Math.max(0, Math.min(value, Math.max(0, this.scrollHeight - this.clientHeight))) },
+    }
+  }
+  const assistant = load('TaskChat', ['input', 'turns', 'output', 'send', 'onOutputScroll'], {
+    defineProps: () => ({ scope: 'console' }),
+    useId: () => 'chat-anchor-test',
+    chatWithAssistant: (_taskId, _messages, onText) => {
+      emitChunk = onText
+      return reply.promise
+    },
+  }, 'components')
+  context.after(assistant.dispose)
+
+  // 1. 没有输出时发送，后续每行流式输出自动跟进到底部
+  const box = makeScrollBox(200, 200, 0)
+  assistant.output.value = box
+  assistant.input.value = '第一问'
+  const first = assistant.send()
+  box.scrollHeight = 360
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 160)
+
+  box.scrollHeight = 520
+  emitChunk('第一行\n第二行')
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 320)
+
+  // 2. 流式输出中途用户向上滚离末行后，不再强制拉回底部
+  box.scrollTop = 80
+  assistant.onOutputScroll()
+  box.scrollHeight = 700
+  emitChunk('第一行\n第二行\n第三行')
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 80)
+
+  // 3. 用户滚回底部后重新建立锚点，继续自动跟进
+  box.scrollTop = 500
+  assistant.onOutputScroll()
+  box.scrollHeight = 820
+  reply.resolve('完整回复')
+  await first
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 620)
+
+  // 4. 发送对话前未显示最后一行时，发送与输出均不自动跟进
+  box.scrollTop = 40
+  assistant.onOutputScroll()
+  reply = deferred()
+  assistant.input.value = '第二问'
+  const second = assistant.send()
+  box.scrollHeight = 980
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 40)
+
+  box.scrollHeight = 1120
+  emitChunk('新的流式内容')
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 40)
+
+  reply.resolve('第二条回复')
+  await second
+  await vue.nextTick()
+  assert.equal(box.scrollTop, 40)
+})
+
+test('deleting an active WebSocket session stops polling and resets live state', async context => {
+  const pending = deferred()
+  let pollSignal
+  const page = load('LongConnection', ['start', 'removeHistory', 'session', 'events', 'history'], {
+    startStream: async () => ({ id: 'ws-live', kind: 'websocket', status: 'open', finished: false }),
+    readStream: (_id, _after, _wait, signal) => { pollSignal = signal; return pending.promise },
+    listStreams: async () => ({ items: [{ id: 'ws-live', kind: 'websocket', url: 'ws://127.0.0.1:9100/ws', status: 'open', stop_reason: null, event_count: 1, created_at: '2026-11-22T00:00:00Z' }] }),
+    deleteStream: async () => null,
+  })
+  context.after(page.dispose)
+
+  await page.start()
+  assert.equal(page.session.value.id, 'ws-live')
+  await page.removeHistory({ id: 'ws-live' })
+  assert.equal(pollSignal.aborted, true)
+  assert.equal(page.session.value, null)
+  assert.deepEqual(page.events.value, [])
+  pending.resolve({ session: { id: 'ws-live', finished: true }, events: [{ sequence: 1 }], next_cursor: 1, has_more: false })
+  await Promise.resolve()
+  assert.equal(page.session.value, null)
+})
+
+test('history view confirms before clearing HTTP history and supports stream/task deletion with event preview', async context => {
+  let cleared = 0
+  const deleted = []
+  let confirmed = false
+  const storage = memoryStorage({
+    'api-agent.chat-execution.console.h1': 'c1',
+    'api-agent.chat.console.c1': '[]',
+    'api-agent.chat-execution.websocket.s1': 'c2',
+    'api-agent.chat.websocket.c2': '[]',
+    'api-agent.chat-execution.tasks.t1': 'c3',
+    'api-agent.chat.tasks.c3': '[]',
+  })
+  const page = load('HistoryView', [
+    'tab', 'httpItems', 'streamItems', 'taskItems', 'selectedStream', 'streamEvents',
+    'selectedTaskId', 'task', 'selectStream', 'removeStreamRecord', 'removeTaskRecord', 'clearAll',
+  ], {
+    storage,
+    window: {
+      localStorage: storage,
+      matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+      confirm: () => confirmed,
+      addEventListener: () => {},
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    },
+    clearConsoleHistory: async () => { cleared++ },
+    deleteStream: async id => { deleted.push(['stream', id]) },
+    deleteTask: async id => { deleted.push(['task', id]) },
+    readStream: async () => ({
+      session: { id: 's1', finished: true },
+      events: [{ sequence: 1, direction: 'in', kind: 'text', data: 'welcome-1', elapsed_ms: 5 }],
+      next_cursor: 1,
+      has_more: false,
+    }),
+    describeStopReason: () => '正常关闭',
+    formatBytes: () => '10 B',
+    prettyJson: value => value,
+  })
+  context.after(page.dispose)
+
+  page.httpItems.value = [{ id: 'h1' }]
+  await page.clearAll()
+  assert.equal(cleared, 0)
+  assert.equal(page.httpItems.value.length, 1)
+
+  confirmed = true
+  await page.clearAll()
+  assert.equal(cleared, 1)
+  assert.equal(page.httpItems.value.length, 0)
+  assert.equal(storage.getItem('api-agent.chat.console.c1'), null)
+
+  page.streamItems.value = [{ id: 's1', kind: 'websocket', url: 'ws://127.0.0.1:9100/ws', status: 'closed', event_count: 1, byte_count: 9, created_at: '2026-11-22T00:00:00Z' }]
+  await page.selectStream(page.streamItems.value[0])
+  assert.equal(page.streamEvents.value.length, 1)
+  await page.removeStreamRecord(page.streamItems.value[0])
+  assert.equal(page.selectedStream.value, null)
+  assert.equal(storage.getItem('api-agent.chat.websocket.c2'), null)
+
+  page.taskItems.value = [{ id: 't1', status: 'completed', created_at: '2026-11-22T00:00:00Z' }]
+  page.selectedTaskId.value = 't1'
+  page.task.value = { id: 't1', status: 'completed', snapshot: { cases: [] }, results: [], summary: '## 结论' }
+  await page.removeTaskRecord('t1')
+  assert.equal(page.task.value, null)
+  assert.equal(storage.getItem('api-agent.chat.tasks.c3'), null)
+  assert.deepEqual(deleted, [['stream', 's1'], ['task', 't1']])
+})
+
+test('history view filters records by URL/keyword and status across tabs and resets status on tab switch', async context => {
+  const page = load('HistoryView', [
+    'tab', 'searchQuery', 'statusFilter', 'httpItems', 'streamItems', 'taskItems',
+    'filteredHttpItems', 'filteredStreamItems', 'filteredTaskItems', 'resetFilters',
+  ], {
+    window: {
+      localStorage: memoryStorage(),
+      matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+      confirm: () => true,
+      addEventListener: () => {},
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+      setInterval: () => 1,
+      clearInterval: () => {},
+    },
+    describeStopReason: () => '',
+    formatBytes: () => '0 B',
+    prettyJson: value => value,
+  })
+  context.after(page.dispose)
+
+  page.httpItems.value = [
+    { id: 'h1', method: 'GET', url: 'http://127.0.0.1:8010/health', ok: true, status_code: 200, response_headers: {} },
+    { id: 'h2', method: 'POST', url: 'http://127.0.0.1:8010/api/login', ok: true, status_code: 401, response_headers: {} },
+    { id: 'h3', method: 'GET', url: 'http://127.0.0.1:9100/sse', ok: true, status_code: 200, response_headers: { 'content-type': ['text/event-stream'] } },
+    { id: 'h4', method: 'GET', url: 'http://127.0.0.1:9100/down', ok: false, status_code: null, error_kind: 'request_timeout', response_headers: {} },
+  ]
+  page.streamItems.value = [
+    { id: 's1', kind: 'websocket', url: 'ws://127.0.0.1:9100/ws', status: 'closed', stop_reason: 'client_stopped' },
+    { id: 's2', kind: 'websocket', url: 'ws://127.0.0.1:9100/reject', status: 'error', stop_reason: 'handshake_rejected' },
+    { id: 's3', kind: 'websocket', url: 'ws://127.0.0.1:9100/live', status: 'connecting', stop_reason: null },
+  ]
+  page.taskItems.value = [
+    { id: 't1', title: 'CRM 冒烟', origin: 'http://127.0.0.1:8088', status: 'completed' },
+    { id: 't2', title: '订单测试', origin: 'http://127.0.0.1:9100', status: 'partial' },
+    { id: 't3', title: '超时回归', origin: 'http://127.0.0.1:9100', status: 'timed_out' },
+  ]
+
+  page.statusFilter.value = '4xx'
+  assert.deepEqual(page.filteredHttpItems.value.map(item => item.id), ['h2'])
+  page.statusFilter.value = 'all'
+  page.searchQuery.value = '9100'
+  assert.deepEqual(page.filteredHttpItems.value.map(item => item.id), ['h3', 'h4'])
+  page.statusFilter.value = 'error'
+  assert.deepEqual(page.filteredHttpItems.value.map(item => item.id), ['h4'])
+  page.statusFilter.value = 'sse'
+  assert.deepEqual(page.filteredHttpItems.value.map(item => item.id), ['h3'])
+
+  page.tab.value = 'stream'
+  await vue.nextTick()
+  assert.equal(page.statusFilter.value, 'all')
+  assert.deepEqual(page.filteredStreamItems.value.map(item => item.id), ['s1', 's2', 's3'])
+  page.statusFilter.value = 'open'
+  assert.deepEqual(page.filteredStreamItems.value.map(item => item.id), ['s3'])
+  page.statusFilter.value = 'error'
+  assert.deepEqual(page.filteredStreamItems.value.map(item => item.id), ['s2'])
+
+  page.tab.value = 'task'
+  await vue.nextTick()
+  assert.equal(page.statusFilter.value, 'all')
+  assert.deepEqual(page.filteredTaskItems.value.map(item => item.id), ['t2', 't3'])
+  page.statusFilter.value = 'partial'
+  assert.deepEqual(page.filteredTaskItems.value.map(item => item.id), ['t2'])
+  page.statusFilter.value = 'timed_out'
+  assert.deepEqual(page.filteredTaskItems.value.map(item => item.id), ['t3'])
+  page.resetFilters()
+  assert.deepEqual(page.filteredTaskItems.value.map(item => item.id), ['t1', 't2', 't3'])
+})
+
+test('WebSocket headers and subprotocols start collapsed and timeline events toggle independently', async context => {
+  const started = []
+  const page = load('LongConnection', [
+    'SAMPLES', 'applySample', 'form', 'urlPrefix', 'session', 'events', 'toggleEvent', 'toggleAllEvents', 'isEventCollapsed',
+  ], {
+    startStream: async input => { started.push(input); return { id: 'ws-started', finished: true } },
+    formatBytes: value => `${value ?? 0} B`,
+    describeStopReason: () => '',
+    looksLikeJson: value => value.trim().startsWith('{'),
+    prettyJson: value => value,
+  })
+  context.after(page.dispose)
+
+  page.urlPrefix.value = 'ws://127.0.0.1:9000'
+  page.applySample(page.SAMPLES[0])
+  assert.equal(page.SAMPLES[0].label, 'CRM 实时对话')
+  assert.equal(page.urlPrefix.value, '')
+  assert.equal(page.form.url, 'ws://127.0.0.1:8088/api/ws/chat?room=lobby&name=API测试端')
+  assert.equal(page.form.scheduled, '你好，我是 API-Agent！')
+  assert.deepEqual(started, [])
+
+  page.session.value = { id: 'ws-ui', kind: 'websocket', status: 'open', finished: false, url: 'ws://127.0.0.1:8088/api/ws/chat', event_count: 3, sent_count: 1, byte_count: 64 }
+  page.events.value = [
+    { sequence: 1, direction: 'in', kind: 'open', data: 'WebSocket handshake complete', data_bytes: 28, truncated: false, elapsed_ms: 12 },
+    { sequence: 2, direction: 'out', kind: 'text', data: '{"type":"ping"}', data_bytes: 15, truncated: false, elapsed_ms: 35 },
+    { sequence: 3, direction: 'in', kind: 'text', data: '{"type":"pong","onlineCount":2}', data_bytes: 31, truncated: false, elapsed_ms: 48 },
+  ]
+
+  const initialHtml = await page.render()
+  assert.match(initialHtml, /class="sample-chip"[^>]*>CRM 实时对话<\/button>/)
+  assert.match(initialHtml, /<details\b(?![^>]*\sopen(?:\s|=|>))[^>]*>[\s\S]*?<summary[^>]*>[\s\S]*?请求头[\s\S]*?<\/summary>/)
+  assert.match(initialHtml, /<details\b(?![^>]*\sopen(?:\s|=|>))[^>]*>[\s\S]*?<summary[^>]*>[\s\S]*?子协议（逗号分隔）[\s\S]*?<\/summary>/)
+  assert.match(initialHtml, /event-tone-open/)
+  assert.match(initialHtml, /event-tone-out/)
+  assert.match(initialHtml, /event-tone-in/)
+  assert.match(initialHtml, /class="event-body"/)
+
+  // 折叠第 2 条发送记录，第 3 条接收记录仍保持展开
+  page.toggleEvent(2)
+  assert.equal(page.isEventCollapsed(2), true)
+  assert.equal(page.isEventCollapsed(3), false)
+  const foldedOne = await page.render()
+  assert.match(foldedOne, /event-collapsed/)
+  assert.match(foldedOne, /class="event-preview"/)
+  assert.match(foldedOne, /class="event-body"[^>]*>[^<]*pong/)
+
+  // 批量折叠与批量展开
+  page.toggleAllEvents()
+  assert.equal(page.isEventCollapsed(1), true)
+  assert.equal(page.isEventCollapsed(2), true)
+  assert.equal(page.isEventCollapsed(3), true)
+  assert.doesNotMatch(await page.render(), /class="event-body"/)
+
+  page.toggleAllEvents()
+  assert.equal(page.isEventCollapsed(1), false)
+  assert.equal(page.isEventCollapsed(2), false)
+  assert.equal(page.isEventCollapsed(3), false)
+  assert.match(await page.render(), /class="event-body"/)
+})
+
+test('unified UrlInput renders quick protocol prefixes and powers ModelTestingView and SettingsView without model test history', async context => {
+  const discovered = []
+  const probed = []
+  const savedSettings = []
+
+  const urlProps = {
+    modelValue: 'https://',
+    address: 'provider.example.com/v1',
+    label: 'Base URL',
+    placeholder: 'https://api.openai.com/v1',
+    websocket: false,
+    disabled: false,
+  }
+  const urlInput = load('UrlInput', [], {
+    ...urlProps,
+    defineProps: () => urlProps,
+  }, 'components')
+  context.after(urlInput.dispose)
+  const urlHtml = await urlInput.render()
+  assert.match(urlHtml, /常用协议/)
+  assert.match(urlHtml, /https:\/\//)
+  assert.match(urlHtml, /http:\/\//)
+  assert.doesNotMatch(urlHtml, /ws:\/\//)
+
+  const wsUrlProps = { ...urlProps, modelValue: '', websocket: true }
+  const wsUrlInput = load('UrlInput', [], {
+    ...wsUrlProps,
+    defineProps: () => wsUrlProps,
+  }, 'components')
+  context.after(wsUrlInput.dispose)
+  const wsUrlHtml = await wsUrlInput.render()
+  assert.match(wsUrlHtml, /ws:\/\//)
+  assert.match(wsUrlHtml, /wss:\/\//)
+
+  const modelPage = load('ModelTestingView', [
+    'form', 'urlPrefix', 'selectUrlPrefix', 'effectiveBaseUrl', 'discover', 'runProbe',
+  ], {
+    getLLMConfig: async () => ({
+      enabled: true,
+      provider: 'openai',
+      base_url: 'https://provider.example.com/v1',
+      model: 'deepseek-v4.1-flash',
+      generation_model: null,
+      timeout_seconds: 60,
+      has_api_key: true,
+    }),
+    discoverProviderModels: async payload => {
+      discovered.push(payload)
+      return {
+        ok: true,
+        base_url: 'https://provider.example.com/v1',
+        http_status: 200,
+        latency_ms: 120,
+        count: 1,
+        message: '成功拉取 1 个模型',
+        models: [{
+          id: 'deepseek-v4.1-flash',
+          owned_by: null,
+          created: null,
+          model_type: 'chat',
+          type_source: 'inferred',
+          availability: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+          tool_calling: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+          input_modalities: [],
+          output_modalities: [],
+          raw_metadata: {},
+        }],
+      }
+    },
+    probeProviderModels: async payload => {
+      probed.push(payload)
+      return { ok: true, base_url: payload.base_url, tested_count: 1, available_count: 1, tool_supported_count: 1, message: 'done', results: [] }
+    },
+    useToastStore: () => ({ push: () => {} }),
+  })
+  context.after(modelPage.dispose)
+
+  modelPage.selectUrlPrefix('https://')
+  modelPage.form.baseUrl = 'provider.example.com'
+  assert.equal(modelPage.effectiveBaseUrl.value, 'https://provider.example.com')
+  await modelPage.discover()
+  assert.equal(discovered[0].base_url, 'https://provider.example.com')
+  assert.equal(modelPage.urlPrefix.value, 'https://')
+  assert.equal(modelPage.form.baseUrl, 'provider.example.com/v1')
+  assert.equal(modelPage.effectiveBaseUrl.value, 'https://provider.example.com/v1')
+  await modelPage.runProbe(['deepseek-v4.1-flash'])
+  assert.equal(probed[0].base_url, 'https://provider.example.com/v1')
+
+  const modelHtml = await modelPage.render()
+  assert.match(modelHtml, /<h1>大模型测试<\/h1>/)
+  assert.doesNotMatch(modelHtml, /模型测试服务/)
+  assert.doesNotMatch(modelHtml, /测试历史/)
+
+  const settingsPage = load('SettingsView', ['form', 'urlPrefix', 'selectUrlPrefix', 'saveSettings'], {
+    updateLLMConfig: async body => {
+      savedSettings.push(body)
+      return {
+        enabled: true,
+        provider: 'openai',
+        base_url: body.base_url,
+        model: body.model,
+        generation_model: null,
+        timeout_seconds: body.timeout_seconds,
+        has_api_key: false,
+      }
+    },
+    useToastStore: () => ({ push: () => {} }),
+  })
+  context.after(settingsPage.dispose)
+  settingsPage.selectUrlPrefix('https://')
+  settingsPage.form.baseUrl = 'api.example.com/v1'
+  await settingsPage.saveSettings()
+  assert.equal(savedSettings[0].base_url, 'https://api.example.com/v1')
+})
+
+test('WebSocket composer sits above headers with bidirectional send and TestCases settings uses matching bordered panel', async context => {
+  const sentMessages = []
+  const socket = load('LongConnection', [
+    'form', 'session', 'outgoing', 'messageDraft', 'sendMessage',
+  ], {
+    sendStreamMessage: async (id, message) => {
+      sentMessages.push({ id, message })
+      return { id, kind: 'websocket', status: 'open', finished: false, url: 'ws://127.0.0.1:8081/api/ws/chat', event_count: 2, sent_count: 1, byte_count: 32 }
+    },
+    formatBytes: value => `${value ?? 0} B`,
+    describeStopReason: () => '',
+    looksLikeJson: value => value.trim().startsWith('{'),
+    prettyJson: value => value,
+  })
+  context.after(socket.dispose)
+
+  // 未连接时编辑自动发送内容，且输入区位于请求头之前
+  socket.messageDraft.value = '{"type":"subscribe"}'
+  assert.equal(socket.form.scheduled, '{"type":"subscribe"}')
+  const idleHtml = await socket.render()
+  assert.ok(idleHtml.indexOf('message-composer') > 0)
+  assert.ok(idleHtml.indexOf('message-composer') < idleHtml.indexOf('请求头'))
+  assert.match(idleHtml, /composer-send-btn[^>]*disabled/)
+
+  // 建立连接后自动切换为双向实时发送模式并调用 sendStreamMessage
+  socket.session.value = { id: 'ws-live', kind: 'websocket', status: 'open', finished: false, url: 'ws://127.0.0.1:8081/api/ws/chat', event_count: 1, sent_count: 0, byte_count: 16 }
+  assert.equal(socket.messageDraft.value, '')
+  socket.messageDraft.value = '你好，实时测试'
+  assert.equal(socket.outgoing.value, '你好，实时测试')
+  assert.equal(socket.form.scheduled, '{"type":"subscribe"}')
+  const liveHtml = await socket.render()
+  assert.match(liveHtml, /composer-mode-live/)
+  assert.doesNotMatch(liveHtml, /class="send-bar"/)
+  await socket.sendMessage()
+  assert.deepEqual(sentMessages, [{ id: 'ws-live', message: '你好，实时测试' }])
+  assert.equal(socket.outgoing.value, '')
+
+  // 智能群测设置折叠块具备与长连接设置一致的边框样式
+  const taskCss = fs.readFileSync(path.join(__dirname, '../src/views/TestCasesView.vue'), 'utf8')
+  const settingsRule = taskCss.slice(taskCss.indexOf('.settings {'), taskCss.indexOf('.settings:hover'))
+  assert.match(settingsRule, /border:\s*1px solid var\(--border-subtle\)/)
+  assert.match(settingsRule, /border-radius:\s*var\(--radius-md\)/)
+  assert.match(settingsRule, /background:\s*var\(--bg-subtle\)/)
+})
+
+test('ModelTestingView splits input and results, supports multi-filters, adjacent system buttons, and modal-confirmed clear all', async context => {
+  const sampleModels = [
+    {
+      id: 'chat-pro-vision',
+      owned_by: 'acme',
+      created: null,
+      model_type: 'chat',
+      type_source: 'inferred',
+      availability: { status: 'available', source: 'probed', latency_ms: 1200, detail: 'ok' },
+      tool_calling: { status: 'supported', source: 'probed', latency_ms: 900, detail: 'tool_calls' },
+      input_modalities: [
+        { modality: 'text', status: 'supported', source: 'probed', detail: null },
+        { modality: 'image', status: 'supported', source: 'probed', detail: null },
+      ],
+      output_modalities: [
+        { modality: 'text', status: 'supported', source: 'probed', detail: null },
+        { modality: 'reasoning', status: 'supported', source: 'probed', detail: null },
+      ],
+      raw_metadata: {},
+    },
+    {
+      id: 'chat-text-only',
+      owned_by: 'acme',
+      created: null,
+      model_type: 'chat',
+      type_source: 'inferred',
+      availability: { status: 'unavailable', source: 'probed', latency_ms: 500, detail: 'HTTP 502' },
+      tool_calling: { status: 'unsupported', source: 'probed', latency_ms: 300, detail: '400' },
+      input_modalities: [
+        { modality: 'text', status: 'inferred', source: 'inferred', detail: null },
+        { modality: 'image', status: 'unsupported', source: 'probed', detail: null },
+      ],
+      output_modalities: [
+        { modality: 'text', status: 'inferred', source: 'inferred', detail: null },
+      ],
+      raw_metadata: {},
+    },
+    {
+      id: 'flux-image-gen',
+      owned_by: 'studio',
+      created: null,
+      model_type: 'image',
+      type_source: 'inferred',
+      availability: { status: 'unsupported', source: 'untested', latency_ms: null, detail: null },
+      tool_calling: { status: 'unsupported', source: 'inferred', latency_ms: null, detail: null },
+      input_modalities: [{ modality: 'text', status: 'inferred', source: 'inferred', detail: null }],
+      output_modalities: [{ modality: 'image', status: 'inferred', source: 'inferred', detail: null }],
+      raw_metadata: {},
+    },
+  ]
+
+  const page = load('ModelTestingView', [
+    'form', 'urlPrefix', 'checks', 'savedConfig', 'discoverMeta', 'models', 'selectedIds', 'activeModelId',
+    'filteredModels', 'categoryFilter', 'availabilityFilter', 'toolFilter', 'inputModalityFilter',
+    'outputModalityFilter', 'searchQuery', 'clearConfirmOpen', 'loadSavedDefaults', 'fillFromSystemSettings',
+    'toggleUseSavedKey', 'requestClearAll', 'cancelClearAll', 'confirmClearAll', 'resetFilters',
+  ], {
+    getLLMConfig: async () => ({
+      enabled: true,
+      provider: 'openai',
+      base_url: 'https://provider.example.com/v1',
+      model: 'chat-pro-vision',
+      generation_model: null,
+      timeout_seconds: 60,
+      has_api_key: true,
+    }),
+    useToastStore: () => ({ push: () => {} }),
+  })
+  context.after(page.dispose)
+
+  await page.loadSavedDefaults()
+  page.fillFromSystemSettings()
+  assert.equal(page.form.baseUrl, 'https://provider.example.com/v1')
+  assert.equal(page.form.useSavedKey, true)
+  assert.equal(page.form.timeoutSeconds, 60)
+  page.toggleUseSavedKey()
+  assert.equal(page.form.useSavedKey, false)
+
+  // 注入模拟响应结果并验证多维筛选
+  page.urlPrefix.value = 'https://'
+  page.form.baseUrl = 'provider.example.com/v1'
+  page.form.apiKey = 'ephemeral-test-key'
+  page.form.timeoutSeconds = 45
+  page.checks.output_modalities = true
+  page.discoverMeta.value = { ok: true, base_url: 'https://provider.example.com/v1', http_status: 200, latency_ms: 210, count: 3, message: 'ok' }
+  page.models.value = sampleModels
+  page.selectedIds.value = ['chat-pro-vision']
+  page.activeModelId.value = 'chat-pro-vision'
+
+  page.availabilityFilter.value = 'available'
+  assert.deepEqual(page.filteredModels.value.map(item => item.id), ['chat-pro-vision'])
+
+  page.resetFilters()
+  page.toolFilter.value = 'supported'
+  assert.deepEqual(page.filteredModels.value.map(item => item.id), ['chat-pro-vision'])
+
+  page.resetFilters()
+  page.inputModalityFilter.value = 'image_probed'
+  assert.deepEqual(page.filteredModels.value.map(item => item.id), ['chat-pro-vision'])
+
+  page.resetFilters()
+  page.inputModalityFilter.value = 'text_only'
+  assert.deepEqual(page.filteredModels.value.map(item => item.id), ['chat-text-only', 'flux-image-gen'])
+
+  page.resetFilters()
+  page.outputModalityFilter.value = 'reasoning'
+  assert.deepEqual(page.filteredModels.value.map(item => item.id), ['chat-pro-vision'])
+
+  page.resetFilters()
+  page.outputModalityFilter.value = 'image'
+  assert.deepEqual(page.filteredModels.value.map(item => item.id), ['flux-image-gen'])
+
+  // 渲染结构校验：左右分栏 + 系统设置双按钮紧挨 + 清空确认弹窗文案
+  const sfc = fs.readFileSync(path.join(__dirname, '../src/views/ModelTestingView.vue'), 'utf8')
+  assert.match(sfc, /<TestWorkspace[\s\S]*editor-key="api-agent\.layout\.model-testing\.config"/)
+  assert.match(sfc, /<AppModal[\s\S]*:open="clearConfirmOpen"/)
+  const systemActionsRule = sfc.slice(sfc.indexOf('.system-actions {'), sfc.indexOf('.input-form {'))
+  assert.match(systemActionsRule, /display:\s*grid/)
+  assert.match(systemActionsRule, /grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/)
+  assert.doesNotMatch(systemActionsRule, /flex-wrap:\s*wrap/)
+  assert.doesNotMatch(systemActionsRule, /font-weight:\s*600/)
+  const filterSelectRule = sfc.slice(sfc.indexOf('.filter-select {'), sfc.indexOf('.filter-count {'))
+  assert.match(filterSelectRule, /width:\s*auto/)
+  assert.match(filterSelectRule, /flex:\s*0 0 auto/)
+  const tableWrapRule = sfc.slice(sfc.indexOf('.table-wrap {'), sfc.indexOf('.model-table tbody tr {'))
+  assert.match(tableWrapRule, /overflow-y:\s*auto/)
+  assert.match(tableWrapRule, /max-height:\s*clamp\(/)
+  assert.match(tableWrapRule, /position:\s*sticky/)
+  const html = await page.render()
+  assert.match(html, /class="input-pane scroll-y"/)
+  assert.match(html, /class="result-pane scroll-y"/)
+  assert.match(html, /class="system-actions"[\s\S]*填入系统设置地址[\s\S]*复用系统同源密钥/)
+  assert.match(html, /确认清空/)
+
+  // 清空弹窗：取消保留所有内容，确认则全部输入输出清空
+  page.requestClearAll()
+  assert.equal(page.clearConfirmOpen.value, true)
+  page.cancelClearAll()
+  assert.equal(page.clearConfirmOpen.value, false)
+  assert.equal(page.models.value.length, 3)
+  assert.equal(page.form.apiKey, 'ephemeral-test-key')
+
+  page.requestClearAll()
+  page.confirmClearAll()
+  assert.equal(page.clearConfirmOpen.value, false)
+  assert.equal(page.urlPrefix.value, '')
+  assert.equal(page.form.baseUrl, '')
+  assert.equal(page.form.apiKey, '')
+  assert.equal(page.form.useSavedKey, false)
+  assert.equal(page.form.protocol, 'auto')
+  assert.equal(page.form.timeoutSeconds, 25)
+  assert.equal(page.checks.output_modalities, false)
+  assert.equal(page.checks.streaming, false)
+  assert.equal(page.checks.structured_output, false)
+  assert.equal(page.discoverMeta.value, null)
+  assert.deepEqual(page.models.value, [])
+  assert.deepEqual(page.selectedIds.value, [])
+  assert.equal(page.activeModelId.value, null)
+  assert.equal(page.availabilityFilter.value, 'all')
+  assert.equal(page.toolFilter.value, 'all')
+  assert.equal(page.inputModalityFilter.value, 'all')
+  assert.equal(page.outputModalityFilter.value, 'all')
+  assert.equal(page.searchQuery.value, '')
+})
+
+test('ModelTestingView supports protocol selection, streaming TTFT, and structured output badges', async context => {
+  const discoverCalls = []
+  const probeCalls = []
+  const page = load('ModelTestingView', [
+    'form', 'checks', 'models', 'selectedIds', 'discoverMeta', 'discover', 'runProbe',
+  ], {
+    getLLMConfig: async () => null,
+    discoverProviderModels: async body => {
+      discoverCalls.push(body)
+      return {
+        ok: true,
+        protocol: 'anthropic',
+        base_url: 'https://api.anthropic.com/v1',
+        http_status: 200,
+        latency_ms: 95,
+        count: 1,
+        message: '成功拉取 1 个模型',
+        models: [
+          {
+            id: 'claude-sonnet-4-5',
+            owned_by: 'anthropic',
+            created: null,
+            model_type: 'chat',
+            type_source: 'inferred',
+            availability: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+            tool_calling: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+            streaming: { status: 'untested', source: 'untested', latency_ms: null, ttft_ms: null, detail: null },
+            structured_output: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+            input_modalities: [{ modality: 'text', status: 'inferred', source: 'inferred', detail: null }],
+            output_modalities: [{ modality: 'text', status: 'inferred', source: 'inferred', detail: null }],
+            raw_metadata: {},
+          },
+        ],
+      }
+    },
+    probeProviderModels: async body => {
+      probeCalls.push(body)
+      return {
+        ok: true,
+        protocol: 'anthropic',
+        base_url: 'https://api.anthropic.com/v1',
+        tested_count: 1,
+        available_count: 1,
+        tool_supported_count: 1,
+        streaming_supported_count: 1,
+        structured_output_supported_count: 1,
+        message: '已完成探测',
+        results: [
+          {
+            id: 'claude-sonnet-4-5',
+            owned_by: 'anthropic',
+            created: null,
+            model_type: 'chat',
+            type_source: 'inferred',
+            availability: { status: 'available', source: 'probed', latency_ms: 420, detail: 'Anthropic Messages 可用' },
+            tool_calling: { status: 'supported', source: 'probed', latency_ms: 380, detail: 'tool_use' },
+            streaming: { status: 'supported', source: 'probed', latency_ms: 510, ttft_ms: 145, detail: 'SSE 可用' },
+            structured_output: { status: 'supported', source: 'probed', latency_ms: 410, detail: 'Schema 支持' },
+            input_modalities: [{ modality: 'text', status: 'supported', source: 'probed', detail: null }],
+            output_modalities: [
+              { modality: 'text', status: 'supported', source: 'probed', detail: null },
+              { modality: 'json', status: 'supported', source: 'probed', detail: null },
+            ],
+            raw_metadata: {},
+          },
+        ],
+      }
+    },
+    useToastStore: () => ({ push: () => {} }),
+  })
+  context.after(page.dispose)
+
+  page.form.baseUrl = 'https://api.anthropic.com/v1'
+  page.form.protocol = 'anthropic'
+  page.checks.streaming = true
+  page.checks.structured_output = true
+  await page.discover()
+  assert.equal(discoverCalls[0].protocol, 'anthropic')
+  assert.equal(page.discoverMeta.value.protocol, 'anthropic')
+
+  await page.runProbe(['claude-sonnet-4-5'])
+  assert.equal(probeCalls[0].protocol, 'anthropic')
+  assert.ok(probeCalls[0].checks.includes('streaming'))
+  assert.ok(probeCalls[0].checks.includes('structured_output'))
+
+  const html = await page.render()
+  assert.match(html, /TTFT 145ms/)
+  assert.match(html, /Schema/)
+  assert.match(html, /Anthropic/)
+})
+
+test('TaskDraft accepts bound variable placeholders and extract rules while TaskResultTree renders extracted values', async context => {
+  const emitted = []
+  const draft = load('TaskDraft', ['beginEdit', 'saveEdit', 'path', 'extract', 'error'], {
+    defineProps: () => ({
+      editing: false,
+      catalog: {
+        format: 'openapi',
+        endpoints: [
+          {
+            name: '详情',
+            protocol: 'http',
+            method: 'GET',
+            path: '/api/customer/1',
+            path_template: '/api/customer/{id}',
+            source: 'document',
+            assertions: [{ kind: 'status', expected: 200 }],
+          },
+        ],
+        cases: [],
+        warnings: [],
+      },
+    }),
+    defineEmits: () => (event, ...args) => emitted.push([event, ...args]),
+  }, 'components')
+  context.after(draft.dispose)
+
+  draft.beginEdit(
+    'op',
+    0,
+    '/api/customer/{id}',
+    { kind: 'example', operation: 0 },
+    {
+      name: '获取客户详情',
+      protocol: 'http',
+      method: 'GET',
+      path: '/api/customer/1',
+      source: 'document',
+      headers: { token: '{{crm_token}}' },
+      assertions: [{ kind: 'status', expected: 200 }],
+    },
+  )
+  draft.path.value = '/api/customer/{{customer_id}}'
+  draft.extract.value = JSON.stringify([{ name: 'customer_name', source: 'json', pointer: '/data/name' }])
+  draft.saveEdit()
+  assert.equal(draft.error.value, '')
+  const changeCall = emitted.find(([evt]) => evt === 'change')
+  assert.ok(changeCall)
+  assert.equal(changeCall[2].path, '/api/customer/{{customer_id}}')
+  assert.equal(changeCall[2].extract[0].name, 'customer_name')
+
+  assert.match(
+    taskResultExports.taskCaseMessage({ index: 0, name: 'x', protocol: 'http', source: 'document', status: 'skipped', reason: 'missing_variable:crm_token', assertions: [] }),
+    /crm_token/,
+  )
+})
+
+test('RequestConsole scope notice reflects unrestricted valid targets with optional allowlist guardrails', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src/views/RequestConsole.vue'), 'utf8')
+  assert.doesNotMatch(source, /只允许数字回环地址/)
+  assert.doesNotMatch(source, /target_not_loopback/)
+  assert.match(source, /TARGET_ALLOWED_ORIGINS/)
+  assert.match(source, /跨源重定向自动剥离认证头/)
+})
+
+test('AssistantAvatar renders green robot expressions and randomly switches expressions on timer', async context => {
+  const avatar = load('AssistantAvatar', ['expression', 'nextRandomExpression', 'EXPRESSIONS'], {
+    defineProps: () => ({ size: 24, state: 'idle', minIntervalMs: 1000, maxIntervalMs: 1000 }),
+  }, 'components')
+  context.after(avatar.dispose)
+
+  assert.ok(avatar.EXPRESSIONS.length >= 8)
+  const initial = avatar.expression.value
+  const switched = avatar.nextRandomExpression()
+  assert.notEqual(switched, initial)
+  assert.equal(avatar.expression.value, switched)
+
+  const html = await avatar.render()
+  assert.match(html, /class="assistant-avatar/)
+  assert.match(html, new RegExp(`data-expression="${switched}"`))
+
+  const avatarSource = fs.readFileSync(path.join(__dirname, '..', 'src/components/AssistantAvatar.vue'), 'utf8')
+  assert.match(avatarSource, /var\(--assistant-color,\s*#22c55e\)/)
+})
+
+test('TaskChat displays animated thinking/reading ellipsis cycle and forwards current test context', async context => {
+  const reply = deferred()
+  let capturedOptions = null
+  const currentTest = assistantContextExports.buildConsoleTestContext({
+    method: 'POST',
+    url: 'http://127.0.0.1:8088/api/customer',
+    headers: { Authorization: 'Bearer super-secret', 'X-Trace': 'trace-42' },
+    bodyMode: 'json',
+    body: '{"name":"demo"}',
+    result: {
+      ok: true,
+      request: { method: 'POST', url: 'http://127.0.0.1:8088/api/customer' },
+      response: { status: 500, reason: 'Error', headers: {}, body: '{"err":"boom"}', body_bytes: 14, body_truncated: false, body_encoding: null, elapsed_ms: 12, redirects: [] },
+      error_kind: null,
+      error_message: null,
+      elapsed_ms: 12,
+    },
+    liveEvents: null,
+    localFailure: null,
+    responseCleared: false,
+  })
+  assert.equal(currentTest.request.headers.Authorization, '[redacted]')
+  assert.equal(currentTest.request.headers['X-Trace'], 'trace-42')
+
+  const assistant = load('TaskChat', ['input', 'send', 'statusPhase', 'statusLabel', 'statusDots', 'dotCount'], {
+    defineProps: () => ({ scope: 'console', currentTest }),
+    useId: () => 'chat-status-test',
+    chatWithAssistant: (_taskId, _messages, onText, options) => {
+      capturedOptions = { onText, options }
+      return reply.promise
+    },
+  }, 'components')
+  context.after(assistant.dispose)
+
+  assistant.input.value = '为什么报 500？'
+  const pending = assistant.send()
+  assert.equal(assistant.statusPhase.value, 'thinking')
+  assert.equal(assistant.statusLabel.value, '努力思考中')
+  assert.equal(assistant.statusDots.value, '.')
+  assert.match(await assistant.render(), /努力思考中<\/span><span[^>]*>\.<\/span>/)
+
+  // 模拟省略号循环动画：. -> .. -> ... -> .
+  assistant.tick()
+  assert.equal(assistant.statusDots.value, '..')
+  assistant.tick()
+  assert.equal(assistant.statusDots.value, '...')
+  assistant.tick()
+  assert.equal(assistant.statusDots.value, '.')
+
+  // 触发读取当前测试数据工具状态
+  capturedOptions.options.onStatus({ phase: 'reading_data', tool: 'read_current_test_result', message: '读取数据中' })
+  assert.equal(assistant.statusPhase.value, 'reading_data')
+  assert.equal(assistant.statusLabel.value, '读取数据中')
+  assistant.tick()
+  assert.match(await assistant.render(), /读取数据中<\/span><span[^>]*>\.\.<\/span>/)
+  assert.equal(capturedOptions.options.currentTest.response.status, 500)
+
+  // 模型开始流式输出后展示正文并结束等待态
+  capturedOptions.onText('根因：服务端返回 500')
+  assert.match(await assistant.render(), /根因：服务端返回 500/)
+  reply.resolve('根因：服务端返回 500，建议检查必填字段。')
+  await pending
+  assert.equal(assistant.statusPhase.value, null)
+})
+
+test('KnowledgeBaseSettings loads prepared corpus, saves embedding config and triggers vector build', async context => {
+  const savedPayloads = []
+  let buildCount = 0
+  const baseStatus = {
+    status: 'unconfigured',
+    configured: false,
+    ready: false,
+    retrieval_mode: 'lexical_fallback',
+    corpus_hash: 'abc123',
+    chunk_count: 20,
+    vector_count: 0,
+    embedding_model: null,
+    embedding_dimensions: null,
+    built_at: null,
+    last_error: null,
+    config: {
+      enabled: true,
+      use_llm_endpoint: true,
+      base_url: null,
+      effective_base_url: 'http://127.0.0.1:11434/v1',
+      model: '',
+      dimensions: null,
+      top_k: 4,
+      timeout_seconds: 30,
+      has_api_key: false,
+      has_effective_api_key: false,
+    },
+    documents: [{ doc_id: 'overview', category: '项目总览', title: '总览', sections: ['页面'], chunk_count: 2 }],
+  }
+  const kb = load('KnowledgeBaseSettings', ['loadStatus', 'form', 'saveConfig', 'buildVectors', 'status'], {
+    getKnowledgeStatus: async () => buildCount ? { ...baseStatus, status: 'ready', configured: true, ready: true, retrieval_mode: 'vector', vector_count: 20, embedding_dimensions: 1536 } : baseStatus,
+    updateKnowledgeConfig: async payload => {
+      savedPayloads.push(payload)
+      return { ...baseStatus, status: 'unbuilt', configured: true, config: { ...baseStatus.config, model: payload.model } }
+    },
+    buildKnowledgeIndex: async () => {
+      buildCount++
+      return { ok: true, status: 'ready', chunk_count: 20, vector_count: 20, embedding_model: 'BAAI/bge-m3', embedding_dimensions: 1536, corpus_hash: 'abc123', built_at: '2026-11-26T00:00:00Z', duration_ms: 42, message: '构建成功' }
+    },
+  }, 'components')
+  context.after(kb.dispose)
+
+  await kb.loadStatus()
+  assert.equal(kb.status.value.chunk_count, 20)
+  kb.form.model = 'BAAI/bge-m3'
+  await kb.buildVectors()
+  assert.equal(savedPayloads.length, 1)
+  assert.equal(savedPayloads[0].model, 'BAAI/bge-m3')
+  assert.equal(buildCount, 1)
+  assert.equal(kb.status.value.ready, true)
+  assert.equal(kb.status.value.retrieval_mode, 'vector')
+})
+
+test('AssistantAvatar renders compact 30px robotic LED eyes-and-mouth expressions without head outline', () => {
+  const avatarSfc = fs.readFileSync(path.join(__dirname, '../src/components/AssistantAvatar.vue'), 'utf8')
+  const chatSfc = fs.readFileSync(path.join(__dirname, '../src/components/TaskChat.vue'), 'utf8')
+  assert.match(avatarSfc, /size:\s*30/)
+  assert.match(avatarSfc, /viewBox="0 0 36 36"/)
+  assert.match(avatarSfc, /face-led-eye/)
+  assert.match(avatarSfc, /face-eq-bar/)
+  assert.doesNotMatch(avatarSfc, /robot-head|robot-visor|robot-ear|robot-antenna/)
+  assert.match(chatSfc, /<AssistantAvatar\s+:size="30"\s+:state="avatarState"\s*\/>/)
+})
+
+test('ModelTestingView allows enqueuing additional models while probing and updates each result immediately', async context => {
+  const inflight = new Map()
+  const modelEntry = id => ({
+    id,
+    owned_by: 'acme',
+    created: null,
+    model_type: 'chat',
+    type_source: 'inferred',
+    availability: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+    tool_calling: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+    streaming: { status: 'untested', source: 'untested', latency_ms: null, ttft_ms: null, detail: null },
+    structured_output: { status: 'untested', source: 'untested', latency_ms: null, detail: null },
+    input_modalities: [{ modality: 'text', status: 'inferred', source: 'inferred', detail: null }],
+    output_modalities: [{ modality: 'text', status: 'inferred', source: 'inferred', detail: null }],
+    raw_metadata: {},
+  })
+
+  const page = load('ModelTestingView', [
+    'form', 'checks', 'models', 'selectedIds', 'probing', 'probingStates',
+    'probingCompleted', 'probingTotal', 'activeProbingCount', 'queuedProbingCount',
+    'selectableProbeIds', 'runProbe',
+  ], {
+    getLLMConfig: async () => null,
+    probeProviderModelsStream: async (body, onFrame) => {
+      const modelId = body.models[0]
+      const gate = deferred()
+      inflight.set(modelId, { gate, onFrame })
+      onFrame({ type: 'model_start', model_id: modelId })
+      return gate.promise
+    },
+    useToastStore: () => ({ push: () => {} }),
+  })
+  context.after(page.dispose)
+
+  const finishModel = (id, latencyMs) => {
+    const entry = inflight.get(id)
+    assert.ok(entry, `expected ${id} to be in-flight`)
+    const profile = {
+      ...modelEntry(id),
+      availability: { status: 'available', source: 'probed', latency_ms: latencyMs, detail: '可用' },
+      tool_calling: { status: 'supported', source: 'probed', latency_ms: latencyMs + 10, detail: '支持' },
+    }
+    entry.onFrame({
+      type: 'model_result',
+      model_id: id,
+      model: profile,
+      completed: 1,
+      total: 1,
+    })
+    entry.gate.resolve({
+      ok: true,
+      protocol: 'openai',
+      base_url: 'https://queue.example/v1',
+      tested_count: 1,
+      available_count: 1,
+      tool_supported_count: 1,
+      message: `已完成 ${id} 探测`,
+      results: [profile],
+    })
+  }
+
+  page.form.baseUrl = 'https://queue.example/v1'
+  page.models.value = ['m1', 'm2', 'm3', 'm4', 'm5'].map(modelEntry)
+  page.selectedIds.value = ['m1', 'm2']
+
+  // 1. 先点单个模型 m1：仅 m1 处于探测中，其它模型仍可点击加入队列
+  const p1 = page.runProbe(['m1'])
+  await vue.nextTick()
+  assert.equal(page.probing.value, true)
+  assert.equal(page.probingStates.value.m1, 'probing')
+  assert.equal(page.probingStates.value.m2, undefined)
+  assert.deepEqual(page.selectableProbeIds.value, ['m2'])
+
+  const firstHtml = await page.render()
+  assert.match(firstHtml, /class="probe-spinner"/)
+  assert.match(firstHtml, /加入探测队列（\+1）/)
+  // m2 的行内按钮不应被禁用
+  assert.match(firstHtml, /class="btn btn-sm row-probe-btn">(?:<!--v-if-->)?<span>探测<\/span>/)
+
+  // 2. 在 m1 尚未返回时，继续依次点击 m2、m3、m4、m5 加入消费队列
+  const p2 = page.runProbe(['m2'])
+  const p3 = page.runProbe(['m3'])
+  const p4 = page.runProbe(['m4'])
+  const p5 = page.runProbe(['m5'])
+  await vue.nextTick()
+
+  assert.equal(page.probingTotal.value, 5)
+  assert.equal(page.activeProbingCount.value, 4)
+  assert.equal(page.queuedProbingCount.value, 1)
+  assert.equal(page.probingStates.value.m5, 'queued')
+
+  // 3. m2 率先完成：仅 m2 立即更新结果并释放等待态，m1 仍在探测中，且 m5 自动出队补位开始探测
+  finishModel('m2', 95)
+  await p2
+  await vue.nextTick()
+
+  assert.equal(page.probingCompleted.value, 1)
+  assert.equal(page.probingStates.value.m2, undefined)
+  assert.equal(page.probingStates.value.m1, 'probing')
+  assert.equal(page.probingStates.value.m5, 'probing')
+  assert.equal(page.queuedProbingCount.value, 0)
+  assert.equal(page.models.value.find(m => m.id === 'm2').availability.status, 'available')
+  assert.equal(page.models.value.find(m => m.id === 'm1').availability.status, 'untested')
+
+  const partialHtml = await page.render()
+  assert.match(partialHtml, /可用 · 95ms/)
+  assert.match(partialHtml, /探测中/)
+
+  // 4. 其余模型陆续完成，队列自然清空
+  finishModel('m1', 510)
+  finishModel('m3', 320)
+  finishModel('m4', 280)
+  finishModel('m5', 140)
+  await Promise.all([p1, p3, p4, p5])
+  await vue.nextTick()
+
+  assert.equal(page.probing.value, false)
+  assert.deepEqual(page.probingStates.value, {})
+  assert.equal(page.probingCompleted.value, 5)
+  assert.ok(page.models.value.every(m => m.availability.status === 'available'))
+
+  const sfc = fs.readFileSync(path.join(__dirname, '../src/views/ModelTestingView.vue'), 'utf8')
+  assert.match(sfc, /@media \(prefers-reduced-motion: reduce\)[\s\S]*\.probe-spinner[\s\S]*animation-iteration-count:\s*infinite/)
 })

@@ -1,99 +1,112 @@
-/** Browser-local chat index and execution links; immutable test snapshots remain owned by their APIs. */
-export interface ChatHistoryRecord {
-  id: string
-  title: string
-  created_at: string
+/** Browser-local transcripts for real test executions, including pre-existing links. */
+import type { CaseLinkBlock, CaseLinkTone, PageScope } from '@/api/types'
+
+const VALID_SCOPES: ReadonlySet<string> = new Set<PageScope>([
+  'console',
+  'websocket',
+  'tasks',
+  'model_testing',
+])
+
+const VALID_TONES: ReadonlySet<string> = new Set<CaseLinkTone>([
+  'success',
+  'danger',
+  'warning',
+  'info',
+  'neutral',
+])
+
+const transcriptPrefix = (scope: string) => `api-agent.chat.${scope}.`
+const executionPrefix = (scope: string) => `api-agent.chat-execution.${scope}.`
+
+export function chatTranscriptKey(scope: string, executionId: string): string {
+  let transcriptId = executionId
+  try {
+    transcriptId = window.localStorage.getItem(`${executionPrefix(scope)}${executionId}`) ?? executionId
+  } catch {
+    // Use the direct key if storage is unavailable.
+  }
+  return `${transcriptPrefix(scope)}${transcriptId}`
 }
 
-export function listChatHistories(scope: string): ChatHistoryRecord[] {
+export function removeTestChat(scope: string, executionId: string): void {
   try {
-    const value: unknown = JSON.parse(window.localStorage.getItem(`api-agent.chat-history.${scope}`) ?? '[]')
-    if (!Array.isArray(value)) return []
-    return value.filter((item): item is ChatHistoryRecord =>
-      !!item && typeof item === 'object' &&
-      typeof item.id === 'string' && typeof item.title === 'string' && typeof item.created_at === 'string',
-    )
+    window.localStorage.removeItem(chatTranscriptKey(scope, executionId))
+    window.localStorage.removeItem(`${executionPrefix(scope)}${executionId}`)
   } catch {
-    return []
+    // Storage failure must not undo deletion of the test itself.
   }
 }
 
-export function saveChatHistory(scope: string, record: ChatHistoryRecord): void {
-  const records = listChatHistories(scope).filter(item => item.id !== record.id)
+/** Only called after explicitly clearing all tests for this scope. */
+export function clearTestChats(scope: string): void {
   try {
-    window.localStorage.setItem(`api-agent.chat-history.${scope}`, JSON.stringify([record, ...records].slice(0, 100)))
+    const storage = window.localStorage
+    for (let index = storage.length - 1; index >= 0; index--) {
+      const key = storage.key(index)
+      if (key?.startsWith(transcriptPrefix(scope)) || key?.startsWith(executionPrefix(scope))) storage.removeItem(key)
+    }
+    storage.removeItem(`api-agent.chat-history.${scope}`)
   } catch {
-    // The assistant remains usable if browser storage is unavailable.
+    // Keep the execution history clear even if browser storage is blocked.
   }
 }
 
-export function removeChatHistory(scope: string, id: string): void {
-  try {
-    window.localStorage.setItem(`api-agent.chat-history.${scope}`, JSON.stringify(
-      listChatHistories(scope).filter(item => item.id !== id),
-    ))
-    window.localStorage.removeItem(chatTranscriptKey(scope, id))
-    window.localStorage.removeItem(`api-agent.chat-execution.${scope}.${id}`)
-  } catch {
-    // Existing history data remains untouched when storage is unavailable.
+function normalizeTone(raw: unknown): CaseLinkTone {
+  if (typeof raw !== 'string') return 'neutral'
+  const lowered = raw.trim().toLowerCase()
+  if (VALID_TONES.has(lowered)) return lowered as CaseLinkTone
+  if (lowered === 'error' || lowered === 'failed' || lowered === 'fail') return 'danger'
+  if (lowered === 'ok' || lowered === 'passed' || lowered === 'pass' || lowered === 'available') return 'success'
+  if (lowered === 'warn' || lowered === 'partial' || lowered === 'cancelled') return 'warning'
+  return 'neutral'
+}
+
+/** 校验并规范化来自后端流或持久化线程的单条 CaseLinkBlock；非法项返回 null。 */
+export function normalizeCaseLinkBlock(value: unknown): CaseLinkBlock | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  if (raw.type !== 'case_link') return null
+  if (typeof raw.scope !== 'string' || !VALID_SCOPES.has(raw.scope)) return null
+  if (typeof raw.history_id !== 'string' || !raw.history_id.trim()) return null
+  if (typeof raw.case_id !== 'string' || !raw.case_id.trim()) return null
+
+  const historyId = raw.history_id.trim()
+  const caseId = raw.case_id.trim()
+  const rawRound = typeof raw.round === 'number' ? raw.round : Number(raw.round)
+  const round = Number.isFinite(rawRound) && rawRound >= 1 ? Math.trunc(rawRound) : 1
+  const label = typeof raw.label === 'string' && raw.label.trim() ? raw.label.trim() : caseId
+  const status = typeof raw.status === 'string' && raw.status.trim() ? raw.status.trim() : 'completed'
+
+  return {
+    type: 'case_link',
+    scope: raw.scope as PageScope,
+    history_id: historyId,
+    case_id: caseId,
+    round,
+    label,
+    status,
+    tone: normalizeTone(raw.tone),
   }
 }
 
-/** Link the execution to the same transcript so an in-flight reply keeps its storage key. */
-export function attachChatToExecution(scope: string, chatId: string, executionId: string): boolean {
-  if (!isChatOnly(chatId) || !listChatHistories(scope).some(item => item.id === chatId)) return false
-  try {
-    window.localStorage.setItem(`api-agent.chat-execution.${scope}.${executionId}`, chatId)
-    window.localStorage.setItem(`api-agent.chat-history.${scope}`, JSON.stringify(
-      listChatHistories(scope).filter(item => item.id !== chatId),
-    ))
-    return true
-  } catch {
-    return false
+/** 批量过滤并规范化 CaseLinkBlock 列表。 */
+export function normalizeCaseLinkBlocks(values: unknown): CaseLinkBlock[] {
+  if (!Array.isArray(values)) return []
+  const result: CaseLinkBlock[] = []
+  for (const item of values) {
+    const normalized = normalizeCaseLinkBlock(item)
+    if (normalized) result.push(normalized)
   }
+  return result
 }
 
-export function chatTranscriptKey(scope: string, id: string): string {
-  let transcriptId = id
-  try {
-    transcriptId = window.localStorage.getItem(`api-agent.chat-execution.${scope}.${id}`) ?? id
-  } catch {
-    // Keep using the original key when storage is blocked.
+/** 按 (scope, history_id, round, case_id) 去重 CaseLinkBlock，保留首次出现顺序并采用最新状态。 */
+export function dedupeCaseLinkBlocks(blocks: CaseLinkBlock[]): CaseLinkBlock[] {
+  const map = new Map<string, CaseLinkBlock>()
+  for (const block of blocks) {
+    const key = `${block.scope}:${block.history_id}:${block.round}:${block.case_id}`
+    map.set(key, block)
   }
-  return `api-agent.chat.${scope}.${transcriptId}`
-}
-
-export function hasExecutionChat(scope: string, id: string): boolean {
-  try {
-    return window.localStorage.getItem(`api-agent.chat-execution.${scope}.${id}`) !== null
-  } catch {
-    return false
-  }
-}
-
-export function hasChatTranscript(scope: string, id: string): boolean {
-  try {
-    return window.localStorage.getItem(chatTranscriptKey(scope, id)) !== null
-  } catch {
-    return false
-  }
-}
-
-export const isChatOnly = (id: string) => id.startsWith('chat-')
-
-export function createChatHistoryId(): string {
-  return `chat-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
-}
-
-export function titleChatHistory(scope: string, id: string, title: string): ChatHistoryRecord | undefined {
-  const record = listChatHistories(scope).find(item => item.id === id)
-  if (!record) return
-  const updated = { ...record, title: summarizeFirstQuestion(title) }
-  saveChatHistory(scope, updated)
-  return updated
-}
-
-export function summarizeFirstQuestion(question: string): string {
-  const sentence = question.trim().replace(/\s+/g, ' ')
-  return sentence.length > 48 ? `${sentence.slice(0, 47)}…` : sentence || 'AI 对话'
+  return [...map.values()]
 }

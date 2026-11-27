@@ -2,10 +2,11 @@
 
 import asyncio
 import base64
+from typing import Any
 
 import httpx
 
-from api_agent.infrastructure.orm import new_id, utc_now
+from api_agent.infrastructure.orm import as_utc, new_id, utc_now
 from api_agent.infrastructure.outcomes import outcome_for, transport_error_kind
 from api_agent.streams.repository import StreamRepository
 from api_agent.streams.schemas import StreamStart
@@ -38,37 +39,104 @@ class StreamManager:
         """
         self.database = database
         self.repository = StreamRepository(database)
+        self.repo = self.repository
         self.settings = settings
         self.active: dict[str, ActiveStream] = {}
         self.history: dict[str, ActiveStream] = {}
         self.max_history = 20
+        self._ephemeral_ids: set[str] = set()
+        self._session_meta: dict[str, dict[str, Any]] = {}
 
-    async def start(self, payload: StreamStart, allowed_origins: list[str]) -> ActiveStream:
+    async def start(
+        self,
+        payload: StreamStart,
+        allowed_origins: list[str] | None = None,
+        *,
+        persist_history: bool = True,
+        source: str = "manual",
+        title: str | None = None,
+        badge: str | None = None,
+        parent_session_id: str | None = None,
+        round_index: int = 1,
+        case_index: int = 0,
+        case_label: str | None = None,
+        cooldown_ms: int = 500,
+        total_rounds: int = 1,
+    ) -> ActiveStream:
         """校验目标后启动一个长连接会话。
 
-        作用：这是唯一的启动入口，范围裁定（回环 + 可选允许列表）在此生效。
+        作用：这是唯一的启动入口，范围裁定（合法目标地址 + 可选允许列表）在此生效。
         实现：先限制并发会话数（避免界面误开大量连接把本机端口耗尽），
-        再预写下会话行（状态 connecting），最后把真正的连接过程交给后台任务——
-        这样接口能立刻返回会话 ID，界面无需等待握手完成。
+        在 ``persist_history=True`` 时预写会话行（状态 connecting），
+        ``persist_history=False`` 时仅在内存中执行与收集事件而不污染历史表；
+        最后把真正的连接过程交给后台任务，使接口能立刻返回会话 ID。
         """
         if len(self.active) >= self.settings.stream_max_sessions:
             raise ValueError("stream_session_limit")
         from api_agent.infrastructure.targets import validate_target
 
+        origins = (
+            self.settings.target_allowed_origins if allowed_origins is None else allowed_origins
+        )
         schemes = frozenset({"http", "https", "ws", "wss"})
-        parsed, origin = validate_target(payload.url, allowed_origins, schemes)
+        parsed, origin = validate_target(payload.url, origins, schemes)
         url = _canonical_stream_url(parsed)
+        effective_source = "ai" if parent_session_id and source == "manual" else source
         stream = ActiveStream(
             id=new_id(), kind=payload.kind, url=url, max_events=payload.max_events
         )
         self.active[stream.id] = stream
+        self._session_meta[stream.id] = {
+            "persist_history": persist_history,
+            "source": effective_source,
+            "title": title,
+            "badge": badge,
+            "parent_session_id": parent_session_id,
+            "round_index": round_index,
+            "case_index": case_index,
+            "case_label": case_label,
+            "cooldown_ms": cooldown_ms,
+            "total_rounds": total_rounds,
+        }
+        if not persist_history:
+            self._ephemeral_ids.add(stream.id)
         try:
-            await self._persist_new(stream, payload, origin)
+            if persist_history:
+                has_custom_meta = (
+                    effective_source != "manual"
+                    or title is not None
+                    or badge is not None
+                    or parent_session_id is not None
+                    or round_index != 1
+                    or case_index != 0
+                    or case_label is not None
+                    or cooldown_ms != 500
+                    or total_rounds != 1
+                )
+                if has_custom_meta:
+                    await self._persist_new(
+                        stream,
+                        payload,
+                        origin,
+                        source=effective_source,
+                        title=title,
+                        badge=badge,
+                        parent_session_id=parent_session_id,
+                        round_index=round_index,
+                        case_index=case_index,
+                        case_label=case_label,
+                        cooldown_ms=cooldown_ms,
+                        total_rounds=total_rounds,
+                    )
+                else:
+                    await self._persist_new(stream, payload, origin)
             stream.task = asyncio.create_task(
                 self._run(stream, payload, url), name=f"stream-{stream.kind}-{stream.id[:8]}"
             )
         except BaseException:
             self.active.pop(stream.id, None)
+            self._ephemeral_ids.discard(stream.id)
+            self._session_meta.pop(stream.id, None)
             raise
         return stream
 
@@ -107,9 +175,7 @@ class StreamManager:
             if not stream.finished:
                 stream.finish("cancelled", reason)
             await self._flush(stream, final=True)
-            self.active.pop(stream.id, None)
-            self.history[stream.id] = stream
-            self._trim_history()
+            self._retire_stream(stream)
         return stream
 
     async def shutdown(self) -> None:
@@ -145,6 +211,8 @@ class StreamManager:
         """
         self.active.pop(session_id, None)
         self.history.pop(session_id, None)
+        self._ephemeral_ids.discard(session_id)
+        self._session_meta.pop(session_id, None)
 
     def find(self, session_id: str) -> ActiveStream | None:
         """按 ID 在活跃与近期历史中查找会话。
@@ -153,6 +221,44 @@ class StreamManager:
         由调用方决定回落数据库还是返回 404。
         """
         return self.active.get(session_id) or self.history.get(session_id)
+
+    def is_active(self, session_id: str) -> bool:
+        """判断指定会话当前是否仍在活跃表中运行。"""
+        return session_id in self.active
+
+    def session_meta(self, session_id: str) -> dict[str, Any]:
+        """读取内存会话的附加元数据（来源、标题、标签、父会话等）。"""
+        return dict(self._session_meta.get(session_id) or {})
+
+    def active_sessions(self) -> list[dict[str, Any]]:
+        """列出当前活跃的顶层手动长连接会话（排除内部无持久化探针与 AI 子用例）。"""
+        items: list[dict[str, Any]] = []
+        for stream in list(self.active.values()):
+            if stream.id in self._ephemeral_ids:
+                continue
+            meta = self._session_meta.get(stream.id) or {}
+            if meta.get("parent_session_id") is not None:
+                continue
+            items.append(
+                {
+                    "id": stream.id,
+                    "kind": "manual",
+                    "source": meta.get("source", "manual"),
+                    "url": stream.url,
+                    "title": meta.get("title"),
+                    "badge": meta.get("badge"),
+                    "status": stream.status,
+                    "stage": "streaming",
+                    "current_round": meta.get("round_index", 1),
+                    "total_rounds": meta.get("total_rounds", 1),
+                    "completed_cases": 0,
+                    "total_cases": 1,
+                    "cooldown_ms": meta.get("cooldown_ms", 500),
+                    "cooldown_remaining_ms": None,
+                    "opened_at": as_utc(stream.opened_at),
+                }
+            )
+        return items
 
     async def send_text(self, session_id: str, message: str) -> int:
         """向一个 WebSocket 会话发送文本消息。
@@ -226,7 +332,7 @@ class StreamManager:
 
     async def read(
         self, session_id: str, after: int, wait_ms: int = 0
-    ) -> tuple[ActiveStream, list, bool]:
+    ) -> tuple[ActiveStream | None, list, bool]:
         """增量读取时间线，可短暂等待新事件（长轮询）。
 
         作用：让界面用 200ms～2s 的轮询就获得接近实时的体验，
@@ -292,9 +398,19 @@ class StreamManager:
             stream.websocket = None
             stream.notify.set()
             await self._flush(stream, final=True)
-            self.active.pop(stream.id, None)
+            self._retire_stream(stream)
+
+    def _retire_stream(self, stream: ActiveStream) -> None:
+        """把已完成会话从活跃表移出；非持久化探针与子用例不占用顶层内存历史槽位。"""
+        is_ephemeral = stream.id in self._ephemeral_ids
+        is_child = bool((self._session_meta.get(stream.id) or {}).get("parent_session_id"))
+        self.active.pop(stream.id, None)
+        if not is_ephemeral and not is_child:
             self.history[stream.id] = stream
             self._trim_history()
+        else:
+            self._session_meta.pop(stream.id, None)
+        self._ephemeral_ids.discard(stream.id)
 
     async def _run_websocket(self, stream: ActiveStream, payload: StreamStart, url: str) -> None:
         """建立 WebSocket 连接并逐帧记录。
@@ -320,7 +436,7 @@ class StreamManager:
                 close_timeout=3,
                 max_size=self.settings.stream_max_bytes,
                 max_queue=1,
-                proxy=None,
+                proxy=True if self.settings.trust_system_proxy else None,
                 compression="deflate",
             )
         except InvalidStatus as error:
@@ -512,13 +628,46 @@ class StreamManager:
         while len(self.history) > self.max_history:
             oldest = next(iter(self.history))
             self.history.pop(oldest, None)
+            self._session_meta.pop(oldest, None)
+            self._ephemeral_ids.discard(oldest)
 
-    async def _persist_new(self, stream: ActiveStream, payload: StreamStart, origin: str) -> None:
+    async def _persist_new(
+        self,
+        stream: ActiveStream,
+        payload: StreamStart,
+        origin: str,
+        *,
+        source: str = "manual",
+        title: str | None = None,
+        badge: str | None = None,
+        parent_session_id: str | None = None,
+        round_index: int = 1,
+        case_index: int = 0,
+        case_label: str | None = None,
+        cooldown_ms: int = 500,
+        total_rounds: int = 1,
+    ) -> None:
         """委托存储层预写会话；持久化失败时不得开始目标连接。"""
-        await self.repository.create(stream, payload, origin)
+        await self.repository.create(
+            stream,
+            payload,
+            origin,
+            source=source,
+            title=title,
+            badge=badge,
+            parent_session_id=parent_session_id,
+            round_index=round_index,
+            case_index=case_index,
+            case_label=case_label,
+            cooldown_ms=cooldown_ms,
+            total_rounds=total_rounds,
+        )
 
     async def _flush(self, stream: ActiveStream, *, final: bool = False) -> None:
-        """委托事务写入；final=True 在无新事件时也提交终态。"""
+        """委托事务写入；非持久化探针跳过写库，final=True 在无新事件时也提交终态。"""
+        if stream.id in self._ephemeral_ids:
+            stream.pending.clear()
+            return
         await self.repository.flush(stream, final=final)
 
 
@@ -539,12 +688,11 @@ async def _cancel_after(stream: ActiveStream, seconds: float) -> None:
 
 def _canonical_stream_url(parsed) -> str:
     """Normalize an authorized HTTP/WS address into its WebSocket transport URL."""
-    from ipaddress import ip_address
+    from api_agent.infrastructure.targets import format_host_literal
 
-    address = ip_address(parsed.hostname or "")
-    literal = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    literal = format_host_literal(parsed.hostname or "")
     netloc = literal + (f":{parsed.port}" if parsed.port is not None else "")
-    scheme = parsed.scheme
+    scheme = parsed.scheme.lower()
     scheme = {"http": "ws", "https": "wss"}.get(scheme, scheme)
     return f"{scheme}://{netloc}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
 

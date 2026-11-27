@@ -21,7 +21,7 @@ from api_agent.agent.schemas import (
 )
 from api_agent.agent.service import AgentError, AgentService, CallBudget, evidence_for
 from api_agent.agent.store import AgentStore
-from api_agent.execution.schemas import RunResult, empty_result
+from api_agent.execution.schemas import RunResult, empty_result, origin_allowed
 
 
 def now():
@@ -44,7 +44,7 @@ class AgentRuntime:
         不发送模型或目标请求；范围、引擎及持久化错误直接上抛给接收入口。
         """
         self.agent.execution.resolve_engine(request.engine)
-        if request.scope.origin not in self.agent.settings.target_allowed_origins:
+        if not origin_allowed(request.scope.origin, self.agent.settings.target_allowed_origins):
             raise AgentError("origin_not_allowed")
         self.agent.context.learn(request.model_dump())
         snapshot = self.agent.context.clean(request.model_dump())

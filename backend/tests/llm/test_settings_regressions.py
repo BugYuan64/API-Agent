@@ -72,6 +72,7 @@ async def test_get_client_uses_environment_until_explicit_disabled_override(app,
         assert effective.is_configured
         assert effective.api_key == "fictional-saved-key"
         assert effective.model == "environment-model"
+        assert (await service.get_client(for_generation=True)).model == "environment-model"
         assert await service.get_record() is None
         await service.update(LLMConfigUpdate(enabled=False))
         disabled = await service.get_client()
@@ -95,6 +96,52 @@ async def test_switching_shared_model_preserves_other_settings(client, app, pers
         record = await LLMSettingService(session).get_record()
         assert record.api_key == "fictional-saved-key"
     assert (await client.patch("/api/settings/llm/model", json={"model": "   "})).status_code == 422
+
+
+async def test_generation_model_override_is_optional_and_independent(client, app):
+    follow = await client.get("/api/settings/llm")
+    assert follow.json()["generation_model"] is None
+    async with app.state.database.session() as session:
+        service = LLMSettingService(session)
+        assert (await service.get_client(for_generation=True)).model == "gpt-4o"
+
+    saved = await client.put(
+        "/api/settings/llm",
+        json={"enabled": True, "model": "assistant-v1", "generation_model": " generator-v1 "},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["generation_model"] == "generator-v1"
+    async with app.state.database.session() as session:
+        service = LLMSettingService(session)
+        assert (await service.get_client()).model == "assistant-v1"
+        assert (await service.get_client(for_generation=True)).model == "generator-v1"
+
+    switched = await client.patch("/api/settings/llm/model", json={"model": "assistant-v2"})
+    assert switched.status_code == 200
+    assert switched.json()["generation_model"] == "generator-v1"
+
+    follow_again = await client.put(
+        "/api/settings/llm",
+        json={"enabled": True, "model": "assistant-v2", "generation_model": None},
+    )
+    assert follow_again.status_code == 200
+    assert follow_again.json()["generation_model"] is None
+    async with app.state.database.session() as session:
+        generator = await LLMSettingService(session).get_client(for_generation=True)
+        assert generator.model == "assistant-v2"
+
+
+async def test_partial_settings_update_preserves_generation_model(client):
+    configured = await client.put(
+        "/api/settings/llm",
+        json={"enabled": True, "model": "assistant-v1", "generation_model": "generator-v1"},
+    )
+    assert configured.status_code == 200
+    cleared = await client.put(
+        "/api/settings/llm", json={"enabled": False, "model": "assistant-v2"}
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["generation_model"] == "generator-v1"
 
 
 @pytest.mark.parametrize("endpoint", ["ping", "models"])
@@ -167,3 +214,29 @@ async def test_saved_origin_change_cannot_carry_old_credential(
         await service.update(LLMConfigUpdate(enabled=True, base_url=base_url, api_key=api_key))
         effective = await service.get_client()
         assert effective._build_headers().get("Authorization") == authorization
+
+
+async def test_llm_service_defaults_to_enabled_and_respects_disabled_override(app, tmp_path):
+    async with app.state.database.session() as session:
+        service = LLMSettingService(session)
+        assert (await service.get_response()).enabled is True
+        assert LLMConfigUpdate().enabled is True
+
+        disabled_settings = load_settings(env_file=None, project_root=tmp_path, llm_mode="disabled")
+        disabled_service = LLMSettingService(session, settings=disabled_settings)
+        assert (await disabled_service.get_response()).enabled is False
+
+
+async def test_preview_client_preserves_configured_timeout_up_to_90s(app):
+    async with app.state.database.session() as session:
+        service = LLMSettingService(session)
+        await service.update(
+            LLMConfigUpdate(
+                enabled=True,
+                base_url="https://saved.example/v1",
+                model="slow-reasoning-model",
+                timeout_seconds=75.0,
+            )
+        )
+        preview = await service.get_preview_client()
+        assert preview.timeout_seconds == 75.0

@@ -1,10 +1,28 @@
 /** Typed document-task API; transport failures use the shared management client. */
 import { ApiError, request } from './client'
-import type { ConsoleSseEvent } from './types'
+import type { CaseLinkBlock, ConsoleSseEvent, PageScope } from './types'
 
 export interface TaskDocument {
   filename: string
   text: string
+}
+
+export interface TaskExtractRule {
+  name: string
+  source?: 'json' | 'header' | 'status'
+  pointer?: string
+  header_name?: string
+  required?: boolean
+  sensitive?: boolean
+}
+
+export interface TaskExtractedVariable {
+  name: string
+  source: 'json' | 'header' | 'status'
+  ok: boolean
+  sensitive: boolean
+  value: unknown
+  message?: string | null
 }
 
 export interface TestCase {
@@ -19,12 +37,15 @@ export interface TestCase {
   body?: unknown
   messages?: string[]
   assertions: { kind: string; expected: unknown; pointer?: string }[]
+  extract?: TaskExtractRule[]
+  always_run?: boolean
   cases?: TestCase[]
   generated_cases?: TestCase[]
 }
 export interface TaskSnapshot {
   origin?: string
   document?: Pick<TaskDocument, 'filename'>
+  variables?: Record<string, string | number | boolean>
   cases: TestCase[]
   operations?: { path: string; example_index: number; case_indices: number[] }[]
   warnings: string[]
@@ -32,18 +53,24 @@ export interface TaskSnapshot {
 }
 export interface TaskCaseResult {
   index: number
+  case_id?: string
+  round?: number
+  case_index?: number
+  execution_index?: number
   name: string
   protocol: string
   source: string
   status: string
   reason?: string
   assertions: { kind: string; pointer?: string; expected: unknown; actual: unknown; passed: boolean | null }[]
+  extracted?: TaskExtractedVariable[]
   evidence?: unknown
 }
 export interface Catalog {
   format: string
   title?: string | null
   server_url?: string | null
+  variables?: Record<string, string | number | boolean>
   endpoints: TestCase[]
   cases: TestCase[]
   warnings: string[]
@@ -52,6 +79,14 @@ export interface Catalog {
 export interface TaskHistory {
   id: string
   title?: string | null
+  origin?: string | null
+  source?: 'manual' | 'ai'
+  badge?: string | null
+  total_rounds?: number
+  current_round?: number | null
+  cooldown_ms?: number
+  cooldown_remaining_ms?: number | null
+  tests_per_url?: number | null
   status: string
   stage: string
   current_index?: number | null
@@ -66,6 +101,13 @@ export interface TaskRecord extends TaskHistory {
 }
 export interface TaskProgressFrame {
   type: 'progress'
+  source?: 'manual' | 'ai'
+  badge?: string | null
+  total_rounds?: number
+  current_round?: number | null
+  cooldown_ms?: number
+  cooldown_remaining_ms?: number | null
+  tests_per_url?: number | null
   status: string
   stage: string
   current_index: number | null
@@ -94,12 +136,60 @@ export const generateProjectDocument = () => request<{ filename: string; text: s
 export const readTaskDocument = (id: string, signal?: AbortSignal) => request<string>(
   '/api/tasks/' + encodeURIComponent(id) + '/document', { signal, readResponse: response => response.text() })
 
-export interface TaskChatMessage { role: 'user' | 'assistant'; content: string }
+export interface TaskChatMessage {
+  id?: string
+  role: 'user' | 'assistant'
+  content: string
+  blocks?: CaseLinkBlock[]
+  run_id?: string | null
+}
 
-/** Follow an assistant reply and distinguish an old API server from model errors. */
-export function chatWithAssistant(taskId: string | undefined, messages: TaskChatMessage[], onText: (text: string) => void) {
+export type AssistantStatusPhase = 'thinking' | 'reading_data' | 'testing' | 'cooling_down'
+
+export interface AssistantStatusEvent {
+  phase: AssistantStatusPhase
+  message?: string
+  tool?: string
+}
+
+export interface AssistantCurrentTestContext {
+  page: PageScope
+  has_result: boolean
+  request?: Record<string, unknown> | null
+  response?: Record<string, unknown> | null
+  error?: Record<string, unknown> | null
+  session?: Record<string, unknown> | null
+  events?: Array<Record<string, unknown>>
+  task?: Record<string, unknown> | null
+  config?: object | null
+  summary?: object | null
+  active_model?: object | null
+  models_preview?: readonly object[]
+  settings?: Record<string, unknown>
+  draft_endpoints?: Array<Record<string, unknown>>
+}
+
+export interface AssistantChatOptions {
+  currentTest?: AssistantCurrentTestContext | null
+  onStatus?: (status: AssistantStatusEvent) => void
+}
+
+function normalizeStatusPhase(raw: string | undefined): AssistantStatusPhase {
+  if (raw === 'reading_data' || raw === 'testing' || raw === 'cooling_down') return raw
+  return 'thinking'
+}
+
+/** Follow an assistant reply and distinguish status phases, tool reads and model errors. */
+export function chatWithAssistant(
+  taskId: string | undefined,
+  messages: TaskChatMessage[],
+  onText: (text: string) => void,
+  options?: AssistantChatOptions,
+) {
+  const body: Record<string, unknown> = { task_id: taskId ?? null, messages }
+  if (options?.currentTest) body.current_test = options.currentTest
   return request<string>('/api/tasks/chat', {
-    method: 'POST', body: { task_id: taskId ?? null, messages }, timeoutMs: 130_000,
+    method: 'POST', body, timeoutMs: 130_000,
     readResponse: async response => {
       const incomplete = () => new ApiError(0, 'incomplete_stream', 'AI 回复未完整返回')
       if (!response.body || !response.headers.get('content-type')?.startsWith('application/x-ndjson')) throw incomplete()
@@ -114,8 +204,22 @@ export function chatWithAssistant(taskId: string | undefined, messages: TaskChat
           pending = lines.pop() ?? ''
           for (const line of lines) {
             if (!line) continue
-            const frame = JSON.parse(line) as { type: string; text?: string; code?: string }
+            const frame = JSON.parse(line) as {
+              type: string
+              text?: string
+              code?: string
+              phase?: string
+              message?: string
+              tool?: string
+            }
             if (frame.type === 'error') throw new ApiError(502, frame.code ?? 'chat_failed', `AI 回复失败（${frame.code ?? '未知错误'}）`)
+            if (frame.type === 'status') {
+              options?.onStatus?.({
+                phase: normalizeStatusPhase(frame.phase),
+                message: frame.message,
+                tool: frame.tool,
+              })
+            }
             if (frame.type === 'text') onText(frame.text ?? '')
             if (frame.type === 'done') return frame.text ?? ''
           }
@@ -135,10 +239,18 @@ export function chatWithAssistant(taskId: string | undefined, messages: TaskChat
   })
 }
 
-/** Ask the model for a concise title after the first conversation turn. */
-export const generateChatTitle = (question: string) =>
-  request<{ title: string }>('/api/tasks/chat/title', { method: 'POST', body: { question }, timeoutMs: 40_000 })
-type RunOptions = { origin: string; allow_writes: boolean; observation_ms: number; wall_time_seconds: number }
+type RunOptions = {
+  origin: string
+  allow_writes: boolean
+  observation_ms: number
+  wall_time_seconds: number
+  rounds?: number
+  cooldown_ms?: number
+  reset_vars_per_round?: boolean
+  source?: 'manual' | 'ai'
+  badge?: string | null
+  variables?: Record<string, string | number | boolean>
+}
 /** Start a bounded task with an explicit target and write permission. */
 export const startTask = (body: RunOptions & { catalog: Catalog; document?: TaskDocument }) =>
   request<TaskRecord>('/api/tasks', { method: 'POST', body })

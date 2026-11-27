@@ -1,6 +1,5 @@
-"""Bounded, data-only API testing contracts."""
+"""Bounded, data-only API testing contracts with stateful variable chains."""
 
-import ipaddress
 import json
 import re
 from typing import Literal
@@ -8,17 +7,36 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
+from api_agent.execution.variables import (
+    CONCRETE_PATH_SEGMENT_RE,
+    PLACEHOLDER_RE,
+    VAR_NAME_PATTERN,
+    VAR_NAME_RE,
+    find_placeholders,
+)
 from api_agent.infrastructure.json_pointer import is_valid as is_valid_pointer
+from api_agent.infrastructure.logging import is_sensitive_key
 from api_agent.infrastructure.outcomes import OutcomeFields
+from api_agent.infrastructure.targets import HEADER_NAME, RESERVED_HEADERS, format_host_literal
 from api_agent.projects.schemas import AuthReference
 
 Method = Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
 Status = Literal["passed", "failed", "error", "timed_out", "cancelled"]
 IDENTIFIER = r"^[A-Za-z0-9_-]{1,64}$"
-PATH_SEGMENT = re.compile(r"[A-Za-z0-9_~-]+(?:\.[A-Za-z0-9_~-]+)*")
+PATH_SEGMENT = CONCRETE_PATH_SEGMENT_RE
+PARAM_VALUE_SEGMENT = re.compile(r"[A-Za-z0-9_~-]+")
 TEMPLATE = re.compile(
     r"^/(?:[A-Za-z0-9_.~-]+|\{[A-Za-z_][A-Za-z0-9_]*\})(?:/(?:[A-Za-z0-9_.~-]+|\{[A-Za-z_][A-Za-z0-9_]*\}))*/?$"
 )
+FORBIDDEN_DYNAMIC_HEADERS = RESERVED_HEADERS | frozenset({"proxy-authorization"})
+
+
+def _valid_request_path_segment(segment: str) -> bool:
+    """线性时间校验请求路径单段（允许字面量与受控 `{{var}}`，禁止 `.`/`..`/百分号/空白）。"""
+    if not segment:
+        return False
+    normalized = PLACEHOLDER_RE.sub("v", segment)
+    return bool(PATH_SEGMENT.fullmatch(normalized))
 
 
 class Input(BaseModel):
@@ -28,22 +46,17 @@ class Input(BaseModel):
 
 
 def local_origin(value: str) -> str:
-    """强制把 origin 归一成“数字形式的回环地址”。
+    """校验并规范化目标 HTTP(S) origin（支持任意合法域名、局域网 IP、回环 IP 与公网 IP）。
 
-    作用：本阶段只允许访问本机目标（127.0.0.1 / ::1 等），
-    并且必须是 IP 字面量——这样就无法用 DNS 域名把请求引流到外部主机。
-    实现：``urlsplit`` 后把 hostname 交给 ``ipaddress.ip_address`` 解析
-    （域名会直接抛错），再断言 ``is_loopback``、无账号密码、无路径/查询/片段、
-    端口非 0、无空白与控制字符；最后按规范重建字符串——
-    IPv6 用 ``[compressed]`` 加方括号，端口存在才拼接。
+    仍严格禁止非 http/https 协议、内嵌账号密码、路径/查询/片段、0 端口、空白与控制字符；
+    保留函数名 ``local_origin`` 以保持跨模块导入兼容性。
     """
     try:
         parsed = urlsplit(value)
-        address = ipaddress.ip_address(parsed.hostname or "")
         port = parsed.port
         if (
-            parsed.scheme not in {"http", "https"}
-            or not address.is_loopback
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.path not in {"", "/"}
@@ -53,10 +66,36 @@ def local_origin(value: str) -> str:
             or any(c.isspace() or ord(c) < 32 for c in value)
         ):
             raise ValueError
-        host = f"[{address.compressed}]" if address.version == 6 else address.compressed
-        return f"{parsed.scheme}://{host}" + (f":{port}" if port is not None else "")
+        host = format_host_literal(parsed.hostname)
+        return f"{parsed.scheme.lower()}://{host}" + (f":{port}" if port is not None else "")
     except ValueError:
-        raise ValueError("origin must be a numeric loopback HTTP(S) origin") from None
+        raise ValueError(
+            "origin must be a valid HTTP(S) origin without credentials or path"
+        ) from None
+
+
+class VariableExtract(Input):
+    """从单次响应中提取运行时标量变量，供后续步骤引用。"""
+
+    name: str = Field(pattern=VAR_NAME_PATTERN)
+    source: Literal["json", "header", "status"] = "json"
+    pointer: str = Field(default="", max_length=250)
+    header_name: str = Field(default="", max_length=100)
+    required: bool = True
+    sensitive: bool = False
+
+    @model_validator(mode="after")
+    def valid_extract(self):
+        """校验提取来源与指针/响应头字段组合是否自洽。"""
+        if self.source == "json":
+            if not is_valid_pointer(self.pointer) or self.header_name:
+                raise ValueError("json extraction requires a valid JSON Pointer and no header_name")
+        elif self.source == "header":
+            if not HEADER_NAME.fullmatch(self.header_name) or self.pointer:
+                raise ValueError("header extraction requires a valid header_name and no pointer")
+        elif self.pointer or self.header_name:
+            raise ValueError("status extraction takes neither pointer nor header_name")
+        return self
 
 
 class Assertion(Input):
@@ -75,15 +114,7 @@ class Assertion(Input):
 
     @model_validator(mode="after")
     def valid_assertion(self):
-        """按 ``kind`` 校验 ``pointer``/``expected`` 的组合是否合法。
-
-        实现：逐类检查——
-        status 要求 expected 是 100..599 的整数（用 ``type is int`` 排除 bool）；
-        JSON 断言要求 pointer 是合法 JSON Pointer；
-        json_equals 会递归遍历期望值，拒绝超过 JS 安全整数范围（2^53-1）的数字，
-        因为 Postman 的断言脚本用 JS 比较，超范围会静默失真；
-        其余类型不允许带 pointer，且各自有专属的 expected 约束。
-        """
+        """按 ``kind`` 校验 ``pointer``/``expected`` 的组合是否合法。"""
         if self.kind == "status" and not (
             type(self.expected) is int and 100 <= self.expected <= 599
         ):
@@ -115,36 +146,27 @@ class Assertion(Input):
 
 
 class RequestCase(Input):
-    """一条待执行的请求用例（路径必须是具体路径，不是模板）。
-
-    实现：``id`` 用字符集加长度约束，作为结果配对与去重的键；
-    ``path`` 由 ``concrete_path`` 逐段校验——不允许变量占位、百分号编码和 ``..``，
-    确保真正发出的路径不会越出已授权模板；``headers`` 只允许 Accept/Content-Type；
-    ``supported_request`` 额外禁止在 GET/HEAD/OPTIONS 上携带请求体。
-    """
+    """一条待执行的请求用例（支持受控变量引用、前置依赖、提取规则与清理标记）。"""
 
     id: str = Field(pattern=IDENTIFIER)
     method: Method
     path: str = Field(max_length=300)
     query: dict[str, str] = Field(default_factory=dict, max_length=30)
-    headers: dict[str, str] = Field(default_factory=dict, max_length=2)
+    headers: dict[str, str] = Field(default_factory=dict, max_length=10)
     body: JsonValue = None
     assertions: list[Assertion] = Field(min_length=1, max_length=20)
+    extract: list[VariableExtract] = Field(default_factory=list, max_length=10)
+    depends_on: list[str] = Field(default_factory=list, max_length=10)
+    always_run: bool = False
 
     @field_validator("path")
     @classmethod
     def concrete_path(cls, value):
-        """校验路径是“具体、未编码的绝对路径”。
-
-        实现：必须以 ``/`` 开头（根路径 ``/`` 特例放行）；
-        其余情况先去掉尾部斜杠再按 ``/`` 切段，每段都要匹配 ``PATH_SEGMENT``
-        （字母数字下划线波浪线中划线加点）。这样 ``%2e%2e``、``*``、``{id}``、
-        ``..`` 一律被拒绝，避免编码绕过和路径穿越。
-        """
+        """校验路径是“具体、未编码的绝对路径”或仅含受控 `{{var}}` 占位的路径。"""
         if not value.startswith("/") or (
             value != "/"
             and not all(
-                PATH_SEGMENT.fullmatch(part) for part in value[1:].removesuffix("/").split("/")
+                _valid_request_path_segment(part) for part in value[1:].removesuffix("/").split("/")
             )
         ):
             raise ValueError("path must be a concrete, unencoded absolute path")
@@ -154,87 +176,134 @@ class RequestCase(Input):
     def supported_request(self):
         """限制请求可携带的头与请求体的组合。
 
-        实现：头名转小写后必须唯一且只允许 accept/content-type（防止覆盖
-        Host、Authorization 等关键头）；头值只允许 application/json；
-        无实体语义的方法（GET/HEAD/OPTIONS）不允许带 body。
+        - `Accept` 与 `Content-Type` 仍仅允许 `application/json`；
+        - 其他非保留请求头（如 `token`、`Authorization`、`X-Request-Id`）仅允许携带
+          已绑定的运行时变量占位符 `{{var}}`，禁止在计划中硬编码静态凭据；
+        - 无实体语义的方法（GET/HEAD/OPTIONS）不允许带 body。
         """
         lowered = [name.lower() for name in self.headers]
-        if len(lowered) != len(set(lowered)) or set(lowered) - {"accept", "content-type"}:
-            raise ValueError("only unique Accept and Content-Type headers are supported")
-        if any(value != "application/json" for value in self.headers.values()):
-            raise ValueError("only JSON headers are supported")
+        if len(lowered) != len(set(lowered)):
+            raise ValueError("duplicate request header names are not allowed")
+        for name, value in self.headers.items():
+            if not HEADER_NAME.fullmatch(name):
+                raise ValueError("invalid request header name")
+            low = name.lower()
+            if low in FORBIDDEN_DYNAMIC_HEADERS:
+                raise ValueError("reserved request header is not allowed")
+            if low in {"accept", "content-type"}:
+                if value != "application/json":
+                    raise ValueError("only JSON headers are supported")
+            else:
+                if (
+                    len(value) > 512
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+                    or not PLACEHOLDER_RE.search(value)
+                ):
+                    raise ValueError(
+                        "custom headers must reference a bound runtime variable placeholder"
+                    )
         if self.method in {"GET", "HEAD", "OPTIONS"} and self.body is not None:
             raise ValueError("this method does not support a JSON body")
+        if len({rule.name for rule in self.extract}) != len(self.extract):
+            raise ValueError("duplicate_extract_variable")
         return self
 
 
 class ExecutionPlan(Input):
-    """一次受控执行计划：目标、白名单、用例与配额。
-
-    作用：这是唯一被接受的外部输入契约，所有限制都在这一层落地，
-    CLI/MCP 只负责搬运，不再二次解释。
-    实现：字段级先校验 origin（必须回环 IP）；
-    模型级 ``valid_plan`` 再统一检查请求数、ID 唯一性、路径模板与用例的匹配、
-    鉴权头黑名单、体积上限和未绑定变量，理由见各检查点。
-    """
+    """一次受控执行计划：目标、白名单、用例、变量依赖链与配额。"""
 
     schema_version: Literal["1"] = "1"
     origin: str
     allowed_methods: list[Method] = Field(min_length=1, max_length=7)
     path_templates: list[str] = Field(min_length=1, max_length=50)
     auth_ref: AuthReference | None = None
+    variables: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=20)
     requests: list[RequestCase] = Field(min_length=1, max_length=50)
     max_requests: int = Field(default=50, ge=1, le=50)
-    request_timeout_ms: int = Field(default=3000, ge=50, le=10_000)
+    request_timeout_ms: int = Field(default=3000, ge=50, le=30_000)
     timeout_ms: int = Field(default=30_000, ge=100, le=120_000)
     delay_ms: int = Field(default=50, ge=0, le=1000)
 
     @field_validator("origin")
     @classmethod
     def validate_origin(cls, value):
-        """把 origin 归一成数字回环地址（委托 ``local_origin``）。
-
-        实现：这里只做转发，实际校验逻辑集中在 ``local_origin``，
-        以便其它地方（如测试）可以直接复用同一套规则。
-        """
+        """把 origin 归一成数字回环地址（委托 ``local_origin``）。"""
         return local_origin(value)
+
+    @field_validator("variables")
+    @classmethod
+    def validate_initial_variables(cls, value: dict[str, str | int | float | bool]):
+        """初始变量仅允许非敏感命名与安全标量，防止在计划里硬编码密码或密钥。"""
+        for name, item in value.items():
+            if not VAR_NAME_RE.fullmatch(name):
+                raise ValueError("invalid_variable_name")
+            if is_sensitive_key(name):
+                raise ValueError("sensitive_initial_variable_not_allowed")
+            if isinstance(item, str) and (
+                len(item) > 1024
+                or "{{" in item
+                or "}}" in item
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in item)
+            ):
+                raise ValueError("invalid_variable_value")
+        return value
+
+    def matches_path(self, path: str, *, allow_vars: bool = False) -> bool:
+        """线性时间按段比对路径是否命中任一授权模板，避免复杂正则回溯。"""
+        case_parts = path.split("/")
+        for template in self.path_templates:
+            tmpl_parts = template.split("/")
+            if len(case_parts) != len(tmpl_parts):
+                continue
+            matched = True
+            for c_part, t_part in zip(case_parts, tmpl_parts, strict=True):
+                if t_part.startswith("{") and t_part.endswith("}"):
+                    candidate = PLACEHOLDER_RE.sub("v", c_part) if allow_vars else c_part
+                    if not PARAM_VALUE_SEGMENT.fullmatch(candidate):
+                        matched = False
+                        break
+                elif c_part != t_part:
+                    matched = False
+                    break
+            if matched:
+                return True
+        return False
 
     @model_validator(mode="after")
     def valid_plan(self):
         """对整个计划做交叉校验，任何一条不满足都拒绝执行。
 
-        实现顺序与理由：
-        ① 请求数不得超过 ``max_requests``；
-        ② 用例 ID 不得重复（结果靠 ID 配对）；
-        ③ 每个路径模板转成正则：``{变量}`` 段替换成“单段字面量”模式，
-           字面段用 ``re.escape`` 转义，并拒绝 ``.``/``..`` 段；
-        ④ 逐用例检查方法在白名单内、路径能匹配某个模板（这是访问面收口的关键）；
-        ⑤ 鉴权头不许撞上 Host/Content-Length/Transfer-Encoding/Connection/
-           Accept/Content-Type/Proxy-* 等会改变协议语义的头；
-        ⑥ 序列化后检查体积（≤256KiB）且 JSON 中无 NaN/Infinity；
-        ⑦ 遍历全部字符串，拒绝 ``{{ }}`` 未绑定变量——Postman 会把它当变量替换，
-           可能绕过我们已校验的固定字面量。
+        核心不变量：
+        - 任意未由 `variables` 或前序步骤 `extract` 声明的 `{{var}}` 依然被拒绝；
+        - `depends_on` 仅允许引用前序已出现的用例 ID；
+        - 只有路径模板中的 `{param}` 段才允许出现 `{{var}}` 占位符。
         """
         if len(self.requests) > self.max_requests:
             raise ValueError("request_budget_exceeded")
         if len({case.id for case in self.requests}) != len(self.requests):
             raise ValueError("duplicate_request_id")
-        patterns = []
         for template in self.path_templates:
             if template != "/" and not TEMPLATE.fullmatch(template):
                 raise ValueError("invalid_path_template")
             if any(part in {".", ".."} for part in template.split("/")):
                 raise ValueError("invalid_path_template")
-            pattern = "/".join(
-                "[A-Za-z0-9_~-]+" if part.startswith("{") else re.escape(part)
-                for part in template.split("/")
-            )
-            patterns.append(re.compile(pattern))
+
+        seen_ids: set[str] = set()
+        bound_vars: set[str] = set(self.variables.keys())
         for case in self.requests:
             if case.method not in self.allowed_methods:
                 raise ValueError("method_not_allowed")
-            if not any(pattern.fullmatch(case.path) for pattern in patterns):
+            if not self.matches_path(case.path, allow_vars=True):
                 raise ValueError("path_not_allowed")
+            for dep in case.depends_on:
+                if dep not in seen_ids:
+                    raise ValueError("invalid_dependency")
+            refs, invalid = find_placeholders(case.model_dump(exclude={"extract"}))
+            if invalid or not refs.issubset(bound_vars):
+                raise ValueError("unbound_variables_not_supported")
+            bound_vars.update(rule.name for rule in case.extract)
+            seen_ids.add(case.id)
+
         if (
             self.auth_ref
             and self.auth_ref.header_name
@@ -257,17 +326,29 @@ class ExecutionPlan(Input):
             raise ValueError("non_finite_json_value") from None
         if len(encoded.encode()) > 262_144:
             raise ValueError("plan_too_large")
-        pending = [self.model_dump()]
-        while pending:
-            value = pending.pop()
-            if isinstance(value, str) and ("{{" in value or "}}" in value):
-                raise ValueError("unbound_variables_not_supported")
-            if isinstance(value, dict):
-                pending.extend(value.keys())
-                pending.extend(value.values())
-            elif isinstance(value, list):
-                pending.extend(value)
+        # 顶层非请求字段也不得包含花括号模板
+        _, top_invalid = find_placeholders(self.model_dump(exclude={"requests"}))
+        top_refs, _ = find_placeholders(self.model_dump(exclude={"requests"}))
+        if top_invalid or top_refs:
+            raise ValueError("unbound_variables_not_supported")
         return self
+
+
+def origin_allowed(origin: str, allowed_origins: list[str]) -> bool:
+    """判断目标 origin 是否被允许：白名单为空时放行，非空时按规范化 origin 匹配。"""
+    if not allowed_origins:
+        return True
+    try:
+        target = local_origin(origin)
+    except ValueError:
+        target = origin.rstrip("/").lower()
+    normalized_allowed = set()
+    for candidate in allowed_origins:
+        try:
+            normalized_allowed.add(local_origin(candidate))
+        except ValueError:
+            normalized_allowed.add(candidate.rstrip("/").lower())
+    return target in normalized_allowed
 
 
 def validate_scope(
@@ -275,26 +356,28 @@ def validate_scope(
 ) -> None:
     """把计划与“本次部署允许的目标/凭据”做比对。
 
-    作用：计划自带 origin，但能不能打要由本地配置说了算——
-    这是防止越权访问的第二道闸（第一道是 ``local_origin`` 的回环限制）。
-    实现：origin 比对时对配置项再 ``rstrip("/")`` 一次，避免形态差异造成误判；
-    若计划引用了凭据，其变量名必须出现在 ``TARGET_AUTH_ENV_VARS`` 白名单里。
-    失败时抛出带固定错误码的 ValueError，由调用方转成 error_kind。
+    当 ``allowed_origins`` 非空时强制要求 ``plan.origin`` 命中白名单；
+    为空时默认不限制目标 origin。凭据变量名白名单始终强制生效。
     """
-    if plan.origin not in {origin.rstrip("/") for origin in allowed_origins}:
+    if not origin_allowed(plan.origin, allowed_origins):
         raise ValueError("origin_not_allowed")
     if plan.auth_ref and plan.auth_ref.env_var not in auth_env_vars:
         raise ValueError("auth_reference_not_allowed")
 
 
-class AssertionResult(BaseModel):
-    """单条断言的判定及有界、脱敏后的观察值。
+class ExtractedVariable(BaseModel):
+    """单条变量提取的脱敏观测记录。"""
 
-    作用：区分已通过、已失败和未评估；actual 允许保留非敏感业务字段，
-    不包含完整响应正文。敏感值保护与大小限制由引擎记录证据时实施。
-    实现：``passed`` 允许为 None（无法判定时），``index`` 与计划中的断言顺序一一对应；
-    ``message`` 仅在断言失败时携带引擎给出的差异说明，正常通过时为 None。
-    """
+    name: str
+    source: Literal["json", "header", "status"] = "json"
+    ok: bool
+    sensitive: bool = False
+    value: JsonValue = None
+    message: str | None = None
+
+
+class AssertionResult(BaseModel):
+    """单条断言的判定及有界、脱敏后的观察值。"""
 
     index: int
     kind: str
@@ -308,13 +391,7 @@ class AssertionResult(BaseModel):
 
 
 class ResponseCapture(BaseModel):
-    """一次请求实际收到的响应快照（原样输出模式才会填充）。
-
-    作用：让调用方能看到目标真实返回了什么，而不是只有“通过/失败”一个布尔值。
-    实现：``headers`` 保留引擎给出的键值对顺序（多值头合并为列表），
-    ``body`` 是解码后的有界文本；具体引擎可能用替换字符处理非 UTF-8 字节，
-    ``body_truncated`` 表示截断或无法完整还原。``omitted`` 表示关闭了捕获。
-    """
+    """一次请求实际收到的响应快照（原样输出模式才会填充）。"""
 
     status_text: str | None = None
     headers: dict[str, list[str]] = Field(default_factory=dict)
@@ -325,30 +402,22 @@ class ResponseCapture(BaseModel):
 
 
 class CaseResult(OutcomeFields):
-    """单个用例的执行结果。
-
-    实现：默认 ``status="unknown"``——只有确实观察到证据才会被改成
-    passed/failed/error/timed_out/cancelled，避免把“没跑到”误报成“通过”；
-    ``error_kind`` 用固定码描述失败类别（如 request_error、missing_assertions）；
-    ``response`` 在开启响应捕获时携带目标回包，关闭时为 None。
-    """
+    """单个用例的执行结果。"""
 
     id: str
-    status: Literal["passed", "failed", "error", "timed_out", "cancelled", "unknown"] = "unknown"
+    status: Literal["passed", "failed", "error", "timed_out", "cancelled", "skipped", "unknown"] = (
+        "unknown"
+    )
     http_status: int | None = None
     response_time_ms: float | None = None
     error_kind: str | None = None
     assertions: list[AssertionResult] = Field(default_factory=list)
+    extracted: list[ExtractedVariable] = Field(default_factory=list)
     response: ResponseCapture | None = None
 
 
 class RunResult(OutcomeFields):
-    """一次执行的最终汇总。
-
-    实现：``reserved_requests`` 是预算口径（计划里声明了多少），
-    ``observed_attempts`` 是实际观察到报告里有多少条，``unknown_requests`` 是差额，
-    差额表示缺少结果证据，不能据此断言请求未发送或没有产生副作用。
-    """
+    """一次执行的最终汇总。"""
 
     schema_version: Literal["1"] = "1"
     status: Status
@@ -376,15 +445,7 @@ def unevaluated_assertions(case: RequestCase) -> list[AssertionResult]:
 
 
 def empty_result(plan: ExecutionPlan, status: Status, error_kind: str) -> RunResult:
-    """构造一个“没有观察到任何结果”的占位返回值。
-
-    作用：在 CLI 缺失、报告缺失、超时、解析失败等情形下，
-    仍需返回与计划结构对齐的对象，让上层（和用户）能区分
-    “跑了但全失败”和“根本没跑起来”。
-    实现：``reserved_requests`` 与 ``unknown_requests`` 都设为计划里的请求数
-    （即全部预算被占用但结果未知），``executions`` 为每个用例生成一条
-    ``status="unknown"`` 的空结果。
-    """
+    """构造一个“没有观察到任何结果”的占位返回值。"""
     return RunResult(
         status=status,
         error_kind=error_kind,

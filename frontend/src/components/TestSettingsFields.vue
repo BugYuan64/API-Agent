@@ -1,17 +1,16 @@
 <script setup lang="ts">
 /** Edit the same persisted settings in the workbench and system settings. */
 import { computed } from 'vue'
-import { normalizeTestNumber, testNumberFields, testSettings, type TestSettingsGroup } from '@/lib/testSettings'
+import { normalizeTestNumber, testNumberFields, testSettings, type TestNumberField, type TestSettingsGroup } from '@/lib/testSettings'
 import { useToastStore } from '@/stores/toasts'
 
 const props = defineProps<{ group: TestSettingsGroup; disabled?: boolean; generationLocked?: boolean }>()
-type Field = typeof testNumberFields[TestSettingsGroup][number]
-const fields = computed(() => testNumberFields[props.group])
+const fields = computed<readonly TestNumberField[]>(() => testNumberFields[props.group])
 const values = computed(() => testSettings[props.group] as Record<string, number | boolean>)
 const toast = useToastStore()
 
 /** Commit the bounded value and explain any correction in the same place. */
-function updateNumber(event: Event, field: Field) {
+function updateNumber(event: Event, field: TestNumberField) {
   const input = event.currentTarget as HTMLInputElement
   const { value, adjustment } = normalizeTestNumber(input.valueAsNumber, Number(values.value[field.key]), field.min, field.max)
   input.value = String(value)
@@ -26,7 +25,7 @@ function updateNumber(event: Event, field: Field) {
   <div class="test-settings-fields">
     <label v-for="field in fields" :key="field.key" class="number-field">
       <span>{{ field.label }}</span>
-      <input class="input" type="number" :min="field.min" :max="field.max" :value="values[field.key]"
+      <input class="input" type="number" :min="field.min" :max="field.max" :step="field.step" :value="values[field.key]"
         :disabled="disabled || (field.key === 'testsPerUrl' && generationLocked)" @change="updateNumber($event, field)" />
       <span class="hint">{{ field.min }}–{{ field.max }}</span>
     </label>

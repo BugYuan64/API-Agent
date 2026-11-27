@@ -50,10 +50,16 @@ async def test_real_stdio_initialization_tools_validation_and_safe_errors(tmp_pa
         assert result.structured_content["error_kind"] == "unknown_engine"
 
 
-async def test_independent_client_denies_unconfigured_origin(tmp_path):
-    settings = load_settings(env_file=None, project_root=tmp_path)
-    result = await call_tool(settings, "validate_plan", payload())
+async def test_independent_client_enforces_optional_origin_allowlist(tmp_path):
+    restricted = load_settings(
+        env_file=None, project_root=tmp_path, target_allowed_origins=["http://127.0.0.1:9999"]
+    )
+    result = await call_tool(restricted, "validate_plan", payload())
     assert result == {"valid": False, "error_kind": "origin_not_allowed"}
+
+    unrestricted = load_settings(env_file=None, project_root=tmp_path)
+    allowed = await call_tool(unrestricted, "validate_plan", payload("https://api.example.com"))
+    assert allowed["valid"] is True
 
 
 async def test_secret_reference_requires_server_permission(tmp_path, monkeypatch):

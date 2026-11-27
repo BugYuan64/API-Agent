@@ -1,18 +1,26 @@
 """Normalize the Postman CLI report into a bounded, inspectable result."""
 
 import base64
+import json
 import math
+from typing import Any
 
+from api_agent.execution.checks import bounded_observation
 from api_agent.execution.schemas import (
     AssertionResult,
     CaseResult,
     ExecutionPlan,
+    ExtractedVariable,
     ResponseCapture,
     RunResult,
     empty_result,
     unevaluated_assertions,
 )
+from api_agent.execution.variables import extract_from_response, is_rule_sensitive
+from api_agent.infrastructure.json_pointer import resolve as evaluate_pointer
+from api_agent.infrastructure.logging import REDACTED
 from api_agent.infrastructure.outcomes import outcome_for
+from api_agent.infrastructure.privacy import Context
 
 # 单条响应体最多保留的字符数；超出部分截断并置 body_truncated，
 # 避免一个超大响应把整份结果撑到不可用。
@@ -20,16 +28,7 @@ MAX_BODY_CHARS = 1_000_000
 
 
 def decode_stream(stream) -> tuple[str | None, int, bool]:
-    """把 Postman 的 ``stream`` 字段还原成文本。
-
-    作用：引擎把响应体序列化成 ``{"type":"Buffer","data":[123,34,...]}``
-    （Node 的 Buffer JSON 形式），也可能是 base64 字符串或纯文本，
-    这里统一还原成可读文本。
-    实现：按三种形态分别处理——Buffer 数组逐字节还原、
-    带 ``base64`` 标记或疑似 base64 的字符串先解码再按 UTF-8 容错解码、
-    其余直接当文本。任何解码失败都返回 ``(None, 长度, True)``，
-    让上层知道“有响应体但没法按文本展示”，而不是伪装成空响应。
-    """
+    """把 Postman 的 ``stream`` 字段还原成文本。"""
     if stream is None:
         return None, 0, False
     data: bytes
@@ -44,8 +43,6 @@ def decode_stream(stream) -> tuple[str | None, int, bool]:
     elif isinstance(stream, dict) and isinstance(stream.get("data"), str):
         data = _decode_base64(stream["data"])
     elif isinstance(stream, str):
-        # 引擎早期版本直接给 base64 文本；能干净解码就按 base64 处理，
-        # 否则当普通文本，避免把正常文本误伤成乱码。
         decoded = _decode_base64(stream, strict=True)
         data = decoded if decoded is not None else stream.encode("utf-8", "replace")
     else:
@@ -65,13 +62,7 @@ def _decode_base64(value: str, strict: bool = False) -> bytes | None:
 
 
 def capture_headers(raw) -> dict[str, list[str]]:
-    """把响应头数组聚合成“名字 → 值列表”。
-
-    作用：引擎给的是 ``[{"key":"X","value":"1"}, ...]``，同名头可能出现多次
-    （如多个 Set-Cookie），用列表保留全部值，避免后一个覆盖前一个。
-    实现：遍历列表，只接受 ``key`` 为非空字符串的条目；
-    键名保持原样不做大小写归一，让用户看到目标真实发送的写法。
-    """
+    """把响应头数组聚合成“名字 → 值列表”。"""
     headers: dict[str, list[str]] = {}
     if not isinstance(raw, list):
         return headers
@@ -86,12 +77,7 @@ def capture_headers(raw) -> dict[str, list[str]]:
 
 
 def capture_response(response: dict) -> ResponseCapture:
-    """把一条 ``response`` 记录转成对外暴露的 ResponseCapture。
-
-    实现：头与体都从记录里取；若报告被 ``--omitAllHeadersAndBody`` 裁过，
-    两个字段都会缺失，此时 ``omitted`` 置 True，让调用方明确知道
-    “不是目标没返回，而是本次运行关掉了捕获”。
-    """
+    """把一条 ``response`` 记录转成对外暴露的 ResponseCapture。"""
     has_header = "header" in response
     has_stream = "stream" in response
     if not has_header and not has_stream:
@@ -107,34 +93,49 @@ def capture_response(response: dict) -> ResponseCapture:
     )
 
 
+def _observe_assertion(
+    wanted,
+    *,
+    code: int,
+    elapsed: float | int | None,
+    headers: dict[str, list[str]],
+    has_parsed_json: bool,
+    parsed_json: Any,
+    context: Context,
+) -> dict[str, Any]:
+    """依据已捕获响应构造与原生引擎同构的有界脱敏断言观察值。"""
+    if wanted.kind == "status":
+        return bounded_observation(code, "", context)
+    if wanted.kind == "response_time":
+        if elapsed is not None:
+            return bounded_observation(elapsed, "", context)
+        return {}
+    if wanted.kind == "content_type":
+        raw_ct = next(
+            (
+                values[0]
+                for name, values in headers.items()
+                if name.lower() == "content-type" and values
+            ),
+            "",
+        )
+        return bounded_observation(raw_ct.split(";")[0].strip().lower(), "", context)
+    if wanted.kind in {"json_equals", "json_exists"} and has_parsed_json:
+        exists, value = evaluate_pointer(parsed_json, wanted.pointer)
+        if exists:
+            return bounded_observation(value, wanted.pointer, context)
+    return {}
+
+
 def normalize_report(
     report: dict,
     plan: ExecutionPlan,
     exit_code: int,
     capture: bool = True,
+    *,
+    secrets: set[str] | None = None,
 ) -> RunResult:
-    """把 Postman CLI 的 JSON 报告归一成受控的 ``RunResult``。
-
-    作用：从引擎报告里提取“哪些用例跑了、HTTP 状态码、耗时、每条断言结果”，
-    并在 ``capture`` 为真时一并带出目标实际返回的头与体，便于人工核对。
-    实现步骤：
-    ① 先假设结果为 ``invalid_report``，只有结构完全符合预期才继续；
-    ② 校验 ``run.executions`` 是列表，逐条要求 ``item.name`` 命中计划里的 ID
-       且不得重复——出现未知或重复条目就整体判为无效报告，
-       因为无法再保证“结果与计划一一对应”；
-    ③ 统计 observed/unknown，使上层能看出有多少请求根本没有回音；
-    ④ 按计划顺序遍历用例：缺条目保持 unknown；明确请求超时记为 timed_out，
-       其他 ``requestError`` 记为 request_error，传输异常说明只使用固定文本；
-       状态码必须是 100..599 的真实 int；耗时必须是有限非负数才采信；
-       断言数组长度必须与计划完全一致，且每条断言名要对上 ``a{下标}_{类型}``、
-       不能被标记 skipped，否则判为 invalid_assertions；
-    ⑤ 最后按优先级定总体状态：存在 unknown → 报告不完整；已知 error 保留其错误码；
-       请求 timed_out 优先于 failed；CLI 退出码非 0 或报告里有 error/failures → cli_error；
-       全部通过才置 passed。
-
-    ``capture=False`` 时不读取响应头与响应体，但仍在每条结果上挂一个
-    ``omitted`` 标记，让调用方能区分“本次运行关掉了捕获”和“没有结果”。
-    """
+    """把 Postman CLI 的 JSON 报告归一成受控的 ``RunResult``（含断言观察值与变量提取回显）。"""
     result = empty_result(plan, "error", "invalid_report")
     run = report.get("run")
     if not isinstance(run, dict) or not isinstance(run.get("executions"), list):
@@ -152,6 +153,7 @@ def normalize_report(
     result.observed_attempts = len(observed)
     result.unknown_requests = len(expected) - len(observed)
     executions = []
+    secret_pool = set(secrets or ())
     for case in plan.requests:
         item = CaseResult(id=case.id, assertions=unevaluated_assertions(case))
         executions.append(item)
@@ -159,6 +161,26 @@ def normalize_report(
         if entry is None:
             continue
         response = entry.get("response")
+        # 识别 prerequest 通过 pm.execution.skipRequest() 主动跳过的受控步骤
+        if not entry.get("requestError") and not isinstance(response, dict):
+            pre_assertions = entry.get("assertions")
+            if (
+                isinstance(pre_assertions, list)
+                and len(pre_assertions) == 1
+                and isinstance(pre_assertions[0], dict)
+                and isinstance(pre_assertions[0].get("assertion"), str)
+            ):
+                marker = pre_assertions[0]["assertion"]
+                if marker.startswith("__aa_skip:"):
+                    reason = marker.removeprefix("__aa_skip:")
+                    if reason in {"dependency_failed", "missing_variable"}:
+                        item.status, item.error_kind = "skipped", reason
+                        continue
+                elif marker.startswith("__aa_error:"):
+                    reason = marker.removeprefix("__aa_error:")
+                    if reason in {"unsafe_variable_value"}:
+                        item.status, item.error_kind = "error", reason
+                        continue
         if entry.get("requestError") or not isinstance(response, dict):
             request_error = entry.get("requestError")
             error_code = request_error.get("code") if isinstance(request_error, dict) else None
@@ -173,22 +195,57 @@ def normalize_report(
             )
             continue
         code = response.get("code")
-        # 用 type(...) is int 而非 isinstance，排除 True/False 被当成 1/0 的情况。
         if type(code) is not int or not 100 <= code <= 599:
             item.status, item.error_kind = "error", "invalid_response_metadata"
             continue
         item.http_status = code
         elapsed = response.get("responseTime")
+        valid_elapsed: float | int | None = None
         if type(elapsed) in {int, float} and math.isfinite(elapsed) and elapsed >= 0:
             item.response_time_ms = elapsed
-        item.response = capture_response(response) if capture else ResponseCapture(omitted=True)
-        assertions = entry.get("assertions")
-        if not isinstance(assertions, list) or len(assertions) != len(case.assertions):
+            valid_elapsed = elapsed
+        raw_capture = capture_response(response)
+        item.response = raw_capture if capture else ResponseCapture(omitted=True)
+        raw_assertions = entry.get("assertions")
+        expected_total = len(case.assertions) + len(case.extract)
+        if not isinstance(raw_assertions, list) or len(raw_assertions) != expected_total:
             item.status, item.error_kind = "error", "missing_assertions"
             continue
+        assertion_entries = raw_assertions[: len(case.assertions)]
+        extract_entries = raw_assertions[len(case.assertions) :]
+
+        parsed_json: Any = None
+        has_parsed_json = False
+        if not raw_capture.omitted and isinstance(raw_capture.body, str) and raw_capture.body:
+            try:
+                parsed_json = json.loads(raw_capture.body)
+                has_parsed_json = True
+            except ValueError:
+                pass
+
+        extracted_by_name: dict[str, dict[str, Any]] = {}
+        if case.extract:
+            _, raw_extracted, new_secrets, _ = extract_from_response(
+                case.extract,
+                status_code=code,
+                headers=raw_capture.headers,
+                has_parsed_json=has_parsed_json,
+                parsed_json=parsed_json,
+                omit_values=not capture,
+            )
+            secret_pool.update(new_secrets)
+            extracted_by_name = {rec["name"]: rec for rec in raw_extracted}
+
+        context = Context(secret_pool)
+        context.learn(plan.model_dump())
+        if has_parsed_json:
+            context.learn(parsed_json)
+
         valid = True
         item.assertions = []
-        for index, (actual, wanted) in enumerate(zip(assertions, case.assertions, strict=True)):
+        for index, (actual, wanted) in enumerate(
+            zip(assertion_entries, case.assertions, strict=True)
+        ):
             if (
                 not isinstance(actual, dict)
                 or actual.get("assertion") != f"a{index}_{wanted.kind}"
@@ -197,20 +254,85 @@ def normalize_report(
                 valid = False
                 break
             passed = "error" not in actual
+            observation = (
+                _observe_assertion(
+                    wanted,
+                    code=code,
+                    elapsed=valid_elapsed,
+                    headers=raw_capture.headers,
+                    has_parsed_json=has_parsed_json,
+                    parsed_json=parsed_json,
+                    context=context,
+                )
+                if capture
+                else {}
+            )
+            raw_message = _assertion_message(actual) if capture and not passed else None
             item.assertions.append(
                 AssertionResult(
                     index=index,
                     kind=wanted.kind,
                     pointer=wanted.pointer,
                     passed=passed,
-                    message=_assertion_message(actual) if capture and not passed else None,
+                    message=context.text(raw_message) if raw_message else None,
+                    **observation,
                 )
             )
+
+        required_extract_failed = False
+        extracted_items: list[ExtractedVariable] = []
+        if valid and case.extract:
+            for ext_idx, (actual, rule) in enumerate(
+                zip(extract_entries, case.extract, strict=True)
+            ):
+                if (
+                    not isinstance(actual, dict)
+                    or actual.get("assertion") != f"e{ext_idx}_{rule.name}"
+                    or actual.get("skipped")
+                ):
+                    valid = False
+                    break
+                ok = "error" not in actual
+                sensitive = is_rule_sensitive(rule)
+                if not ok and rule.required:
+                    required_extract_failed = True
+                matched_extract = extracted_by_name.get(rule.name)
+                if ok:
+                    if sensitive or not capture:
+                        value = REDACTED
+                    elif matched_extract and matched_extract.get("ok"):
+                        value = context.clean(matched_extract.get("value"))
+                    else:
+                        value = None
+                else:
+                    value = None
+                extracted_items.append(
+                    ExtractedVariable(
+                        name=rule.name,
+                        source=rule.source,
+                        ok=ok,
+                        sensitive=sensitive,
+                        value=value,
+                        message=None if ok else "extraction failed",
+                    )
+                )
+
         if not valid:
             item.status, item.error_kind = "error", "invalid_assertions"
         else:
-            item.status = "passed" if all(a.passed for a in item.assertions) else "failed"
+            item.extracted = extracted_items
+            assertions_ok = all(a.passed for a in item.assertions)
+            if assertions_ok and not required_extract_failed:
+                item.status = "passed"
+            else:
+                item.status = "failed"
+                if assertions_ok and required_extract_failed:
+                    item.error_kind = "variable_extraction_failed"
     result.executions = executions
+    result.observed_attempts = sum(
+        1 for item in executions if item.status not in {"unknown", "skipped"}
+    )
+    result.unknown_requests = sum(1 for item in executions if item.status == "unknown")
     if any(item.status == "unknown" for item in executions):
         result.error_kind = "incomplete_or_error_report"
     elif any(item.status == "error" for item in executions):
@@ -219,6 +341,12 @@ def normalize_report(
         result.status, result.error_kind = "timed_out", "request_timeout"
     elif any(item.status == "failed" for item in executions):
         result.status, result.error_kind = "failed", None
+    elif any(item.status == "skipped" for item in executions):
+        result.status = "failed"
+        result.error_kind = next(
+            (item.error_kind for item in executions if item.status == "skipped"),
+            "dependency_failed",
+        )
     elif exit_code != 0 or run.get("error") or run.get("failures"):
         result.error_kind = "cli_error"
     else:
@@ -227,11 +355,7 @@ def normalize_report(
 
 
 def _assertion_message(actual: dict) -> str | None:
-    """取出断言失败时引擎给出的差异说明。
-
-    实现：报告里形如 ``{"error": {"message": "expected 'x' to equal 'y'"}}``；
-    只接受非空字符串，其余返回 None，避免把结构异常的内容当文案透出。
-    """
+    """取出断言失败时引擎给出的差异说明。"""
     error = actual.get("error")
     if isinstance(error, dict):
         message = error.get("message")

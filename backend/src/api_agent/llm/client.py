@@ -24,6 +24,8 @@ from api_agent.llm.response import parse_completion, parse_models
 from api_agent.llm.schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
+    FunctionCall,
+    ToolCall,
 )
 
 logger = logging.getLogger("api_agent.llm")
@@ -44,6 +46,8 @@ class OpenAIClient:
         timeout_seconds: float = 60.0,
         enabled: bool = True,
         settings: Settings | None = None,
+        *,
+        trust_env: bool = False,
     ):
         """保存连接参数；提供 Settings 时优先采用其中配置，此处不探测服务。"""
         if settings is not None:
@@ -52,12 +56,14 @@ class OpenAIClient:
             self.model = settings.llm_model
             self.timeout_seconds = settings.llm_timeout_seconds
             self.enabled = settings.llm_mode != "disabled"
+            self.trust_env = settings.trust_system_proxy
         else:
             self.base_url = base_url.rstrip("/") if base_url else None
             self.api_key = api_key
             self.model = model
             self.timeout_seconds = timeout_seconds
             self.enabled = enabled
+            self.trust_env = trust_env
 
     @property
     def is_configured(self) -> bool:
@@ -167,7 +173,9 @@ class OpenAIClient:
         }
         finished = False
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds, trust_env=False) as client:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds, trust_env=self.trust_env
+            ) as client:
                 async with client.stream(
                     "POST",
                     self._build_url(),
@@ -207,6 +215,147 @@ class OpenAIClient:
         if not finished:
             raise LLMResponseError("LLM stream ended without a completion marker")
 
+    async def stream_completion(self, request: ChatCompletionRequest):
+        """流式调用 Chat Completions，支持正文增量与 OpenAI tools/tool_calls 聚合。"""
+        payload: dict[str, Any] = {
+            "model": request.model or self.model,
+            "messages": self._format_messages(request.messages),
+            "stream": True,
+        }
+        if request.tools:
+            payload["tools"] = [tool.model_dump(mode="json") for tool in request.tools]
+            if request.tool_choice is not None:
+                payload["tool_choice"] = request.tool_choice
+        if request.max_tokens is not None:
+            payload["max_tokens"] = request.max_tokens
+        if request.temperature is not None:
+            payload["temperature"] = request.temperature
+
+        finished = False
+        has_text = False
+        tool_buffers: dict[int, dict[str, str]] = {}
+
+        def _finalize_tools() -> list[ToolCall]:
+            calls: list[ToolCall] = []
+            for idx in sorted(tool_buffers):
+                entry = tool_buffers[idx]
+                name = entry.get("name", "").strip()
+                if not name:
+                    continue
+                raw_args = entry.get("arguments", "").strip()
+                parsed_args: dict[str, Any] = {}
+                if raw_args:
+                    try:
+                        decoded = json.loads(raw_args)
+                        if isinstance(decoded, dict):
+                            parsed_args = decoded
+                    except ValueError:
+                        parsed_args = {"_raw": raw_args[:500]}
+                calls.append(
+                    ToolCall(
+                        id=entry.get("id") or f"call_{idx}",
+                        type="function",
+                        function=FunctionCall(name=name, arguments=parsed_args),
+                    )
+                )
+            return calls
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.timeout_seconds, trust_env=self.trust_env
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    self._build_url(),
+                    headers={**self._build_headers(), "Accept": "text/event-stream"},
+                    json=payload,
+                ) as response:
+                    if response.status_code in {401, 403}:
+                        raise LLMAuthenticationError("LLM authentication failed")
+                    if response.status_code != 200:
+                        raise LLMResponseError(
+                            f"LLM stream endpoint returned HTTP {response.status_code}"
+                        )
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if content_type.startswith("application/json"):
+                        raw_bytes = await response.aread()
+                        try:
+                            raw_json = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+                        except ValueError:
+                            raise LLMResponseError("Invalid LLM JSON response") from None
+                        parsed = parse_completion(raw_json, request.model or self.model)
+                        if parsed.tool_calls:
+                            yield {"type": "tool_calls", "tool_calls": parsed.tool_calls}
+                            return
+                        if parsed.content:
+                            yield {"type": "text", "delta": parsed.content}
+                            return
+                        raise LLMResponseError("Empty LLM response")
+                    if not content_type.startswith("text/event-stream"):
+                        raise LLMResponseError("LLM did not return an SSE completion")
+
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            if tool_buffers:
+                                yield {"type": "tool_calls", "tool_calls": _finalize_tools()}
+                            return
+                        try:
+                            chunk = json.loads(data)
+                            choices = chunk["choices"]
+                            if not choices:
+                                continue
+                            choice = choices[0]
+                            finish_reason = choice.get("finish_reason")
+                            if finish_reason in {"length", "content_filter"}:
+                                raise LLMResponseError("Incomplete LLM completion")
+                            if finish_reason in {"stop", "tool_calls"}:
+                                finished = True
+                            delta = choice.get("delta") or {}
+                            text_piece = delta.get("content")
+                            raw_tc_list = delta.get("tool_calls")
+                        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+                            raise LLMResponseError("Invalid LLM completion event") from None
+
+                        if isinstance(raw_tc_list, list):
+                            for tc_delta in raw_tc_list:
+                                if not isinstance(tc_delta, dict):
+                                    continue
+                                idx = tc_delta.get("index", 0)
+                                if not isinstance(idx, int):
+                                    idx = 0
+                                buf = tool_buffers.setdefault(
+                                    idx, {"id": "", "name": "", "arguments": ""}
+                                )
+                                if isinstance(tc_delta.get("id"), str) and tc_delta["id"]:
+                                    buf["id"] = tc_delta["id"]
+                                fn = tc_delta.get("function")
+                                if isinstance(fn, dict):
+                                    if isinstance(fn.get("name"), str) and fn["name"]:
+                                        buf["name"] += fn["name"]
+                                    if isinstance(fn.get("arguments"), str):
+                                        buf["arguments"] += fn["arguments"]
+
+                        if isinstance(text_piece, str) and text_piece:
+                            has_text = True
+                            yield {"type": "text", "delta": text_piece}
+
+                        if finish_reason == "tool_calls" and tool_buffers:
+                            yield {"type": "tool_calls", "tool_calls": _finalize_tools()}
+                            return
+        except httpx.TimeoutException:
+            raise LLMTimeoutError("LLM stream timed out") from None
+        except (httpx.HTTPError, OSError):
+            raise LLMConnectionError("Could not read the configured LLM stream") from None
+
+        if tool_buffers:
+            yield {"type": "tool_calls", "tool_calls": _finalize_tools()}
+            return
+        if not finished and not has_text:
+            raise LLMResponseError("LLM stream ended without a completion marker")
+
     async def _request(self, method: str, path: str, *, payload=None) -> Any:
         """对指定路径发送一次异步 HTTP 请求并返回解码后的 JSON。
 
@@ -216,7 +365,7 @@ class OpenAIClient:
         url = self._build_url(path)
         timeout = min(15.0, self.timeout_seconds) if path == "/models" else self.timeout_seconds
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=self.trust_env) as client:
                 response = await client.request(
                     method, url, headers=self._build_headers(), json=payload
                 )
@@ -240,16 +389,14 @@ class OpenAIClient:
             raise LLMResponseError("LLM response is not a valid JSON document") from None
 
     async def ping(self) -> dict[str, Any]:
-        """发送最多生成一个 token 的真实对话请求，返回成功状态、耗时及响应模型。
+        """发送最小对话请求验证模型连通性，返回成功状态、耗时及响应模型。
 
-        探测会消耗模型额度；失败沿用对话请求错误，不证明工具调用可用。
+        探测会消耗模型额度；省略 temperature 并预留最小推理 token 预算，兼容推理与封装模型。
         """
         started = time.monotonic()
-        # 发送最小化的 1 Token 探测请求
         request = ChatCompletionRequest(
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-            temperature=0.0,
+            messages=[{"role": "user", "content": "Reply with OK"}],
+            max_tokens=64,
         )
         res = await self.chat_completion(request)
         elapsed_ms = round((time.monotonic() - started) * 1000, 2)

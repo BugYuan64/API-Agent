@@ -83,6 +83,7 @@ async def test_missing_run_and_malformed_id_are_404(client):
 
 
 async def test_scope_rejected_before_background_job_is_created(client, app, monkeypatch):
+    app.state.settings.target_allowed_origins = ["http://127.0.0.1:9999"]
     await enable(client)
     install_model(monkeypatch, ScriptedModel(initial()))
     response = await client.post(

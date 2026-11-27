@@ -28,13 +28,14 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     database_url: str = "sqlite:///data/api_agent.db"
     artifact_dir: Path = Path("data/artifacts")
-    llm_mode: Literal["disabled", "mock", "openai"] = "disabled"
+    llm_mode: Literal["disabled", "mock", "openai"] = "openai"
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
     llm_model: str = Field(default="gpt-4o", min_length=1, max_length=120)
     llm_timeout_seconds: float = Field(default=60.0, ge=0.05, le=600.0)
     target_allowed_origins: list[str] = Field(default_factory=list)
     target_auth_env_vars: list[str] = Field(default_factory=list)
+    trust_system_proxy: bool = False
     postman_cli_path: Path | None = None
     omit_response_payload: bool = False
     response_max_bytes: int = Field(default=2_097_152, ge=1, le=16_777_216)

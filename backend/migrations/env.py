@@ -5,6 +5,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from api_agent.assistant import models as _assistant_models  # noqa: F401
 from api_agent.console import models as _console_models  # noqa: F401
 from api_agent.execution import models as _execution_models  # noqa: F401
 from api_agent.infrastructure.orm import Base

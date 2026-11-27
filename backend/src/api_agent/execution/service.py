@@ -52,11 +52,13 @@ class ExecutionService:
             "native": NativeHttpEngine(
                 omit_response_payload=settings.omit_response_payload,
                 max_response_bytes=settings.response_max_bytes,
+                trust_env=settings.trust_system_proxy,
             ),
             "postman": PostmanRunner(
                 executable,
                 settings.project_root / ".cache/execution",
                 omit_response_payload=settings.omit_response_payload,
+                trust_env=settings.trust_system_proxy,
             ),
         }
 
@@ -154,10 +156,12 @@ class ExecutionService:
 
     async def engine_status(self, name: str | None = None) -> dict[str, Any]:
         """查询指定（默认原生）执行驱动的就绪状态。"""
+        key = (name or DEFAULT_ENGINE).strip().lower()
         try:
             driver = self.resolve_engine(name)
         except PlanError as error:
             return {"available": False, "error_kind": str(error)}
         status = await driver.status()
+        status.setdefault("id", key)
         status.setdefault("engine", driver.name)
         return status

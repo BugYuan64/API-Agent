@@ -4,13 +4,16 @@
 为 HTTP 错误，探测失败在结果体中返回，不负责执行模型工具。
 """
 
+import json
 import time
+from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api_agent.infrastructure.api import ApiError
+from api_agent.infrastructure.api import ApiError, LimitParam, OffsetParam, PageInfo, not_found
 from api_agent.infrastructure.database import session_for
 from api_agent.llm.client import (
     LLMAuthenticationError,
@@ -32,6 +35,28 @@ from api_agent.llm.schemas import (
     LLMStatusResponse,
 )
 from api_agent.llm.service import LLMSettingService
+from api_agent.llm.testing import (
+    discover_models,
+    probe_models,
+    probe_models_stream,
+)
+from api_agent.llm.testing_manager import (
+    ModelTestingConfigError,
+    ModelTestManager,
+    ModelTestRunActiveError,
+    resolve_testing_credentials,
+)
+from api_agent.llm.testing_schemas import (
+    ModelDiscoverRequest,
+    ModelDiscoverResponse,
+    ModelProbeRequest,
+    ModelProbeResponse,
+    ModelTestRunDetail,
+    ModelTestRunListItem,
+    ModelTestRunListResponse,
+    ModelTestRunStartRequest,
+    ModelTestSubCaseSnapshot,
+)
 
 router = APIRouter(prefix="/api", tags=["llm"])
 Session = Annotated[AsyncSession, Depends(session_for)]
@@ -172,3 +197,266 @@ async def chat_completion(
         raise ApiError(502, "llm_connection_failed", str(error)) from None
     except LLMResponseError as error:
         raise ApiError(502, "llm_response_error", str(error)) from None
+
+
+def _get_model_tests(request: Request) -> ModelTestManager:
+    """读取或按需初始化挂在 ``app.state.model_tests`` 上的模型探测任务管理器。"""
+    manager = getattr(request.app.state, "model_tests", None)
+    if manager is None:
+        manager = ModelTestManager(request.app.state.database, request.app.state.settings)
+        request.app.state.model_tests = manager
+    return manager
+
+
+async def _resolve_testing_credentials(
+    session: AsyncSession,
+    request: Request,
+    *,
+    raw_base_url: str | None,
+    raw_api_key: str | None,
+    use_saved_key: bool,
+) -> tuple[str, str | None]:
+    """解析模型测试服务的目标地址与临时密钥，严格阻止跨源复用已保存密钥。"""
+    try:
+        target_url, resolved_key, _used_saved, _has_custom = await resolve_testing_credentials(
+            session,
+            request.app.state.settings,
+            base_url=raw_base_url,
+            api_key=raw_api_key,
+            use_saved_key=use_saved_key,
+        )
+    except ModelTestingConfigError as error:
+        raise ApiError(400, error.code, error.message) from None
+    return target_url, resolved_key or None
+
+
+@router.post("/model-testing/discover", response_model=ModelDiscoverResponse)
+async def discover_provider_models(
+    payload: ModelDiscoverRequest, session: Session, request: Request
+) -> ModelDiscoverResponse:
+    """拉取指定 Base URL 与 API Key 下的模型列表并返回初始类型与模态画像。"""
+    target_url, api_key = await _resolve_testing_credentials(
+        session,
+        request,
+        raw_base_url=payload.base_url,
+        raw_api_key=payload.api_key,
+        use_saved_key=payload.use_saved_key,
+    )
+    return await discover_models(
+        target_url,
+        api_key,
+        protocol=payload.protocol,
+        timeout_seconds=payload.timeout_seconds,
+        trust_env=request.app.state.settings.trust_system_proxy,
+    )
+
+
+@router.post("/model-testing/probe", response_model=ModelProbeResponse)
+async def probe_provider_models(
+    payload: ModelProbeRequest, session: Session, request: Request
+) -> ModelProbeResponse:
+    """针对选定模型执行可用性、工具调用、流式响应、结构化输出与输入/输出模态探测。"""
+    target_url, api_key = await _resolve_testing_credentials(
+        session,
+        request,
+        raw_base_url=payload.base_url,
+        raw_api_key=payload.api_key,
+        use_saved_key=payload.use_saved_key,
+    )
+    return await probe_models(
+        target_url,
+        api_key,
+        payload.models,
+        payload.checks,
+        protocol=payload.protocol,
+        timeout_seconds=payload.timeout_seconds,
+        trust_env=request.app.state.settings.trust_system_proxy,
+        concurrency=payload.concurrency,
+    )
+
+
+@router.post("/model-testing/probe/stream")
+async def probe_provider_models_stream(
+    payload: ModelProbeRequest, session: Session, request: Request
+) -> StreamingResponse:
+    """以异步消费队列并发探测所选模型，并通过 NDJSON 实时逐条流式返回单模型结果。"""
+    target_url, api_key = await _resolve_testing_credentials(
+        session,
+        request,
+        raw_base_url=payload.base_url,
+        raw_api_key=payload.api_key,
+        use_saved_key=payload.use_saved_key,
+    )
+    trust_env = request.app.state.settings.trust_system_proxy
+
+    async def stream_lines() -> AsyncIterator[str]:
+        try:
+            async for frame in probe_models_stream(
+                target_url,
+                api_key,
+                payload.models,
+                payload.checks,
+                protocol=payload.protocol,
+                timeout_seconds=payload.timeout_seconds,
+                trust_env=trust_env,
+                concurrency=payload.concurrency,
+            ):
+                yield json.dumps(frame, ensure_ascii=False) + "\n"
+        except Exception as exc:
+            error_frame = {
+                "type": "error",
+                "code": "probe_stream_error",
+                "message": str(exc) or type(exc).__name__,
+            }
+            yield json.dumps(error_frame, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        stream_lines(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/model-testing/runs", response_model=ModelTestRunDetail, status_code=202)
+async def start_model_test_run(
+    payload: ModelTestRunStartRequest,
+    session: Session,
+    request: Request,
+    response: Response,
+) -> ModelTestRunDetail:
+    """启动持久化后台模型探测任务，立即返回初始任务详情，页面切换不中断执行。"""
+    manager = _get_model_tests(request)
+    try:
+        run = await manager.start_manual_run(session, payload)
+    except ModelTestingConfigError as error:
+        raise ApiError(400, error.code, error.message) from None
+    response.headers["Location"] = f"/api/model-testing/runs/{run['id']}"
+    return ModelTestRunDetail.model_validate(run)
+
+
+@router.get("/model-testing/runs/active")
+async def list_active_model_test_runs(request: Request) -> dict[str, list[dict]]:
+    """列出当前仍在后台运行的模型探测任务，供跨页切回时自动重连观察流。"""
+    manager = _get_model_tests(request)
+    return {"items": manager.active_runs()}
+
+
+@router.get("/model-testing/runs", response_model=ModelTestRunListResponse)
+async def list_model_test_runs(
+    request: Request,
+    limit: LimitParam = 50,
+    offset: OffsetParam = 0,
+) -> ModelTestRunListResponse:
+    """分页查询持久化的模型探测历史列表（含手动与 AI 标注信息，不含明文密钥）。"""
+    manager = _get_model_tests(request)
+    rows, total = await manager.repo.list_runs(limit=limit, offset=offset)
+    return ModelTestRunListResponse(
+        items=[ModelTestRunListItem.model_validate(item) for item in rows],
+        page=PageInfo(limit=limit, offset=offset, total=total),
+    )
+
+
+@router.get("/model-testing/runs/{run_id}", response_model=ModelTestRunDetail)
+async def get_model_test_run(run_id: str, request: Request) -> ModelTestRunDetail:
+    """读取单次模型探测任务的完整详情，包括模型画像快照、各轮汇总与子用例列表。"""
+    manager = _get_model_tests(request)
+    run = await manager.repo.get_run(run_id)
+    if run is None:
+        raise not_found("Model test run")
+    return ModelTestRunDetail.model_validate(run)
+
+
+@router.get(
+    "/model-testing/runs/{run_id}/cases/{case_id:path}",
+    response_model=ModelTestSubCaseSnapshot,
+)
+async def get_model_test_sub_case(
+    run_id: str,
+    case_id: str,
+    request: Request,
+) -> ModelTestSubCaseSnapshot:
+    """读取指定模型探测任务中单个子用例的只读回放快照。"""
+    manager = _get_model_tests(request)
+    sub_case = await manager.repo.get_sub_case(run_id, case_id)
+    if sub_case is None:
+        raise not_found("Model test sub-case")
+    return ModelTestSubCaseSnapshot.model_validate(sub_case)
+
+
+@router.get("/model-testing/runs/{run_id}/live")
+async def stream_model_test_run_live(run_id: str, request: Request) -> StreamingResponse:
+    """以可重连 NDJSON 实时订阅后台模型探测进度；客户端断开绝不取消后台任务。"""
+    manager = _get_model_tests(request)
+    if run_id not in manager.live and await manager.repo.get_run(run_id) is None:
+        raise not_found("Model test run")
+
+    async def stream_lines() -> AsyncIterator[str]:
+        try:
+            async for frame in manager.subscribe(run_id):
+                yield json.dumps(frame, ensure_ascii=False) + "\n"
+        except LookupError:
+            error_frame = {
+                "type": "error",
+                "code": "not_found",
+                "message": "Model test run was not found",
+            }
+            yield json.dumps(error_frame, ensure_ascii=False) + "\n"
+        except Exception as exc:  # noqa: BLE001
+            error_frame = {
+                "type": "error",
+                "code": "live_stream_error",
+                "message": str(exc) or type(exc).__name__,
+            }
+            yield json.dumps(error_frame, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        stream_lines(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/model-testing/runs/{run_id}/cancel", response_model=ModelTestRunDetail)
+async def cancel_model_test_run(run_id: str, request: Request) -> ModelTestRunDetail:
+    """显式取消正在运行的模型探测任务，保留已完成子用例并返回最新终态。"""
+    manager = _get_model_tests(request)
+    try:
+        run = await manager.cancel(run_id)
+    except LookupError:
+        raise not_found("Model test run") from None
+    return ModelTestRunDetail.model_validate(run)
+
+
+@router.delete("/model-testing/runs/{run_id}", status_code=204)
+async def delete_model_test_run(run_id: str, request: Request) -> None:
+    """删除单条终态模型探测历史（运行中返回 409），并级联清理关联助手对话线程。"""
+    manager = _get_model_tests(request)
+    try:
+        deleted = await manager.delete_run(run_id)
+    except ModelTestRunActiveError:
+        raise ApiError(409, "model_test_run_active", "请先取消正在运行的模型探测任务") from None
+    if not deleted:
+        raise not_found("Model test run")
+    threads = getattr(request.app.state, "assistant_threads", None)
+    if threads is not None:
+        await threads.delete_thread("model_testing", run_id)
+
+
+@router.delete("/model-testing/runs", status_code=204)
+async def clear_model_test_runs(request: Request) -> None:
+    """清空所有终态模型探测历史记录，并级联清理 ``model_testing`` 作用域助手对话线程。"""
+    manager = _get_model_tests(request)
+    deleted_ids = await manager.clear_terminal_runs()
+    threads = getattr(request.app.state, "assistant_threads", None)
+    if threads is not None:
+        if not manager.active:
+            await threads.clear_scope("model_testing")
+        else:
+            for run_id in deleted_ids:
+                await threads.delete_thread("model_testing", run_id)

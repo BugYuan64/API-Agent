@@ -19,7 +19,13 @@ SCHEMA_METADATA = {"type", "$ref", "$schema", "$id", "required", "format", "patt
 ASSERTION_VALUES = {"expected", "actual", "value"}
 PHONE = re.compile(r"(?<![\d])1[3-9]\d{9}(?![\d])")
 KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
-EMAIL = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+EMAIL = re.compile(
+    r"(?<![A-Za-z0-9_.+-])[A-Za-z0-9_.+-]{1,64}@(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,24}(?![A-Za-z0-9-])"
+)
+TEMPLATE_ONLY_SECRET = re.compile(
+    r"^(?:(?:Bearer|Basic|Token)\s+)?\{\{[A-Za-z_][A-Za-z0-9_]{0,63}\}\}$",
+    re.IGNORECASE,
+)
 
 
 def is_sensitive_pointer(pointer) -> bool:
@@ -47,9 +53,12 @@ class Context:
     def text(self, value: str) -> str:
         """清洗已知秘密、密钥形态、手机号与邮箱，返回文本副本。"""
         value = self.redactor.redact_text(value)
-        value = KEY.sub(REDACTED, value)
+        if "sk-" in value:
+            value = KEY.sub(REDACTED, value)
         value = PHONE.sub("[PHONE]", value)
-        return EMAIL.sub("[EMAIL]", value)
+        if "@" in value:
+            value = EMAIL.sub("[EMAIL]", value)
+        return value
 
     def learn(self, value):
         """Learn labelled/schema/pointer secrets before scrubbing unlabelled echoes."""
@@ -82,6 +91,8 @@ class Context:
                     elif normalized in SENSITIVE_KEYS:
                         if isinstance(item, dict) and SCHEMA_KEYS & item.keys():
                             visit(item, True)
+                        elif isinstance(item, str) and TEMPLATE_ONLY_SECRET.fullmatch(item):
+                            continue
                         else:
                             collect(item)
                     else:
@@ -132,7 +143,10 @@ class Context:
                 normalized = normalize_key(key)
                 is_schema = schema and isinstance(item, dict) and bool(SCHEMA_KEYS & item.keys())
                 if normalized in SENSITIVE_KEYS and not is_schema:
-                    output[str(key)] = REDACTED
+                    if isinstance(item, str) and TEMPLATE_ONLY_SECRET.fullmatch(item):
+                        output[str(key)] = item
+                    else:
+                        output[str(key)] = REDACTED
                 else:
                     output[str(key)] = self.clean(
                         item,

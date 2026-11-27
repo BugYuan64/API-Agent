@@ -168,11 +168,11 @@ async def test_openai_client_ping(tmp_path, target):
 
 async def test_dynamic_llm_settings_api(client, target):
     """验证通过前端控制台配置 API 动态修改与持久化大模型设置（代替 .env 注入）。"""
-    # 1. 默认未启用
+    # 1. 默认开启，未配置 Base URL 时仍不可用
     get_res = await client.get("/api/settings/llm")
     assert get_res.status_code == 200
     config = get_res.json()
-    assert config["enabled"] is False
+    assert config["enabled"] is True
     assert config["has_api_key"] is False
 
     # 2. 未配置时发对话请求应返回 400 明确指引前往系统设置

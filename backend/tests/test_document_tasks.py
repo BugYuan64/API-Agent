@@ -67,10 +67,15 @@ def catalog():
     )
 
 
-async def enable_model(client, monkeypatch, response=None):
+async def enable_model(client, monkeypatch, response=None, *, generation_model=None):
     await client.put(
         "/api/settings/llm",
-        json={"enabled": True, "base_url": "http://127.0.0.1:9101/v1", "model": "fixture"},
+        json={
+            "enabled": True,
+            "base_url": "http://127.0.0.1:9101/v1",
+            "model": "fixture",
+            "generation_model": generation_model,
+        },
     )
 
     async def complete(self, request):
@@ -171,6 +176,7 @@ async def test_mixed_task_executes_original_and_generated_cases_and_exports(
     history_item = (await client.get("/api/tasks")).json()["items"][0]
     assert history_item["id"] == task_id
     assert history_item["title"] == result["title"] == "本地接口文档"
+    assert history_item["origin"] == target.base_url
     assert (await client.delete(f"/api/tasks/{task_id}")).status_code == 204
     assert (await client.get(f"/api/tasks/{task_id}")).status_code == 404
 
@@ -472,7 +478,14 @@ async def test_refills_a_path_parameter_and_regenerates_only_selected_operations
             ]
         }
 
-    await enable_model(client, monkeypatch, draft)
+    await enable_model(client, monkeypatch, draft, generation_model="generator-fixture")
+    original_complete = OpenAIClient.chat_completion
+
+    async def complete(self, request):
+        assert self.model == "generator-fixture"
+        return await original_complete(self, request)
+
+    monkeypatch.setattr(OpenAIClient, "chat_completion", complete)
     previous = {
         "title": "Two routes",
         "endpoints": [
@@ -525,10 +538,11 @@ async def test_refills_a_path_parameter_and_regenerates_only_selected_operations
 async def test_review_chat_streams_after_completion_and_uses_selected_model(
     client, app, monkeypatch
 ):
-    await enable_model(client, monkeypatch)
+    await enable_model(client, monkeypatch, generation_model="generator-fixture")
     seen = []
 
     async def stream(self, payload):
+        assert self.model == "fixture"
         seen.append(payload.model)
         if payload.model:
             assert "测试证据" in payload.messages[1].content
@@ -753,7 +767,7 @@ def test_task_evidence_redaction_and_compaction_keep_bounded_transport_evidence(
     assert compacted["events"][0]["truncated"] is True
 
 
-async def test_write_cases_skipped_by_default_and_scope_rejected(client, target, monkeypatch):
+async def test_write_cases_skipped_by_default_and_scope_rejected(client, app, target, monkeypatch):
     await enable_model(client, monkeypatch)
     payload = {
         "catalog": {"endpoints": [{"path": "/echo", "method": "POST", "body": {"a": 1}}]},
@@ -764,6 +778,7 @@ async def test_write_cases_skipped_by_default_and_scope_rejected(client, target,
     assert result["results"][0]["status"] == "permission_required"
     assert result["results"][0]["reason"] == "write_permission_required"
     assert "evidence" not in result["results"][0]
+    app.state.settings.target_allowed_origins = [target.base_url]
     payload["origin"] = "http://example.com"
     assert (await client.post("/api/tasks", json=payload)).status_code == 400
     payload["origin"] = target.base_url
@@ -881,9 +896,13 @@ async def test_titleless_standard_document_uses_model_title(client, monkeypatch)
     assert response.json()["title"] == "健康检查接口"
 
 
-async def test_chat_history_title_uses_model_summary_and_falls_back_to_question(client, monkeypatch):
+async def test_chat_history_title_uses_model_summary_and_falls_back_to_question(
+    client, monkeypatch
+):
     await enable_model(client, monkeypatch, {"title": "排查 SSE 响应分块"})
-    response = await client.post("/api/tasks/chat/title", json={"question": "为什么这个 SSE 请求分块返回？"})
+    response = await client.post(
+        "/api/tasks/chat/title", json={"question": "为什么这个 SSE 请求分块返回？"}
+    )
     assert response.status_code == 200
     assert response.json() == {"title": "排查 SSE 响应分块"}
 
@@ -983,3 +1002,620 @@ async def test_summary_batches_include_every_result_without_mutating_evidence():
     assert sum(len(call.get("results", [])) for call in calls) == 100
     assert calls[-1]["total_results"] == 100
     assert results[0]["assertions"][0]["actual"] == "y" * 3000
+
+
+async def test_recognize_skips_parameterless_openapi_operation_without_quota_error(
+    client, monkeypatch
+):
+    """OpenAPI 无可变入参的只读接口（如 GET /health）跳过重复 test 生成且保留文档用例。"""
+    seen_paths = []
+
+    def draft(request):
+        operations = json.loads(request.messages[-1].content)["operations"]
+        seen_paths.extend(item["path"] for item in operations)
+        return {
+            "groups": [
+                {
+                    "cases": [
+                        {
+                            "name": "有效提问",
+                            "path": "/ask",
+                            "body": {"question": "CRM 有哪些模块？"},
+                        },
+                        {
+                            "name": "空问题边界",
+                            "path": "/ask",
+                            "body": {"question": ""},
+                        },
+                    ]
+                }
+            ]
+        }
+
+    await enable_model(client, monkeypatch, draft)
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "CRM RAG", "version": "1.0.0"},
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "健康检查",
+                    "responses": {"200": {"description": "ok"}},
+                    "x-test-cases": [
+                        {
+                            "name": "健康检查-不支持方法",
+                            "method": "POST",
+                            "path": "/health",
+                            "assertions": [{"kind": "status", "expected": 405}],
+                        }
+                    ],
+                }
+            },
+            "/ask": {
+                "post": {
+                    "summary": "非流式问答",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["question"],
+                                    "properties": {"question": {"type": "string"}},
+                                },
+                                "example": {"question": "你好"},
+                            }
+                        },
+                    },
+                    "responses": {"200": {"description": "ok"}},
+                }
+            },
+        },
+    }
+    response = await client.post(
+        "/api/tasks/recognize",
+        json={
+            "filename": "CRM-RAG.openapi.json",
+            "text": json.dumps(spec),
+            "tests_per_url": 2,
+        },
+    )
+    assert response.status_code == 200, response.text
+    catalog = response.json()
+    assert seen_paths == ["/ask"]
+    health = next(item for item in catalog["endpoints"] if item["path"] == "/health")
+    ask = next(item for item in catalog["endpoints"] if item["path"] == "/ask")
+    assert health["generated_cases"] == []
+    assert [case["name"] for case in health["cases"]] == ["健康检查-不支持方法"]
+    assert len(ask["generated_cases"]) == 2
+    assert any("GET /health 无可变入参" in warning for warning in catalog["warnings"])
+
+
+def test_openapi_websocket_101_response_recognized_without_status_warning():
+    """OpenAPI WebSocket 端点声明 101 响应时自动生成 status=101 断言且不报未声明成功状态。"""
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "CRM WS", "version": "1.0.0"},
+        "paths": {
+            "/api/ws/chat": {
+                "get": {
+                    "summary": "实时双向对话",
+                    "x-protocol": "websocket",
+                    "x-messages": ['{"type":"ping"}'],
+                    "responses": {
+                        "101": {"description": "Switching Protocols"},
+                        "401": {"description": "Unauthorized"},
+                    },
+                }
+            }
+        },
+    }
+    found = recognize(json.dumps(spec))
+    assert found.warnings == []
+    assert len(found.endpoints) == 1
+    endpoint = found.endpoints[0]
+    assert endpoint.protocol == "websocket"
+    assert endpoint.messages == ['{"type":"ping"}']
+    assert [item.model_dump() for item in endpoint.assertions] == [
+        {"kind": "status", "expected": 101, "pointer": ""}
+    ]
+
+
+async def test_sse_executor_aligns_timeout_with_observation_window(app, monkeypatch):
+    """SSE 执行超时不短于 observation_ms + 5s（上限 60s），避免慢首包在观察期内提前超时。"""
+    from api_agent.tasks.executor import CaseExecutor
+    from api_agent.tasks.schemas import Case, TaskRunOptions
+
+    seen_timeouts = []
+
+    class FakeResult:
+        def model_dump(self, mode="json"):
+            return {
+                "ok": True,
+                "response": {
+                    "status": 200,
+                    "headers": {"content-type": "text/event-stream"},
+                    "body": "data: ok\n\n",
+                    "sse": {
+                        "events": [{"event": "message", "data": "ok"}],
+                        "stop_reason": "eof",
+                    },
+                },
+            }
+
+    async def fake_execute(self, payload, **_kwargs):
+        seen_timeouts.append(payload.timeout_ms)
+        return FakeResult()
+
+    executor = CaseExecutor(app.state.settings, app.state.streams)
+    monkeypatch.setattr(executor.http, "execute", fake_execute.__get__(executor.http))
+    case = Case(
+        name="SSE流式", protocol="sse", method="GET", path="/api/chat/ask/stream?question=hi"
+    )
+
+    assert TaskRunOptions(origin="http://127.0.0.1:8088").timeout_ms == 30_000
+    await executor.execute(
+        case,
+        TaskRunOptions(origin="http://127.0.0.1:8088", timeout_ms=10_000, observation_ms=25_000),
+    )
+    await executor.execute(
+        case,
+        TaskRunOptions(origin="http://127.0.0.1:8088", timeout_ms=10_000, observation_ms=30_000),
+    )
+    await executor.execute(
+        case,
+        TaskRunOptions(origin="http://127.0.0.1:8088", timeout_ms=50_000, observation_ms=10_000),
+    )
+    assert seen_timeouts == [30_000, 35_000, 50_000]
+
+
+def test_redact_body_preserves_compact_json_wire_format():
+    """脱敏 JSON 帧时保留原始紧凑格式，避免 WebSocket/SSE 的 message_contains 断言误判。"""
+    from api_agent.tasks.evidence import TaskEvidence
+
+    raw = '{"type":"welcome","room":"lobby"}'
+    assert TaskEvidence.redact_body(raw) == raw
+    with_secret = '{"type":"welcome","email":"a@example.com","token":"secret-token-value"}'
+    redacted = TaskEvidence.redact_body(with_secret)
+    assert '"type":"welcome"' in redacted
+    assert "secret-token-value" not in redacted
+    assert "a@example.com" not in redacted
+    nested = '{"type":"chat","format":"json","content":"{\\"customKey\\":\\"ok\\"}"}'
+    assert TaskEvidence.redact_body(nested) == nested
+
+
+def test_matches_path_ignores_query_suffix_in_llm_path_template():
+    """模型识别非标准文档误在 path_template 携带查询串时，仍能正确匹配生成的查询变体。"""
+    from api_agent.tasks.generation import DraftInput, bind_case, matches_path, operation_key
+    from api_agent.tasks.schemas import Endpoint
+
+    ep = Endpoint(
+        name="统计接口",
+        method="GET",
+        path="/stats?scope=day",
+        path_template="/stats?scope={scope}",
+    )
+    assert operation_key(ep) == ("http", "GET", "/stats")
+    assert matches_path(ep, "/stats?scope=week") is True
+    case = bind_case(ep, DraftInput(name="按周统计", path="/stats?scope=week"))
+    assert case.path == "/stats?scope=week"
+
+
+def test_draft_input_headers_merge_safely_and_preserve_extract_rules():
+    """DraftInput 支持可选 headers 与 extract，合并时不覆盖端点的敏感鉴权头。"""
+    from pydantic import ValidationError
+
+    from api_agent.tasks.generation import DraftInput, bind_case
+    from api_agent.tasks.schemas import Endpoint, ExtractRule
+
+    endpoint = Endpoint(
+        name="受保护查询",
+        method="GET",
+        path="/items/1",
+        path_template="/items/{id}",
+        headers={"Authorization": "Bearer real-secret", "X-Tenant": "base"},
+    )
+    draft = DraftInput(
+        name="边界查询",
+        path="/items/2",
+        headers={
+            "authorization": "Bearer spoofed",
+            "x-tenant": "override",
+            "X-Test-Mode": "boundary",
+        },
+        extract=[ExtractRule(name="item_id", source="json", pointer="/id")],
+    )
+    bound = bind_case(endpoint, draft)
+    assert bound.headers["Authorization"] == "Bearer real-secret"
+    assert "authorization" not in bound.headers
+    assert bound.headers["x-tenant"] == "override"
+    assert "X-Tenant" not in bound.headers
+    assert bound.headers["X-Test-Mode"] == "boundary"
+    assert len(bound.extract) == 1
+    assert bound.extract[0].name == "item_id"
+
+    with pytest.raises(ValidationError):
+        DraftInput(name="非法保留头", path="/items/3", headers={"Host": "evil.example"})
+
+
+async def test_task_planning_service_recognize_regenerate_and_build_ai_catalog(app):
+    """TaskPlanningService 支持 recognize_and_draft、regenerate_selected 与 build_ai_catalog。"""
+    from api_agent.tasks.generation import DraftBatch
+    from api_agent.tasks.planning import (
+        GeneratedTitle,
+        TaskPlanningService,
+        fill_catalog_title,
+    )
+    from api_agent.tasks.schemas import DocumentInput, RecognizeDocument, RegenerateTests
+
+    seen_calls: list[tuple[str, dict]] = []
+
+    class ScriptedClient:
+        model = "planner-fixture"
+        api_key = None
+
+        async def chat_completion(self, request):
+            payload = json.loads(request.messages[-1].content)
+            system = request.messages[0].content
+            if "task_title" in system or "不加 task: 前缀" in system:
+                seen_calls.append(("task_title", payload))
+                content = {"title": "AI 规划服务"}
+            elif "operations" in payload:
+                seen_calls.append(("task_cases", payload))
+                groups = []
+                for op in payload["operations"]:
+                    base_path = op["path"].split("?", 1)[0]
+                    remaining = op["remaining_cases"]
+                    cases = [
+                        {
+                            "name": f"边界用例-{idx}",
+                            "path": f"{base_path}?case={idx}&seed={len(seen_calls)}",
+                        }
+                        for idx in range(1, remaining + 1)
+                    ]
+                    groups.append({"cases": cases})
+                content = {"groups": groups}
+            else:
+                seen_calls.append(("recognize", payload))
+                content = {
+                    "title": "非标准接口文档",
+                    "server_url": "http://hallucinated.invalid",
+                    "endpoints": [
+                        {
+                            "name": "查询用户",
+                            "method": "GET",
+                            "path": "/users/1",
+                            "path_template": "/users/{id}",
+                        }
+                    ],
+                }
+            return ChatCompletionResponse(
+                id="planner-call",
+                model=self.model,
+                content=json.dumps(content, ensure_ascii=False),
+                finish_reason="stop",
+            )
+
+    agent = AgentService(app.state.settings, ScriptedClient())
+    planner = TaskPlanningService()
+
+    # 1. fill_catalog_title 无需 Request/Session，无模型时平滑回退
+    titleless = Catalog.model_validate({"endpoints": [{"name": "兜底标题", "path": "/ping"}]})
+    await fill_catalog_title(None, titleless)
+    assert titleless.title == "兜底标题"
+
+    titleless_ai = Catalog.model_validate({"endpoints": [{"name": "默认名", "path": "/ping"}]})
+    await fill_catalog_title(agent, titleless_ai)
+    assert titleless_ai.title == "AI 规划服务"
+
+    # 2. recognize_and_draft：非标准文本走 LLM、过滤幻觉 server_url，并透传截断后的 instructions
+    long_instructions = "重点覆盖空值与极值边界。" + ("A" * 2500)
+    recognized = await planner.recognize_and_draft(
+        agent,
+        RecognizeDocument(filename="notes.md", text="GET /users/{id} 查询用户", tests_per_url=2),
+        instructions=long_instructions,
+    )
+    assert recognized.server_url is None
+    assert len(recognized.endpoints) == 1
+    assert len(recognized.endpoints[0].generated_cases) == 2
+    last_case_payload = [payload for stage, payload in seen_calls if stage == "task_cases"][-1]
+    assert last_case_payload["instructions"] == long_instructions[:2000]
+    assert len(last_case_payload["instructions"]) == 2000
+
+    # 3. regenerate_selected：仅重生成选中接口并透传 instructions
+    two_ep_doc = json.dumps(
+        {
+            "title": "双接口",
+            "endpoints": [
+                {"name": "保留接口", "method": "GET", "path": "/keep?v=0"},
+                {"name": "重测接口", "method": "GET", "path": "/items?page=1"},
+            ],
+        }
+    )
+    base = await planner.recognize_and_draft(
+        agent,
+        RecognizeDocument(filename="two.json", text=two_ep_doc, tests_per_url=1),
+    )
+    regenerated = await planner.regenerate_selected(
+        agent,
+        RegenerateTests(
+            catalog=base,
+            document=DocumentInput(filename="two.json", text=two_ep_doc),
+            tests_per_url=2,
+            selected=[1],
+        ),
+        instructions="针对分页接口构造边界参数",
+    )
+    assert regenerated.endpoints[0] == base.endpoints[0]
+    assert len(regenerated.endpoints[1].generated_cases) == 2
+    regen_payload = [payload for stage, payload in seen_calls if stage == "task_cases"][-1]
+    assert regen_payload["instructions"] == "针对分页接口构造边界参数"
+
+    # 4. build_ai_catalog：基于 base_catalog 精炼，严格遵守 tests_per_url（并夹紧 1..10）
+    refined = await planner.build_ai_catalog(
+        agent,
+        origin="http://127.0.0.1:8088",
+        prompt_or_doc="强化异常查询参数覆盖",
+        tests_per_url=3,
+        base_catalog=base,
+        instructions="优先构造负向查询边界",
+    )
+    assert refined.server_url == "http://127.0.0.1:8088"
+    assert all(len(ep.generated_cases) == 3 for ep in refined.endpoints)
+    refine_payload = [payload for stage, payload in seen_calls if stage == "task_cases"][-1]
+    assert "优先构造负向查询边界" in refine_payload["instructions"]
+    assert "强化异常查询参数覆盖" in refine_payload["instructions"]
+
+    # 5. build_ai_catalog：无 base_catalog 时直接从自然语言构建并回填安全 origin 提示
+    built = await planner.build_ai_catalog(
+        agent,
+        origin="http://127.0.0.1:9000",
+        prompt_or_doc="请测试用户查询接口 GET /users/{id}",
+        tests_per_url=0,  # clamped to 1
+        instructions="极简冒烟测试",
+    )
+    assert built.server_url == "http://127.0.0.1:9000"
+    assert len(built.endpoints[0].generated_cases) == 1
+    assert isinstance(GeneratedTitle(title="ok"), GeneratedTitle)
+    assert isinstance(DraftBatch(groups=[]), DraftBatch)
+
+
+async def test_task_manager_multi_round_cooldown_ai_badge_and_crud(app, target):
+    """TaskManager 支持多轮冷却、AI 徽章持久化、wait_for_completion 进度回调与任务管理方法。"""
+    from api_agent.tasks.schemas import StartTask, TaskRunMetadata
+    from api_agent.tasks.service import report
+
+    manager = app.state.tasks
+    agent = AgentService(app.state.settings, None)
+    raw_origin = target.base_url + "/"
+    start_req = StartTask(
+        origin=raw_origin,
+        allow_writes=True,
+        rounds=2,
+        cooldown_ms=150,
+        reset_vars_per_round=True,
+        catalog=Catalog.model_validate(
+            {
+                "title": "多轮 AI 群测",
+                "endpoints": [
+                    {
+                        "name": "获取状态",
+                        "method": "GET",
+                        "path": "/json",
+                        "assertions": [{"kind": "status", "expected": 200}],
+                    },
+                    {
+                        "name": "回显提交",
+                        "method": "POST",
+                        "path": "/echo",
+                        "body": {"hello": "world"},
+                        "assertions": [{"kind": "status", "expected": 200}],
+                    },
+                ],
+            }
+        ),
+    )
+
+    started = manager.start(
+        start_req,
+        agent,
+        metadata=TaskRunMetadata(source="ai", badge="AI 测试", tests_per_url=2),
+    )
+    # _start 不得原地修改入参 request.origin
+    assert start_req.origin == raw_origin
+    task_id = started["id"]
+
+    frames: list[dict] = []
+
+    async def on_progress(frame: dict) -> None:
+        frames.append(frame)
+
+    final = await manager.wait_for_completion(task_id, on_progress=on_progress)
+    assert final["status"] == "completed"
+    assert final["stage"] == "finished"
+    assert final["source"] == "ai"
+    assert final["badge"] == "AI 测试"
+    assert final["total_rounds"] == 2
+    assert final["current_round"] == 2
+    assert final["cooldown_ms"] == 150
+    assert final["cooldown_remaining_ms"] is None
+    assert final["tests_per_url"] == 2
+
+    # snapshot 也持久化了 AI 来源、徽章与多轮配置
+    assert final["snapshot"]["source"] == "ai"
+    assert final["snapshot"]["badge"] == "AI 测试"
+    assert final["snapshot"]["total_rounds"] == 2
+    assert final["snapshot"]["cooldown_ms"] == 150
+    assert final["snapshot"]["tests_per_url"] == 2
+
+    # 观测到 cooling_down 阶段帧
+    assert any(
+        frame.get("stage") == "cooling_down" and (frame.get("cooldown_remaining_ms") or 0) > 0
+        for frame in frames
+    ), frames
+
+    # 2 条用例 × 2 轮 = 4 条执行记录，具备唯一 case_id / round / case_index / execution_index
+    results = final["results"]
+    assert len(results) == 4
+    assert [item["case_id"] for item in results] == ["r1:c0", "r1:c1", "r2:c0", "r2:c1"]
+    assert [item["round"] for item in results] == [1, 1, 2, 2]
+    assert [item["case_index"] for item in results] == [0, 1, 0, 1]
+    assert [item["execution_index"] for item in results] == [0, 1, 2, 3]
+    assert [item["index"] for item in results] == [0, 1, 2, 3]
+    assert all(item["status"] == "passed" for item in results)
+
+    # 报告包含 AI 来源与轮次摘要且保留原标题
+    markdown = report(final)
+    assert markdown.startswith("# API 文档测试总结")
+    assert "AI 测试" in markdown
+    assert "共 2 轮" in markdown
+    assert "[第 1 轮]" in markdown and "[第 2 轮]" in markdown
+
+    # TaskManager 封装的 list_tasks / get_task / delete_task
+    listed = manager.list_tasks(limit=10)
+    entry = next(item for item in listed if item["id"] == task_id)
+    assert entry["source"] == "ai"
+    assert entry["badge"] == "AI 测试"
+    assert entry["origin"] == target.base_url
+    assert entry["total_rounds"] == 2
+    assert entry["cooldown_ms"] == 150
+
+    assert manager.get_task(task_id)["id"] == task_id
+    with pytest.raises(ValueError):
+        manager.get_task("not-a-valid-uuid")
+
+    manager.delete_task(task_id)
+    with pytest.raises(FileNotFoundError):
+        manager.get_task(task_id)
+
+
+async def test_task_manager_cancel_during_cooldown_and_thread_cleanup(client, app, target):
+    """冷却期可立即取消且保留已完成轮次；运行中拒绝删除；删除终态任务同步清理助手线程。"""
+    import time
+
+    from api_agent.tasks.schemas import StartTask
+    from api_agent.tasks.service import TaskActiveError
+
+    manager = app.state.tasks
+    agent = AgentService(app.state.settings, None)
+    start_req = StartTask(
+        origin=target.base_url,
+        rounds=2,
+        cooldown_ms=5000,
+        source="ai",
+        catalog=Catalog.model_validate(
+            {
+                "title": "冷却取消验证",
+                "endpoints": [
+                    {
+                        "name": "单步查询",
+                        "method": "GET",
+                        "path": "/json",
+                        "assertions": [{"kind": "status", "expected": 200}],
+                    }
+                ],
+            }
+        ),
+    )
+    started = manager.start(start_req, agent)
+    task_id = started["id"]
+    assert started["source"] == "ai"
+    assert started["badge"] == "AI 测试"
+
+    entered_cooldown = asyncio.Event()
+
+    def watch(frame: dict) -> None:
+        if frame.get("stage") == "cooling_down":
+            entered_cooldown.set()
+
+    watcher = asyncio.create_task(manager.wait_for_completion(task_id, on_progress=watch))
+    try:
+        async with asyncio.timeout(5):
+            await entered_cooldown.wait()
+
+        # 运行/冷却期间删除必须抛出 TaskActiveError
+        with pytest.raises(TaskActiveError):
+            manager.delete_task(task_id)
+
+        t0 = time.monotonic()
+        cancelled = await manager.cancel(task_id)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.5
+        assert cancelled["status"] == "cancelled"
+        assert cancelled["stage"] == "finished"
+        assert cancelled["error_kind"] == "cancelled"
+        assert cancelled["cooldown_remaining_ms"] is None
+        # 第 1 轮已完成且冷却期间不应伪造第 2 轮 unknown 用例
+        assert len(cancelled["results"]) == 1
+        assert cancelled["results"][0]["case_id"] == "r1:c0"
+        assert cancelled["results"][0]["status"] == "passed"
+
+        waited = await asyncio.wait_for(watcher, timeout=3)
+        assert waited["status"] == "cancelled"
+    finally:
+        if not watcher.done():
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    # 路由层删除终态任务时若存在 assistant_threads 应同步清理对应线程
+    deleted_threads: list[tuple[str, str]] = []
+
+    class FakeThreads:
+        async def delete_thread(self, scope: str, history_id: str) -> bool:
+            deleted_threads.append((scope, history_id))
+            return True
+
+    app.state.assistant_threads = FakeThreads()
+    try:
+        resp = await client.delete(f"/api/tasks/{task_id}")
+        assert resp.status_code == 204
+        assert deleted_threads == [("tasks", task_id)]
+    finally:
+        delattr(app.state, "assistant_threads")
+
+
+async def test_project_document_generate_openapi_for_directory_decoupled(app, tmp_path):
+    """generate_openapi_for_directory 脱离 Request 和弹窗独立生成并保存 OpenAPI 文档。"""
+    from api_agent.projects.document_schema import DocumentEndpoint
+    from api_agent.tasks.project_document import generate_openapi_for_directory
+
+    project = tmp_path / "demo_proj"
+    project.mkdir()
+    (project / "main.py").write_text(
+        "from fastapi import FastAPI\napp = FastAPI()\n@app.get('/ping')\ndef ping(): return {}\n",
+        encoding="utf-8",
+    )
+
+    class FakeDocuments:
+        async def analyze(self, name, snapshot, agent):
+            assert name == "demo_proj"
+            assert snapshot["scanned_files"] >= 1
+            return {
+                "status": "completed",
+                "project_name": name,
+                "processed_files": 1,
+                "total_files": 1,
+                "processed_batches": 1,
+                "total_batches": 1,
+                "scan_complete": True,
+                "endpoints": [
+                    DocumentEndpoint(
+                        method="GET",
+                        path="/ping",
+                        summary="心跳",
+                        description="检测服务可用性",
+                        source_files=["main.py"],
+                        responses=[{"status": "200", "description": "OK"}],
+                    ).model_dump()
+                ],
+                "warnings": [],
+                "issues": [],
+            }
+
+    result = await generate_openapi_for_directory(
+        project, app.state.settings, FakeDocuments(), AgentService(app.state.settings, None)
+    )
+    assert result["filename"].startswith("openapi") and result["filename"].endswith(".json")
+    assert result["partial"] is False
+    assert "/ping" in json.loads(result["text"])["paths"]
+    assert (project / "API" / result["filename"]).is_file()

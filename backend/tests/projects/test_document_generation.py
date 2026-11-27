@@ -132,7 +132,7 @@ async def test_smart_test_writes_openapi_without_a_source_snapshot(
     async def configured_agent(request, session):
         return AgentService(settings, model)
 
-    monkeypatch.setattr(task_routes, "agent_for", configured_agent)
+    monkeypatch.setattr(task_routes, "generation_agent_for", configured_agent)
     monkeypatch.setattr(project_document, "choose_directory", lambda: project)
     transport = httpx.ASGITransport(app=app, client=("127.0.0.1", 12345))
     async with httpx.AsyncClient(transport=transport, base_url="http://localhost") as client:

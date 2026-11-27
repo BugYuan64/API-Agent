@@ -6,8 +6,53 @@ from urllib.parse import urlsplit
 from pydantic import Field, JsonValue, field_validator, model_validator
 
 from api_agent.console.service import ConsoleRequest
+from api_agent.execution.variables import VAR_NAME_PATTERN, VAR_NAME_RE
 from api_agent.infrastructure.api import ApiInput
 from api_agent.infrastructure.json_pointer import is_valid
+from api_agent.infrastructure.logging import is_sensitive_key
+from api_agent.infrastructure.targets import HEADER_NAME
+
+
+class ExtractRule(ApiInput):
+    """从用例响应中提取变量供后续用例通过 `{{name}}` 占位符复用。"""
+
+    name: str = Field(pattern=VAR_NAME_PATTERN)
+    source: Literal["json", "header", "status"] = "json"
+    pointer: str = Field(default="", max_length=250)
+    header_name: str = Field(default="", max_length=100)
+    required: bool = True
+    sensitive: bool = False
+
+    @model_validator(mode="after")
+    def valid_extract(self):
+        """校验提取来源与 JSON Pointer / 响应头字段是否匹配。"""
+        if self.source == "json":
+            if not is_valid(self.pointer) or self.header_name:
+                raise ValueError("json_extract_requires_valid_pointer")
+        elif self.source == "header":
+            if not HEADER_NAME.fullmatch(self.header_name) or self.pointer:
+                raise ValueError("header_extract_requires_header_name")
+        elif self.pointer or self.header_name:
+            raise ValueError("status_extract_forbids_pointer_and_header")
+        return self
+
+
+def _validate_initial_vars(
+    value: dict[str, str | int | float | bool],
+) -> dict[str, str | int | float | bool]:
+    for name, item in value.items():
+        if not VAR_NAME_RE.fullmatch(name):
+            raise ValueError("invalid_variable_name")
+        if is_sensitive_key(name):
+            raise ValueError("sensitive_initial_variable_not_allowed")
+        if isinstance(item, str) and (
+            len(item) > 1024
+            or "{{" in item
+            or "}}" in item
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in item)
+        ):
+            raise ValueError("invalid_variable_value")
+    return value
 
 
 class Check(ApiInput):
@@ -44,6 +89,8 @@ class Case(ApiInput):
     body: JsonValue = None
     messages: list[str] = Field(default_factory=list, max_length=20)
     assertions: list[Check] = Field(default_factory=list, max_length=20)
+    extract: list[ExtractRule] = Field(default_factory=list, max_length=10)
+    always_run: bool = False
     source: Literal["document", "generated"] = "document"
     kind: Literal["contract", "document", "test"] | None = None
 
@@ -90,9 +137,15 @@ class Catalog(ApiInput):
     format: str = "custom"
     title: str | None = Field(default=None, max_length=160)
     server_url: str | None = Field(default=None, max_length=2000)
+    variables: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=20)
     endpoints: list[Endpoint] = Field(default_factory=list, max_length=200)
     cases: list[Case] = Field(default_factory=list, max_length=500)
     warnings: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("variables")
+    @classmethod
+    def safe_variables(cls, value):
+        return _validate_initial_vars(value)
 
     @field_validator("title", mode="before")
     @classmethod
@@ -173,15 +226,32 @@ class RegenerateTests(ApiInput):
     selected: list[int] = Field(min_length=1, max_length=200)
 
 
+class TaskRunMetadata(ApiInput):
+    """Metadata describing the origin, display badge and generation quota of a task run."""
+
+    source: Literal["manual", "ai"] = "manual"
+    badge: str | None = Field(default=None, max_length=40)
+    tests_per_url: int | None = Field(default=None, ge=1, le=10)
+
+
 class TaskRunOptions(ApiInput):
     """Current target and execution settings used for both new and repeated runs."""
 
     origin: str = Field(max_length=2000)
     allow_writes: bool = False
-    timeout_ms: int = Field(default=10000, ge=1000, le=60000)
+    timeout_ms: int = Field(default=30000, ge=1000, le=60000)
     observation_ms: int = Field(default=1000, ge=1000, le=30000)
     max_events: int = Field(default=200, ge=1, le=2000)
     wall_time_seconds: int = Field(default=300, ge=10, le=3600)
+    rounds: int = Field(default=1, ge=1, le=20)
+    cooldown_ms: int = Field(default=500, ge=0, le=60_000)
+    reset_vars_per_round: bool = True
+    variables: dict[str, str | int | float | bool] = Field(default_factory=dict, max_length=20)
+
+    @field_validator("variables")
+    @classmethod
+    def safe_run_variables(cls, value):
+        return _validate_initial_vars(value)
 
 
 class StartTask(TaskRunOptions):
@@ -189,9 +259,20 @@ class StartTask(TaskRunOptions):
 
     catalog: Catalog
     document: DocumentInput | None = None
+    source: Literal["manual", "ai"] = "manual"
+    badge: str | None = Field(default=None, max_length=40)
 
 
 class RerunTask(TaskRunOptions):
     """Optionally replace reviewed inputs at their original snapshot indices."""
 
     case_edits: dict[int, Case] = Field(default_factory=dict, max_length=200)
+    runtime_headers: dict[str, str] = Field(default_factory=dict)
+    source: Literal["manual", "ai"] = "manual"
+    badge: str | None = Field(default=None, max_length=40)
+
+    @field_validator("runtime_headers")
+    @classmethod
+    def safe_runtime_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        """复用交互式请求头策略校验临时重测请求头，绝不落盘持久化明文凭据。"""
+        return ConsoleRequest.safe_headers(value)

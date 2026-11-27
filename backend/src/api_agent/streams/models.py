@@ -44,6 +44,31 @@ class StreamSessionRecord(IdMixin, CreatedAtMixin, Base):
     scheduled_messages: Mapped[list[str] | None] = mapped_column(JSON(none_as_null=True))
     opened_at: Mapped[datetime | None]
     closed_at: Mapped[datetime | None]
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual", server_default="manual"
+    )
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    badge: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    parent_session_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey(
+            "stream_sessions.id",
+            name="fk_stream_sessions_parent_session_id",
+            ondelete="CASCADE",
+        ),
+        nullable=True,
+        index=True,
+    )
+    round_index: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    case_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    case_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cooldown_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=500, server_default="500"
+    )
+    total_rounds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class StreamEventRecord(IdMixin, CreatedAtMixin, Base):

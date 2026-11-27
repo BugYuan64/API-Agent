@@ -21,6 +21,16 @@
 import { ref } from 'vue'
 import { Plus, Trash2 } from 'lucide-vue-next'
 
+/** 历史条目标签语义色，与全局 .tag-* 色板保持一致。 */
+export type HistoryBadgeTone = 'info' | 'success' | 'warning' | 'danger' | 'neutral'
+
+/** 紧随历史标题渲染的轻量徽标（如「AI 测试」「3 轮」）。 */
+export interface HistoryBadge {
+  label: string
+  tone?: HistoryBadgeTone
+  title?: string
+}
+
 /** 共享历史展示条目；source 用于父级分派，raw 仅供插槽访问，列表不感知领域数据结构。 */
 export interface HistoryEntry {
   id: string
@@ -31,6 +41,12 @@ export interface HistoryEntry {
   status: string
   /** 右侧次要信息，通常是相对时间。 */
   meta: string
+  /** 可选的多徽标列表，紧随标题之后渲染且不随长标题截断而坍缩。 */
+  badges?: HistoryBadge[]
+  /** 向后兼容的单徽标文案（如「AI 测试」），未在 badges 中重复时自动展示。 */
+  badge?: string | null
+  /** 后台仍在执行时展示轻量脉冲指示点。 */
+  running?: boolean
   /** 可选的原始记录，供 prefix/actions 插槽渲染调用方特有字段（如 HTTP 方法）。 */
   raw?: unknown
   /** 可选的时间戳（ISO），仅用于合并多来源时排序，不参与展示。 */
@@ -78,6 +94,23 @@ function requestClear(): void {
   emit('clear')
   props.onClear?.()
 }
+
+/** 合并 badges 与向后兼容的单字段 badge，去除空白与重复标签。 */
+function resolveBadges(item: HistoryEntry): HistoryBadge[] {
+  const list: HistoryBadge[] = []
+  if (item.badges?.length) {
+    for (const entry of item.badges) {
+      const label = entry.label.trim()
+      if (!label) continue
+      list.push({ ...entry, label, tone: entry.tone ?? 'info' })
+    }
+  }
+  const single = item.badge?.trim()
+  if (single && !list.some((entry) => entry.label === single)) {
+    list.unshift({ label: single, tone: 'info' })
+  }
+  return list
+}
 </script>
 
 <template>
@@ -112,7 +145,24 @@ function requestClear(): void {
         <div class="history-line">
           <!-- 行首可选标记（如 HTTP 方法色标）；不传则不占位 -->
           <slot name="prefix" :item="item" />
+          <span
+            v-if="item.running"
+            class="history-running-dot"
+            aria-label="运行中"
+            title="后台运行中"
+          />
           <span class="history-label truncate" :title="item.label">{{ item.label }}</span>
+          <span v-if="resolveBadges(item).length" class="history-badges">
+            <span
+              v-for="(badge, badgeIndex) in resolveBadges(item)"
+              :key="`${badge.label}-${badgeIndex}`"
+              class="history-badge"
+              :class="`history-badge-${badge.tone ?? 'info'}`"
+              :title="badge.title ?? badge.label"
+            >
+              {{ badge.label }}
+            </span>
+          </span>
           <!-- 行尾删除：由组件渲染，保证 stop 冒泡与样式绑定 -->
           <span
             v-if="onDelete"
@@ -152,7 +202,8 @@ function requestClear(): void {
   display: flex;
   align-items: center;
   justify-content: flex-start;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 6px 8px;
   padding: 11px 9px 10px 14px;
   flex: none;
 }
@@ -226,6 +277,84 @@ function requestClear(): void {
   min-width: 0;
   font-size: 11.5px;
   color: var(--text-primary);
+}
+
+.history-running-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--info, var(--accent));
+  box-shadow: 0 0 0 2px var(--info-soft, transparent);
+  animation: history-running-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes history-running-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .history-running-dot {
+    animation: none;
+  }
+}
+
+.history-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.history-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.history-badge-info {
+  border-color: var(--info-border);
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+.history-badge-success {
+  border-color: var(--success-border);
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.history-badge-warning {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.history-badge-danger {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.history-badge-neutral {
+  border-color: var(--border-subtle);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
 }
 
 .history-meta {

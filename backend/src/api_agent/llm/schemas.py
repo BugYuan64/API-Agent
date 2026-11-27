@@ -10,6 +10,8 @@ from pydantic import Field, StringConstraints
 
 from api_agent.infrastructure.api import ApiInput, ApiModel
 
+ModelName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+
 
 class FunctionCall(ApiModel):
     """承载模型建议调用的函数名及参数字典，不自动执行或校验函数业务语义。
@@ -104,6 +106,7 @@ class LLMConfigResponse(ApiModel):
     provider: str = "openai"
     base_url: str | None = None
     model: str = "gpt-4o"
+    generation_model: str | None = None
     timeout_seconds: float = 60.0
     has_api_key: bool = False
 
@@ -112,21 +115,22 @@ class LLMConfigUpdate(ApiInput):
     """前端设置页面提交的大模型配置更新体。
 
     实现：``api_key`` 传 None 时仅对同源保留原密钥；空字符串清空密钥；
-    非空字符串更新为新密钥；支持动态修改 base_url 与模型名。
+    非空字符串更新为新密钥。省略 generation_model 时保留原值，null 时跟随对话模型。
     """
 
-    enabled: bool = False
+    enabled: bool = True
     provider: str = "openai"
     base_url: str | None = None
     api_key: str | None = None
-    model: str = Field(default="gpt-4o", min_length=1, max_length=120)
+    model: ModelName = "gpt-4o"
+    generation_model: ModelName | None = None
     timeout_seconds: float = Field(default=60.0, ge=1.0, le=600.0)
 
 
 class LLMModelUpdate(ApiInput):
     """Change the shared model without rewriting any other setting."""
 
-    model: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+    model: ModelName
 
 
 class LLMPingRequest(ApiInput):

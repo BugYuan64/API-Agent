@@ -97,11 +97,11 @@ async def test_engine_status_reports_cli_availability(client):
 async def test_execution_rejects_invalid_plan_before_running(client, target):
     """非法计划返回 400，且不产生任何执行记录。
 
-    实现：把 origin 换成非回环地址，断言错误码是 ``invalid_plan``，
+    实现：把 origin 换成非法协议，断言错误码是 ``invalid_plan``，
     并确认历史仍为空——被拒绝的请求不能污染证据库。
     """
     plan = plan_for(target.base_url)
-    plan["origin"] = "http://example.com"
+    plan["origin"] = "ftp://example.com"
     response = await client.post("/api/executions", json={"plan": plan})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_plan"
@@ -110,12 +110,9 @@ async def test_execution_rejects_invalid_plan_before_running(client, target):
     assert history.json()["items"] == []
 
 
-async def test_execution_rejects_origin_outside_local_allowlist(client, target):
-    """目标 origin 未在允许列表里时应被拒，而不是默认放行。
-
-    实现：默认夹具的 ``target_allowed_origins`` 为空，执行计划要求显式授权，
-    因此这里得到一个 ``origin_not_allowed``；这条用例守住“配置决定范围”的边界。
-    """
+async def test_execution_rejects_origin_outside_local_allowlist(client, app, target):
+    """当显式配置了 TARGET_ALLOWED_ORIGINS 且目标未命中白名单时应被拒。"""
+    app.state.settings.target_allowed_origins = ["http://127.0.0.1:9999"]
     response = await client.post("/api/executions", json={"plan": plan_for(target.base_url)})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "origin_not_allowed"

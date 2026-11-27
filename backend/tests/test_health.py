@@ -18,7 +18,7 @@ def test_health_boots_offline_without_exposing_configuration(tmp_path):
                 "status": "ok",
                 "service": "API-Agent",
                 "version": "0.1.0",
-                "llm_mode": "disabled",
+                "llm_mode": "openai",
             }
             assert "fixture-private" not in response.text
             assert str(tmp_path) not in response.text

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /** 应用顶栏：依赖健康检查 API、引擎共享选择和图标组件，分别显示管理后端及执行引擎状态。探测失败显示未知或异常状态，不替代各页面的业务错误提示。 */
 
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { Activity, ChevronRight, RefreshCw, ServerCog, Settings as SettingsIcon } from 'lucide-vue-next'
 import { engineStatus, getHealth } from '@/api/endpoints'
 import type { EngineStatus } from '@/api/types'
@@ -13,9 +13,26 @@ import { useEngineSelection } from '@/lib/engines'
 const healthError = ref(false)
 const engine = ref<EngineStatus | null>(null)
 const loading = ref(false)
+let engineProbeSeq = 0
 
 /** 顶栏显示“当前选中的引擎”及其状态，而不是写死某一个引擎名称。 */
 const { selected: selectedEngine, refresh: refreshEngineList } = useEngineSelection()
+
+/** 仅按当前选中引擎重新探测状态与版本号，并用单调序号屏蔽乱序返回。 */
+async function refreshSelectedEngine(target: string = selectedEngine.value) {
+  const seq = ++engineProbeSeq
+  engine.value = null
+  try {
+    const result = await engineStatus(target)
+    if (seq === engineProbeSeq && selectedEngine.value === target) {
+      engine.value = result
+    }
+  } catch {
+    if (seq === engineProbeSeq && selectedEngine.value === target) {
+      engine.value = null
+    }
+  }
+}
 
 /** 刷新引擎列表后并行探测管理后端和所选引擎；探测失败各自映射为异常或未知。列表初始化错误向上传播，但始终解除 loading。 */
 async function refresh() {
@@ -24,16 +41,26 @@ async function refresh() {
     // 首次显示时先确保引擎列表（含服务端默认值）已就绪，再按选中项探活，
     // 否则顶栏会一直停在本地默认值上。
     if (!engine.value) await refreshEngineList()
+    const target = selectedEngine.value
+    const seq = ++engineProbeSeq
     const [healthResult, engineResult] = await Promise.allSettled([
       getHealth(),
-      engineStatus(selectedEngine.value),
+      engineStatus(target),
     ])
     healthError.value = healthResult.status === 'rejected'
-    engine.value = engineResult.status === 'fulfilled' ? engineResult.value : null
+    if (seq === engineProbeSeq && selectedEngine.value === target) {
+      engine.value = engineResult.status === 'fulfilled' ? engineResult.value : null
+    }
   } finally {
     loading.value = false
   }
 }
+
+watch(selectedEngine, (next, prev) => {
+  if (next !== prev) {
+    void refreshSelectedEngine(next)
+  }
+})
 
 /** 结合当前引擎元信息与探测结果生成名称、不可用或未知标签；只在已有版本时追加版本号。 */
 const engineLabel = computed(() => {

@@ -103,7 +103,11 @@ class RedactingJsonFormatter(logging.Formatter):
             except (ValueError, RecursionError):
                 pass
             else:
-                return json.dumps(self.redact(structured), ensure_ascii=False)
+                redacted = self.redact(structured)
+                if redacted == structured:
+                    return value
+                separators = (",", ":") if '": ' not in value else None
+                return json.dumps(redacted, ensure_ascii=False, separators=separators)
         for secret in self.secrets:
             value = value.replace(secret, REDACTED)
         value = HEADER_CREDENTIAL.sub(lambda match: f"{match[1]}: {REDACTED}", value)
@@ -115,7 +119,8 @@ class RedactingJsonFormatter(logging.Formatter):
             ),
             value,
         )
-        value = URL_CREDENTIAL.sub(lambda match: f"{match[1]}{REDACTED}@", value)
+        if "@" in value and "://" in value:
+            value = URL_CREDENTIAL.sub(lambda match: f"{match[1]}{REDACTED}@", value)
         return BEARER_CREDENTIAL.sub(f"Bearer {REDACTED}", value)
 
     def redact(self, value):

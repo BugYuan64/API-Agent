@@ -147,7 +147,7 @@ async def list_engines(request: Request):
             status = await driver.status()
         except Exception:  # noqa: BLE001 - 单个驱动异常不能拖垮整个列表
             status = {"available": False, "error_kind": "status_check_failed"}
-        items.append({"id": name, **status, "engine": name})
+        items.append({"id": name, **status, "engine": driver.name})
     return {"items": items, "default": "native"}
 
 

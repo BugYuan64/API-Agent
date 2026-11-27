@@ -28,7 +28,6 @@ from api_agent.execution.service import PlanError
 from api_agent.infrastructure.api import ApiError, not_found
 from api_agent.infrastructure.database import session_for
 from api_agent.infrastructure.outcomes import result_fields
-from api_agent.llm.client import OpenAIClient
 from api_agent.llm.service import LLMSettingService
 
 router = APIRouter(prefix="/api/agent", tags=["AI agent"])
@@ -36,17 +35,24 @@ Session = Annotated[AsyncSession, Depends(session_for)]
 
 
 async def agent_for(request: Request, session: Session) -> AgentService:
-    """根据数据库配置或环境回退构建请求级 AgentService；未启用配置返回 503。"""
-    settings = LLMSettingService(session)
-    record = await settings.get_record()
-    client = (
-        await settings.get_client()
-        if record is not None
-        else OpenAIClient(settings=request.app.state.settings)
-    )
+    """Use the assistant model for chat, summaries and existing agent routes."""
+    return await configured_agent(request, session)
+
+
+async def generation_agent_for(request: Request, session: Session) -> AgentService:
+    """Use the model configured for document and test generation."""
+    return await configured_agent(request, session, for_generation=True)
+
+
+async def configured_agent(
+    request: Request, session: AsyncSession, *, for_generation: bool = False
+) -> AgentService:
+    """Resolve the effective client once and reject unconfigured agents."""
+    settings = request.app.state.settings
+    client = await LLMSettingService(session, settings).get_client(for_generation=for_generation)
     if not client.is_configured:
         raise ApiError(503, "model_not_configured", "请先配置并启用大模型服务")
-    return AgentService(request.app.state.settings, client)
+    return AgentService(settings, client)
 
 
 Agent = Annotated[AgentService, Depends(agent_for)]

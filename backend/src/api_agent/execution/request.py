@@ -14,17 +14,24 @@ _CANONICAL = {"accept": "Accept", "content-type": "Content-Type"}
 
 
 def build_request_headers(
-    plan: ExecutionPlan, case: RequestCase, secrets: dict[str, str]
+    plan: ExecutionPlan,
+    case: RequestCase,
+    secrets: dict[str, str],
+    *,
+    resolved_headers: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """构造一条用例的最终请求头。
 
     实现：先用默认 ``Accept: application/json``，再把用例显式声明的
-    Accept/Content-Type 按规范大小写覆盖回去；有请求体时补 JSON Content-Type；
+    头按规范大小写或原名覆盖回去；有请求体时补 JSON Content-Type；
     计划声明了 ``auth_ref`` 时按 kind 注入 ``Bearer`` 前缀或裸值。
     头名保持规范化写法，取值来自 ``secrets``（调用方保证已校验）。
     """
+    source_headers = case.headers if resolved_headers is None else resolved_headers
     headers = {"Accept": "application/json"}
-    headers.update({_CANONICAL[name.lower()]: value for name, value in case.headers.items()})
+    headers.update(
+        {_CANONICAL.get(name.lower(), name): value for name, value in source_headers.items()}
+    )
     if case.body is not None:
         headers.setdefault("Content-Type", "application/json")
     if plan.auth_ref:
@@ -36,7 +43,15 @@ def build_request_headers(
     return headers
 
 
-def build_request_url(plan: ExecutionPlan, case: RequestCase) -> str:
+def build_request_url(
+    plan: ExecutionPlan,
+    case: RequestCase,
+    *,
+    resolved_path: str | None = None,
+    resolved_query: dict[str, str] | None = None,
+) -> str:
     """拼出 ``origin + path + query``；查询串用 ``urlencode`` 避免手工拼接注入。"""
-    query = "?" + urlencode(case.query) if case.query else ""
-    return f"{plan.origin}{case.path}{query}"
+    path = case.path if resolved_path is None else resolved_path
+    query_map = case.query if resolved_query is None else resolved_query
+    query = "?" + urlencode(query_map) if query_map else ""
+    return f"{plan.origin}{path}{query}"

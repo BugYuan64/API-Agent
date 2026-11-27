@@ -35,6 +35,7 @@ const props = withDefaults(
 
 const emit = defineEmits<{
   'update:size': [value: number]
+  'size-commit': []
   layout: [sizes: { first: number; second: number }]
   resize: [change: { delta: number; remaining: number }]
 }>()
@@ -51,10 +52,13 @@ let startX = 0
 let startY = 0
 let startSize = 0
 let sessionCleanup: (() => void) | null = null
+let moveFrame: number | null = null
+let queuedSize: number | null = null
+let dragChanged = false
 
 const currentSize = computed(() =>
   props.range ? props.size : clampSize({
-    size: requestedSize.value,
+    size: requestedSize.value === Infinity && available.value === 0 ? props.min : requestedSize.value,
     min: props.min,
     maxOther: props.maxOther,
     max: props.max,
@@ -98,24 +102,43 @@ function readAvailable(): void {
   if (size && size > 0) available.value = size
 }
 
-/** 鼠标和键盘共用同一尺寸阈值；只有实际调整才保存偏好。 */
+/** 鼠标和键盘共用同一尺寸阈值；拖动期间只更新显示。 */
 function emitSize(value: number, round = true): void {
   const previous = currentSize.value
   const { min, max } = dragRange.value
   const next = Math.min(max, Math.max(min, round ? Math.round(value) : value))
   if (next === previous) return
-  if (props.range) {
-    emit('update:size', next)
-    return
+  if (!props.range) {
+    const minimumOther = props.resizeMinOther === undefined
+      ? props.fitOther ?? props.minOther
+      : resizeMinOther.value
+    if (available.value < props.min + minimumOther) return
+    requestedSize.value = next
   }
-  const minimumOther = props.resizeMinOther === undefined
-    ? props.fitOther ?? props.minOther
-    : resizeMinOther.value
-  if (available.value < props.min + minimumOther) return
-  requestedSize.value = next
   emit('update:size', next)
-  writeStoredSize(props.persistKey, next)
-  emit('resize', { delta: next - previous, remaining: available.value - next })
+  if (!props.range) emit('resize', { delta: next - previous, remaining: available.value - next })
+  if (dragging.value) dragChanged = true
+  else commitSize()
+}
+
+function commitSize(): void {
+  if (!props.range) writeStoredSize(props.persistKey, requestedSize.value)
+  emit('size-commit')
+}
+
+/** 高频移动仅保留最新位置，避免每条事件都触发 Vue 更新和内容重排。 */
+function flushMove(): void {
+  moveFrame = null
+  if (queuedSize === null) return
+  const next = queuedSize
+  queuedSize = null
+  emitSize(next)
+}
+
+function scheduleSize(value: number): void {
+  queuedSize = value
+  if (moveFrame !== null) return
+  moveFrame = window.requestAnimationFrame(flushMove)
 }
 
 /**
@@ -140,7 +163,7 @@ function bindSession(id: number): void {
       return
     }
     const delta = props.direction === 'horizontal' ? e.clientX - startX : e.clientY - startY
-    emitSize(startSize + delta)
+    scheduleSize(startSize + delta)
   }
   const onUp = (e: PointerEvent) => {
     if (e.pointerId === id) endSession(id)
@@ -158,12 +181,20 @@ function bindSession(id: number): void {
 
 /** 幂等清理长按计时、全局监听与拖动态，释放/取消/卸载共用。 */
 function endSession(id: number): void {
+  if (moveFrame !== null) {
+    window.cancelAnimationFrame(moveFrame)
+  }
+  flushMove()
   window.clearTimeout(holdTimer)
   holdTimer = undefined
   holding.value = false
   dragging.value = false
   if (pointerId === id) pointerId = null
   document.body.classList.remove('split-dragging', 'split-dragging-vertical')
+  if (dragChanged) {
+    dragChanged = false
+    commitSize()
+  }
   sessionCleanup?.()
 }
 

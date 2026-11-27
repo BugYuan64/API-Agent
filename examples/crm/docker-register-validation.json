@@ -1,0 +1,113 @@
+{
+  "schema_version": "1",
+  "origin": "http://127.0.0.1:8088",
+  "allowed_methods": ["POST"],
+  "path_templates": ["/api/user/register"],
+  "max_requests": 6,
+  "requests": [
+    {
+      "id": "register-missing-name",
+      "method": "POST",
+      "path": "/api/user/register",
+      "body": {
+        "email": "apireg-invalid@example.com",
+        "phone": "13900003333",
+        "company": "测试公司",
+        "password": "test123456",
+        "confirmPassword": "test123456"
+      },
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "content_type", "expected": "application/json"},
+        {"kind": "json_equals", "pointer": "/code", "expected": "400"}
+      ]
+    },
+    {
+      "id": "register-invalid-email",
+      "method": "POST",
+      "path": "/api/user/register",
+      "body": {
+        "name": "校验用户",
+        "email": "not-an-email",
+        "phone": "13900003333",
+        "company": "测试公司",
+        "password": "test123456",
+        "confirmPassword": "test123456"
+      },
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "400"}
+      ]
+    },
+    {
+      "id": "register-invalid-phone",
+      "method": "POST",
+      "path": "/api/user/register",
+      "body": {
+        "name": "校验用户",
+        "email": "apireg-invalid@example.com",
+        "phone": "123",
+        "company": "测试公司",
+        "password": "test123456",
+        "confirmPassword": "test123456"
+      },
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "400"}
+      ]
+    },
+    {
+      "id": "register-short-password",
+      "method": "POST",
+      "path": "/api/user/register",
+      "body": {
+        "name": "校验用户",
+        "email": "apireg-invalid@example.com",
+        "phone": "13900003333",
+        "company": "测试公司",
+        "password": "123",
+        "confirmPassword": "123"
+      },
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "400"}
+      ]
+    },
+    {
+      "id": "register-password-mismatch",
+      "method": "POST",
+      "path": "/api/user/register",
+      "body": {
+        "name": "校验用户",
+        "email": "apireg-mismatch@example.com",
+        "phone": "13900003333",
+        "company": "测试公司",
+        "password": "test123456",
+        "confirmPassword": "other654321"
+      },
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "500"},
+        {"kind": "json_equals", "pointer": "/msg", "expected": "两次密码输入不一致"}
+      ]
+    },
+    {
+      "id": "register-duplicate-email",
+      "method": "POST",
+      "path": "/api/user/register",
+      "body": {
+        "name": "重复邮箱",
+        "email": "admin@elcrms.com",
+        "phone": "13900003333",
+        "company": "测试公司",
+        "password": "test123456",
+        "confirmPassword": "test123456"
+      },
+      "assertions": [
+        {"kind": "status", "expected": 200},
+        {"kind": "json_equals", "pointer": "/code", "expected": "500"},
+        {"kind": "json_equals", "pointer": "/msg", "expected": "该邮箱已被注册"}
+      ]
+    }
+  ]
+}

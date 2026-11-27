@@ -21,7 +21,11 @@ class TaskEvidence:
             return Context().text(value)
         context = Context()
         context.learn(parsed)
-        return json.dumps(context.clean(parsed), ensure_ascii=False)
+        cleaned = context.clean(parsed)
+        if cleaned == parsed and context.text(value) == value:
+            return value
+        separators = (",", ":") if '": ' not in value else None
+        return json.dumps(cleaned, ensure_ascii=False, separators=separators)
 
     @staticmethod
     def compact(evidence):

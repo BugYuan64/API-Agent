@@ -33,7 +33,10 @@ server_url 只填写文档明确给出的原样 HTTP(S) 测试基址，不能推
 assertions 支持 status、contains、json_equals(pointer)、event_count(最少事件数)、message_contains。
 缺少预期时不要编造断言。无法识别的部分在 warnings 说明，不声称全部覆盖。""",
     "task_title": """生成一个简短的中文标题，概括这组接口用例的用途，不加 task: 前缀。""",
-    "chat_title": """根据 first user question 概括对话主题，生成简短清晰的中文标题；只总结，不回答问题，不加引号或标签前缀。""",
+    "chat_title": (
+        "根据 first user question 概括对话主题，生成简短清晰的中文标题；"
+        "只总结，不回答问题，不加引号或标签前缀。"
+    ),
     "task_cases": """为每个 operations 条目生成独立的接口功能用例，数量目标是 remaining_cases。
 按 operations 的顺序返回 groups，每组用 cases 给出不同的正常或文档约束边界输入。operations 中的
 path、body 和 messages 是契约示例；existing_inputs 是文档已有或前几轮已接受的请求输入。不要重复

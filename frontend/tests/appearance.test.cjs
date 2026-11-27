@@ -106,16 +106,20 @@ function loadSidebar(storage = memoryStorage()) {
   const route = vue.reactive({ path: '/testcases' })
   const icon = { render: () => vue.h('svg', { class: 'test-icon' }) }
   const icons = Object.fromEntries([
-    'Boxes', 'Braces', 'Cable', 'FolderKanban', 'History', 'ListTree', 'Moon', 'PanelLeftClose',
+    'Boxes', 'Braces', 'Cable', 'Cpu', 'FolderKanban', 'History', 'ListTree', 'Moon', 'PanelLeftClose',
     'PanelLeftOpen', 'Plus', 'SettingsIcon', 'Sun', 'Terminal',
   ].map(name => [name, icon]))
+  const ProjectLogo = {
+    props: ['size'],
+    render: () => vue.h('span', { class: 'signal-logo' }),
+  }
   const RouterLink = {
     props: ['to'],
     setup(props, context) {
       return () => vue.h('a', { ...context.attrs, href: props.to }, context.slots.default?.())
     },
   }
-  const env = { ...vue, ...appearance, ...appearance.copy, ...icons, useRoute: () => route, RouterLink }
+  const env = { ...vue, ...appearance, ...appearance.copy, ...icons, ProjectLogo, useRoute: () => route, RouterLink }
   const scope = vue.effectScope()
   const state = scope.run(() => new Function(...Object.keys(env),
     `${js};return {groups,theme,collapsed,isActive,toggleTheme,toggleCollapsed}`)(...Object.values(env)))
@@ -127,6 +131,7 @@ function loadSidebar(storage = memoryStorage()) {
       const context = vue.proxyRefs({ ...env, ...state })
       const app = vue.createSSRApp({ render: () => render(context, []) })
       app.component('RouterLink', RouterLink)
+      app.component('ProjectLogo', ProjectLogo)
       for (const [name, value] of Object.entries(icons)) app.component(name, value)
       return renderToString(app)
     },
@@ -134,12 +139,16 @@ function loadSidebar(storage = memoryStorage()) {
   }
 }
 
-test('theme and collapse controls do not navigate or remove the collapsed navigation links', async () => {
+test('theme and logo collapse controls do not navigate, remove separate collapse button and show project tooltip bubble', async () => {
   const sidebar = loadSidebar()
   try {
     const expanded = await sidebar.render()
     assert.match(expanded, /aria-label="切换亮色主题"/)
-    assert.match(expanded, /aria-expanded="true"/)
+    assert.match(expanded, /class="brand-trigger"[^>]*aria-expanded="true"|aria-expanded="true"[^>]*class="brand-trigger"/)
+    assert.match(expanded, /class="brand-tooltip"[^>]*role="tooltip"/)
+    assert.match(expanded, /API-Agent · API 工作台/)
+    assert.ok(!expanded.includes('sidebar-toggle'), 'separate hide sidebar button should be removed')
+    assert.ok(!expanded.includes('brand-text'), 'adjacent project name beside logo should be removed')
     assert.match(expanded, /<a\b[^>]*href="\/testcases"[^>]*aria-current="page"|<a\b[^>]*aria-current="page"[^>]*href="\/testcases"/)
     assert.equal([...expanded.matchAll(/aria-current="page"/g)].length, 1)
     sidebar.toggleCollapsed()
@@ -158,15 +167,38 @@ test('theme and collapse controls do not navigate or remove the collapsed naviga
       [...expanded.matchAll(links)].map(match => match[1]))
     assert.ok(!collapsed.includes('href="/executions"'))
     assert.ok(!collapsed.includes('href="/projects"'))
-    for (const label of ['接口测试', '长连接测试', '智能群测', '执行结果', '系统设置']) {
+    for (const label of ['接口测试', '长连接测试', '智能群测', '大模型测试', '执行结果', '系统设置']) {
       assert.ok(collapsed.includes(`title="${label}"`))
       assert.ok(collapsed.includes(`aria-label="${label}"`))
     }
     assert.match(collapsed, /API 工作台/)
+    assert.match(collapsed, /点击展开侧边栏/)
     assert.match(collapsed, /单点测试/)
   } finally {
     sidebar.dispose()
   }
+})
+
+test('project logo uses continuous signal transmission animation and customizable logo/assistant palette defaults', () => {
+  const logoSource = fs.readFileSync(path.join(__dirname, '../src/components/ProjectLogo.vue'), 'utf8')
+  assert.match(logoSource, /@keyframes signal-ring-emit/)
+  assert.match(logoSource, /@keyframes signal-arc-wave/)
+  assert.match(logoSource, /@keyframes signal-core-pulse/)
+  assert.match(logoSource, /var\(--logo-color/)
+
+  const storage = memoryStorage()
+  const api = loadAppearance(storage)
+  assert.equal(api.DEFAULT_PALETTES.dark['assistant-color'], '#22c55e')
+  assert.equal(api.DEFAULT_PALETTES.light['assistant-color'], '#16a34a')
+  assert.ok(api.COLOR_LABELS['logo-color'])
+  assert.ok(api.COLOR_LABELS['assistant-color'])
+  api.document.documentElement.dataset.theme = 'dark'
+  api.savePalette('dark', { ...api.DEFAULT_PALETTES.dark, 'logo-color': '#FF6600', 'assistant-color': '#00AABB' })
+  assert.equal(api.document.documentElement.style.getPropertyValue('--palette-logo-color'), '#FF6600')
+  assert.equal(api.document.documentElement.style.getPropertyValue('--palette-assistant-color'), '#00AABB')
+  api.resetPalette('dark')
+  assert.equal(api.document.documentElement.style.getPropertyValue('--palette-logo-color'), api.DEFAULT_PALETTES.dark['logo-color'])
+  assert.equal(api.document.documentElement.style.getPropertyValue('--palette-assistant-color'), api.DEFAULT_PALETTES.dark['assistant-color'])
 })
 
 test('early head script restores the same theme default before stylesheet loading', () => {

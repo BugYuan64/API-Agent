@@ -56,6 +56,14 @@ function mountSplit(input, storage = memoryStorage(), connection = {}) {
   const mounts = [], cleanup = []
   const scope = vue.effectScope()
   let width = 1200, height = 800
+  let handle = 0
+  const listeners = new Map(), timers = new Map(), frames = new Map()
+  const enqueue = (queue, callback) => { queue.set(++handle, callback); return handle }
+  const flush = queue => {
+    const batch = [...queue.values()]
+    queue.clear()
+    batch.forEach(callback => callback())
+  }
   const env = {
     ...vue, ...loadSplit(storage),
     defineProps: () => props, withDefaults: p => p,
@@ -63,17 +71,25 @@ function mountSplit(input, storage = memoryStorage(), connection = {}) {
       if (event === 'update:size') props.size = value
       if (event === 'layout') connection.onLayout?.(value)
       if (event === 'resize') connection.onResize?.(value)
+      if (event === 'size-commit') connection.onCommit?.()
     },
     onMounted: fn => mounts.push(fn), onBeforeUnmount: fn => cleanup.push(fn),
     ResizeObserver: class { observe() {} disconnect() {} },
-    window: { localStorage: storage },
-    document: { body: { classList: { remove() {} } } },
+    window: {
+      localStorage: storage,
+      setTimeout: callback => enqueue(timers, callback), clearTimeout: id => timers.delete(id),
+      requestAnimationFrame: callback => enqueue(frames, callback), cancelAnimationFrame: id => frames.delete(id),
+      addEventListener: (name, callback) => listeners.set(name, callback), removeEventListener: name => listeners.delete(name),
+    },
+    document: { body: { classList: { add() {}, remove() {} } } },
   }
-  const api = scope.run(() => new Function(...Object.keys(env), `${js};return {root,currentSize,readAvailable,emitSize,keydown}`)(...Object.values(env)))
+  const api = scope.run(() => new Function(...Object.keys(env), `${js};return {root,currentSize,readAvailable,emitSize,keydown,start}`)(...Object.values(env)))
   api.root.value = { getBoundingClientRect: () => ({ width, height }) }
   mounts.forEach(fn => fn())
   return {
     ...api, props, storage,
+    elapseHold: () => flush(timers), paint: () => flush(frames),
+    pointer: (name, clientX) => listeners.get(name)?.({ pointerId: 1, clientX, clientY: 0 }),
     resize: async (value, nextHeight = height) => { width = value; height = nextHeight; api.readAvailable(); await vue.nextTick() },
     dispose: () => { cleanup.forEach(fn => fn()); scope.stop() },
   }
@@ -91,7 +107,7 @@ test('temporary viewport compression preserves saved widths and restores the his
   pane.dispose()
 })
 
-function mountWorkspace() {
+function mountWorkspace(saved = true, initialWidth = 850) {
   const file = fs.readFileSync(path.join(__dirname, '../src/components/TestWorkspace.vue'), 'utf8')
   const script = file.split('<script setup lang="ts">')[1].split('</script>')[0]
     .replace(/import[^\n]+from[^\n]+\r?\n/g, '')
@@ -100,7 +116,7 @@ function mountWorkspace() {
   const layout = loadWorkspaceLayout()
   const mounts = [], cleanup = []
   const scope = vue.effectScope()
-  let width = 850
+  let width = initialWidth
   let notifyResize
   const env = {
     ...vue, ...loadSplit(storage), ...layout, bounds: layout.WORKSPACE_LAYOUT_BOUNDS,
@@ -109,10 +125,12 @@ function mountWorkspace() {
     onMounted: fn => mounts.push(fn), onBeforeUnmount: fn => cleanup.push(fn),
     ResizeObserver: class { constructor(callback) { notifyResize = callback } observe() {} disconnect() {} },
   }
-  storage.setItem('history', '205')
-  storage.setItem('editor', '325')
-  storage.setItem('editor.second', '320')
-  const api = scope.run(() => new Function(...Object.keys(env), `${outputText};return {root,widths,historyRange,editorRange,resizeNeighbor}`)(...Object.values(env)))
+  if (saved) {
+    storage.setItem('history', '205')
+    storage.setItem('editor', '325')
+    storage.setItem('editor.second', '320')
+  }
+  const api = scope.run(() => new Function(...Object.keys(env), `${outputText};return {root,widths,historyRange,editorRange,resizeNeighbor,persistNeighbor,upperHeight}`)(...Object.values(env)))
   api.root.value = { getBoundingClientRect: () => ({ width }) }
   mounts.forEach(fn => fn())
   return {
@@ -141,11 +159,69 @@ test('the shared workspace redistributes width without persisting temporary size
     assert.deepEqual(workspace.widths.value, { history: 200, editor: 660, results: 440 })
     workspace.resizeNeighbor('history', 240)
     assert.deepEqual(workspace.widths.value, { history: 240, editor: 620, results: 440 })
+    assert.equal(workspace.storage.getItem('history'), '205')
+    assert.equal(workspace.storage.getItem('editor'), '325')
+    assert.equal(workspace.storage.getItem('editor.second'), '320')
+    workspace.persistNeighbor()
     assert.equal(workspace.storage.getItem('history'), '240')
     assert.equal(workspace.storage.getItem('editor'), '620')
     assert.equal(workspace.storage.getItem('editor.second'), '440')
   } finally {
     workspace.dispose()
+  }
+})
+
+test('a fresh workspace opens with minimum history width and minimum assistant height', async () => {
+  const workspace = mountWorkspace(false, 2200)
+  const { WORKSPACE_LAYOUT_BOUNDS: bounds } = loadWorkspaceLayout()
+  const pane = mountSplit({ direction: 'vertical', size: workspace.upperHeight.value,
+    min: bounds.upperMinHeight, minOther: bounds.assistantHeight.min,
+    maxOther: bounds.assistantHeight.max, fitOther: bounds.assistantHeight.min })
+  try {
+    workspace.resize(2200)
+    assert.equal(workspace.widths.value.history, bounds.history.min)
+    workspace.resize(1460)
+    assert.equal(workspace.widths.value.history, bounds.history.min)
+    for (const height of [640, 800.25, 1600]) {
+      await pane.resize(1200, height)
+      assert.equal(height - pane.currentSize.value, bounds.assistantHeight.min)
+    }
+  } finally {
+    pane.dispose()
+    workspace.dispose()
+  }
+})
+
+test('fast pointer moves are coalesced and only the final size is saved', () => {
+  const changes = []
+  let commits = 0
+  const pane = mountSplit({ size: 300, persistKey: 'size' }, undefined, {
+    onResize: ({ delta }) => changes.push(delta), onCommit: () => commits++,
+  })
+  try {
+    const start = () => pane.start({ pointerId: 1, button: 0, clientX: 300, clientY: 0, preventDefault() {} })
+    start()
+    pane.pointer('pointerup', 300)
+    assert.equal(commits, 0)
+    start()
+    pane.elapseHold()
+    pane.pointer('pointermove', 330)
+    pane.pointer('pointermove', 350)
+    assert.equal(pane.currentSize.value, 300)
+    pane.paint()
+    assert.deepEqual(changes, [50])
+    assert.equal(pane.storage.getItem('size'), null)
+    pane.pointer('pointermove', 370)
+    pane.pointer('pointerup', 370)
+    pane.paint()
+    assert.deepEqual(changes, [50, 20])
+    assert.equal(pane.storage.getItem('size'), '370')
+    assert.equal(commits, 1)
+    pane.keydown({ key: 'ArrowRight', preventDefault() {} })
+    assert.equal(pane.storage.getItem('size'), '380')
+    assert.equal(commits, 2)
+  } finally {
+    pane.dispose()
   }
 })
 
@@ -381,6 +457,9 @@ test('the three test pages use the shared history, editor, results and assistant
   }
   const source = fs.readFileSync(path.join(__dirname, '../src/components/TestWorkspace.vue'), 'utf8')
   assert.match(source, /direction="vertical"[\s\S]*?:max-other="bounds.assistantHeight.max"[\s\S]*?#first[\s\S]*?slot name="editor"[\s\S]*?slot name="results"[\s\S]*?slot name="assistant"/)
+  const consoleSource = fs.readFileSync(path.join(__dirname, '../src/views/RequestConsole.vue'), 'utf8')
+  assert.match(consoleSource, /<HistoryList[\s\S]*?:on-delete="removeHistoryById"/)
+  assert.doesNotMatch(consoleSource, /<HistoryList[\s\S]*?:on-clear=/)
 })
 
 
@@ -398,12 +477,13 @@ test('the settings page is a scrollable long form', () => {
 
 test('model field shows exactly one control', () => {
   const src = fs.readFileSync(path.join(__dirname, '../src/views/SettingsView.vue'), 'utf8')
-  const row = src.slice(src.indexOf('<div class="model-input-row">'), src.indexOf('<span class="field-hint">', src.indexOf('<div class="model-input-row">')))
-  // 回归来源：拉取模型列表后文本框与下拉框同时出现，等于两个输入点。
-  // 约定：二者互斥——有列表时只给下拉框，无列表时只给文本框。
-  // select 与 input 互为 v-if / v-else：同一时刻只渲染一个控件。
-  assert.match(row, /<select\s+\s*v-if="availableModels\.length > 0"/)
-  assert.match(row, /<input\s+\s*v-else/)
+  const picker = fs.readFileSync(path.join(__dirname, '../src/components/ModelPicker.vue'), 'utf8')
+  assert.match(picker, /<select\s+v-if="models\.length"/)
+  assert.match(picker, /<input[\s\S]*?v-else/)
+  const generation = src.slice(src.indexOf('class="field field-full">', src.indexOf('class="model-action-group"')), src.indexOf('<!-- 超时时间 -->'))
+  assert.match(generation, /:checked="form\.customGenerationModel"/)
+  assert.match(generation, /:disabled="!form\.customGenerationModel"/)
+  assert.match(src, /generation_model: override/)
 })
 
 test('every engine card exposes a config entry that opens a modal', () => {

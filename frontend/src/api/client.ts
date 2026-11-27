@@ -123,7 +123,9 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     if (controller.signal.aborted) throw aborted()
     if (!response.ok) {
       if (acceptResultErrors && isResultError(payload, response.status)) return payload as T
-      const shaped = payload as { error?: { code: string; message: string; details?: []; request_id?: string } } | null
+      const shaped = payload as {
+        error?: { code: string; message: string; details?: { field: string; reason: string }[]; request_id?: string }
+      } | null
       const detail = shaped?.error
       throw new ApiError(
         response.status,
@@ -150,8 +152,14 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 /** 把任意异常转成一句可展示的中文说明，避免页面各自判断类型。 */
 export function describeError(error: unknown): string {
   if (error instanceof ApiError) {
+    const details = Array.isArray(error.details)
+      ? error.details
+        .map(item => [item.field, item.reason].filter(Boolean).join(': '))
+        .filter(Boolean)
+        .join('；')
+      : ''
     const suffix = error.requestId ? `（request_id ${error.requestId.slice(0, 8)}）` : ''
-    return `${error.message}${suffix}`
+    return details ? `${error.message}：${details}${suffix}` : `${error.message}${suffix}`
   }
   if (error instanceof Error) return error.message
   return String(error)

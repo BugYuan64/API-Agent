@@ -425,24 +425,25 @@ def test_postman_timeout_aggregation_respects_error_and_unknown_evidence(second_
 @pytest.mark.parametrize(
     ("error", "code", "number"),
     [
-        (httpx.ReadTimeout("PRIVATE_TRANSPORT_DETAIL"), "REQUEST_TIMEOUT", 504),
-        (httpx.ConnectError("PRIVATE_TRANSPORT_DETAIL"), "CONNECTION_FAILED", 502),
+        (TimeoutError("PRIVATE_TRANSPORT_DETAIL"), "REQUEST_TIMEOUT", 504),
+        (ConnectionError("PRIVATE_TRANSPORT_DETAIL"), "CONNECTION_FAILED", 502),
         (ssl.SSLError("PRIVATE_CERTIFICATE_DETAIL"), "TLS_ERROR", 502),
     ],
 )
 async def test_stream_transport_failures_have_fixed_safe_outcomes(
     client, app, monkeypatch, error, code, number
 ):
-    """SSE 未取得响应的传输异常应分类并安全保存，不能回显异常原文。"""
+    """WebSocket 未取得响应的传输异常应分类并安全保存，不能回显异常原文。"""
 
     async def fail(*args, **kwargs):
         """替换网络读取边界，保留真实后台任务、落库和接口读取链。"""
         raise error
 
-    monkeypatch.setattr(app.state.streams, "_run_sse", fail)
+    monkeypatch.setattr(app.state.streams, "_run_websocket", fail)
     response = await client.post(
-        "/api/streams", json={"kind": "sse", "url": "http://127.0.0.1:9/events"}
+        "/api/streams", json={"kind": "websocket", "url": "ws://127.0.0.1:9/ws"}
     )
+    assert response.status_code == 202
     stream_id = response.json()["id"]
     stream = app.state.streams.active.get(stream_id) or app.state.streams.history[stream_id]
     if stream.task is not None:
