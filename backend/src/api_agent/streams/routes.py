@@ -32,6 +32,8 @@ from api_agent.streams.schemas import (
     StreamSubCaseReplayResponse,
     StreamSubCaseSummary,
     StreamSuiteStatusResponse,
+    effective_sub_case_status,
+    sub_case_notes,
 )
 from api_agent.streams.service import StreamManager
 from api_agent.streams.state import serialize_event, serialize_stream
@@ -175,6 +177,8 @@ async def read_session_sub_case(session_id: str, case_id: str, request: Request)
     sanitize_stream(record)
     events = await repo.list_events(record.id, after=0, limit=2000)
     label = record.case_label or f"第 {record.round_index} 轮 · 用例 {record.case_index + 1}"
+    effective_status = effective_sub_case_status(record)
+    notes = sub_case_notes(record)
     return StreamSubCaseReplayResponse(
         session_id=session_id,
         case_id=record.id,
@@ -183,13 +187,17 @@ async def read_session_sub_case(session_id: str, case_id: str, request: Request)
         case_label=record.case_label,
         label=label,
         readonly=True,
+        transport_status=record.status,
+        notes=notes,
         inputs=StreamReplayInputs(
             url=record.url,
             request_headers=record.request_headers,
             subprotocols=(record.settings or {}).get("subprotocols", []),
             scheduled_messages=record.scheduled_messages,
         ),
-        session=StreamSessionResponse.model_validate(_stored_state(record)),
+        session=StreamSessionResponse.model_validate(
+            _stored_state(record, status_override=effective_status)
+        ),
         events=[
             StreamEventResponse(
                 session_id=row.session_id,
@@ -357,16 +365,30 @@ def _stored_state(
     *,
     sub_case_count: int = 0,
     suite_active: bool = False,
+    status_override: str | None = None,
 ) -> dict:
     """把数据库里的会话行转成与内存会话一致的序列化形状。
 
     实现：数据库行没有 ``finished`` 派生字段，这里按状态补上；
     未在活跃套件中且非终态的记录（进程崩溃遗留行）视为已结束。
+    子用例只读回放可通过 ``status_override`` 传入持久化裁定状态（如 passed/failed）。
     """
-    terminal = record.status in {"closed", "completed", "error", "cancelled", "interrupted"}
+    terminal = record.status in {
+        "closed",
+        "completed",
+        "passed",
+        "failed",
+        "error",
+        "cancelled",
+        "interrupted",
+    }
     if suite_active:
         status = record.status
         finished = False
+        stop_reason = record.stop_reason
+    elif status_override is not None:
+        status = status_override
+        finished = True
         stop_reason = record.stop_reason
     elif terminal:
         status = record.status
@@ -451,13 +473,7 @@ def _history_item(record: StreamSessionRecord, sub_case_count: int) -> StreamHis
 def _sub_case_summary(record: StreamSessionRecord) -> StreamSubCaseSummary:
     """将子会话 ORM 行投影为前端列表可用的子用例摘要（优先采用已持久化的断言裁定状态）。"""
     label = record.case_label or f"第 {record.round_index} 轮 · 用例 {record.case_index + 1}"
-    stored_status = (record.settings or {}).get("case_status")
-    effective_status = (
-        stored_status
-        if isinstance(stored_status, str)
-        and stored_status in {"passed", "failed", "error", "cancelled", "interrupted"}
-        else record.status
-    )
+    effective_status = effective_sub_case_status(record)
     return StreamSubCaseSummary(
         id=record.id,
         parent_session_id=record.parent_session_id or "",
@@ -478,6 +494,7 @@ def _sub_case_summary(record: StreamSessionRecord) -> StreamSubCaseSummary:
         byte_count=record.byte_count,
         sent_count=record.sent_count,
         truncated_count=record.truncated_count,
+        notes=sub_case_notes(record),
         opened_at=record.opened_at,
         closed_at=record.closed_at,
         created_at=record.created_at,

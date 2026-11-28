@@ -63,7 +63,12 @@ const documentInput = ref<TaskDocument | null>(tasksStore?.document ?? null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const resultTreeRef = ref<{ focusCase: (caseId: string) => boolean } | null>(null)
 const filename = ref(tasksStore?.filename ?? '')
+const documentSourceId = ref<string | null>(tasksStore?.documentSourceId ?? null)
 const displayedFilename = computed(() => filename.value || replaySource.value?.snapshot.document?.filename || '')
+const documentDownloadId = computed(() => {
+  if (replaySource.value?.snapshot.document) return replaySource.value.id
+  return documentSourceId.value && displayedFilename.value ? documentSourceId.value : null
+})
 const generating = ref(false)
 const generationError = ref('')
 const editing = ref(false)
@@ -100,7 +105,7 @@ const replayDraft = computed(() => {
 const savedInterfaceCount = computed(() => replayDraft.value ? buildTaskResultTree(replayDraft.value, []).length : 0)
 const total = computed(() => catalog.value ? catalog.value.cases.length + catalog.value.endpoints.reduce((sum, endpoint) => sum + 1 + (endpoint.cases?.length ?? 0) + (endpoint.generated_cases?.length ?? 0), 0) : 0)
 const draftLocked = computed(() => busy.value || loadingHistory.value || running.value || generating.value || creatingDocument.value || isReadOnlyReplay.value)
-const hasDocument = computed(() => !!(documentInput.value || replaySource.value?.snapshot.document))
+const hasDocument = computed(() => !!(documentInput.value || replaySource.value?.snapshot.document || (documentSourceId.value && displayedFilename.value)))
 const hasOperations = computed(() => !!(catalog.value ? catalog.value.endpoints.length : savedInterfaceCount.value))
 const progress = computed(() => run.value ? taskProgress(run.value.status) : null)
 const outcomes = computed(() => countCaseOutcomes(run.value?.results ?? []).filter(item => item.count > 0))
@@ -227,6 +232,7 @@ function persistToStore() {
   tasksStore.catalog = catalog.value
   tasksStore.document = documentInput.value
   tasksStore.filename = filename.value
+  tasksStore.documentSourceId = documentSourceId.value
   tasksStore.run = run.value
   tasksStore.activeTaskId = run.value?.id ?? null
   tasksStore.replaySource = replaySource.value
@@ -271,12 +277,32 @@ function exitReadonlyReplay() {
 }
 
 watch(
-  [origin, urlPrefix, catalog, documentInput, filename, run, replaySource, replayEdits, resultsCleared, draftVersion, readonlyReplay],
+  [origin, urlPrefix, catalog, documentInput, filename, documentSourceId, run, replaySource, replayEdits, resultsCleared, draftVersion, readonlyReplay],
   () => {
     if (!disposed) persistToStore()
   },
   { flush: 'sync' },
 )
+
+/** Best-effort preload of a history attachment so unlock/retest/delete flows keep its document text. */
+async function prefetchHistoryDocument(taskId: string, docFilename: string, workspace: number) {
+  if (typeof readTaskDocument !== 'function' || !taskId || !docFilename) return
+  try {
+    const text = await readTaskDocument(taskId)
+    if (
+      disposed ||
+      workspace !== workspaceGeneration ||
+      documentSourceId.value !== taskId ||
+      documentInput.value
+    ) {
+      return
+    }
+    documentInput.value = { filename: docFilename, text }
+    filename.value = docFilename
+  } catch {
+    // Best-effort preload only; explicit actions surface fetch errors via sourceDocument().
+  }
+}
 
 /** Invalidate in-flight observations before switching records or leaving this page. */
 function stopPolling() { generation++; window.clearTimeout(timer); abort?.abort(); loadingHistory.value = false }
@@ -335,7 +361,9 @@ async function openHistory(
       resultsCleared.value = false
       catalog.value = null
       documentInput.value = null
-      filename.value = ''
+      const attachment = record.snapshot.document
+      filename.value = attachment?.filename ?? ''
+      documentSourceId.value = attachment ? record.id : null
       replaySource.value = null
       replayEdits.value = {}
       generationError.value = ''
@@ -343,9 +371,20 @@ async function openHistory(
       urlPrefix.value = ''
       editing.value = false
       stopSelection()
-      if (record.snapshot.origin && record.snapshot.cases.length) {
+      if (record.snapshot.cases.length) {
         replaySource.value = record
-        origin.value = record.snapshot.origin
+        origin.value = record.snapshot.origin || record.origin || ''
+      }
+      if (attachment) {
+        void prefetchHistoryDocument(record.id, attachment.filename, workspaceGeneration)
+      }
+    } else {
+      if (replaySource.value?.id === record.id) {
+        replaySource.value = record
+      }
+      if (record.snapshot.document) {
+        if (!filename.value) filename.value = record.snapshot.document.filename
+        if (!documentSourceId.value) documentSourceId.value = record.id
       }
     }
     persistToStore()
@@ -388,6 +427,10 @@ function testAgain() {
   const sourceSnapshot = replayDraft.value ?? run.value?.snapshot
   const sourceTitle = replaySource.value?.title ?? run.value?.title
   const nextOrigin = targetBase.value || origin.value || sourceSnapshot?.origin || ''
+  const nextFilename = filename.value || sourceSnapshot?.document?.filename || ''
+  const nextDocumentSourceId = documentSourceId.value
+    ?? (replaySource.value?.snapshot.document ? replaySource.value.id : null)
+    ?? (run.value?.snapshot.document ? run.value.id : null)
 
   exitReadonlyReplay()
   if (!catalog.value && sourceSnapshot && sourceSnapshot.cases.length) {
@@ -395,6 +438,13 @@ function testAgain() {
   }
   replaySource.value = null
   replayEdits.value = {}
+  filename.value = nextFilename
+  documentSourceId.value = nextDocumentSourceId
+  if (!nextFilename) {
+    documentInput.value = null
+  } else if (!documentInput.value && nextDocumentSourceId) {
+    void prefetchHistoryDocument(nextDocumentSourceId, nextFilename, workspaceGeneration)
+  }
   generationError.value = ''
   generating.value = false
   editing.value = false
@@ -430,6 +480,7 @@ function newTest() {
   replayEdits.value = {}
   documentInput.value = null
   filename.value = ''
+  documentSourceId.value = null
   generationError.value = ''
   generating.value = false
   editing.value = false
@@ -535,6 +586,7 @@ async function upload(event: Event) {
   catalog.value = null
   replaySource.value = null
   replayEdits.value = {}
+  documentSourceId.value = null
   filename.value = file.name
   documentInput.value = null
   generationError.value = ''
@@ -557,7 +609,15 @@ async function sourceDocument(signal?: AbortSignal) {
   if (documentInput.value) return documentInput.value
   const source = replaySource.value
   const attachment = source?.snapshot.document
-  return source && attachment ? { filename: attachment.filename, text: await readTaskDocument(source.id, signal) } : undefined
+  const sourceId = attachment ? source!.id : documentSourceId.value
+  const docFilename = attachment?.filename || filename.value
+  if (!sourceId || !docFilename) return undefined
+  const loaded = { filename: docFilename, text: await readTaskDocument(sourceId, signal) }
+  if (!disposed) {
+    documentInput.value = loaded
+    filename.value = loaded.filename
+  }
+  return loaded
 }
 
 /** Prepare changes atomically; generation failures never erase an existing draft. */
@@ -628,6 +688,7 @@ function newDocumentDraft(document: TaskDocument) {
   catalog.value = null
   replaySource.value = null
   replayEdits.value = {}
+  documentSourceId.value = null
   documentInput.value = document
   filename.value = document.filename
 }
@@ -720,9 +781,21 @@ async function submit() {
         replayEdits.value = {}
         if (imported) {
           catalog.value = null
-          documentInput.value = null
-          filename.value = ''
         }
+      }
+      if (document) {
+        documentInput.value = document
+        filename.value = document.filename
+        documentSourceId.value = record.snapshot.document ? record.id : documentSourceId.value
+      } else if (source) {
+        filename.value = record.snapshot.document?.filename ?? ''
+        documentSourceId.value = record.snapshot.document ? record.id : null
+        if (!record.snapshot.document) {
+          documentInput.value = null
+        }
+      } else if (record.snapshot.document) {
+        filename.value = record.snapshot.document.filename
+        documentSourceId.value = record.id
       }
       resultsCleared.value = false
       persistToStore()
@@ -768,10 +841,17 @@ async function removeHistory(id: string) {
     if (workspace === workspaceGeneration && readonlyReplay.value?.historyId === id) {
       exitReadonlyReplay()
     }
+    if (workspace === workspaceGeneration && documentSourceId.value === id) {
+      documentSourceId.value = null
+    }
     if (workspace === workspaceGeneration && replaySource.value?.id === id) {
       replaySource.value = null
       replayEdits.value = {}
       editing.value = false
+      if (!catalog.value) {
+        documentInput.value = null
+        filename.value = ''
+      }
     }
     if (workspace === workspaceGeneration && run.value?.id === id) {
       stopPolling()
@@ -862,7 +942,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
           <div class="upload">
-            <a v-if="replaySource?.snapshot.document" class="document-name" :href="'/api/tasks/' + replaySource.id + '/document'" :title="displayedFilename" download>{{ displayedFilename }}</a>
+            <a v-if="documentDownloadId && displayedFilename" class="document-name" :href="'/api/tasks/' + documentDownloadId + '/document'" :title="displayedFilename" download>{{ displayedFilename }}</a>
             <span v-else class="document-name" :title="displayedFilename || '支持 JSON、YAML、Markdown 和文本，最多一个文档，最大 512 KiB'">{{ displayedFilename || '未上传接口文档' }}</span>
             <input ref="fileInput" type="file" accept=".json,.yaml,.yml,.md,.txt" hidden @change="upload" />
             <button class="btn btn-sm" type="button" :disabled="draftLocked || editing || selecting" @click="fileInput?.click()">上传文档</button>
@@ -927,7 +1007,7 @@ onBeforeUnmount(() => {
           <details class="settings"><summary>设置</summary>
             <TestSettingsFields group="task" :disabled="running || isReadOnlyReplay" :generation-locked="draftLocked || editing" />
           </details>
-          <div class="actions"><button class="btn btn-primary" :disabled="(catalog ? !total : !replaySource) || !targetBase || draftLocked || editing || selecting" @click="submit"><AppIcon name="play" />{{ replaySource ? '再次测试' : '开始测试' }}</button><button v-if="running" class="btn" :disabled="busy || run?.stage === 'summarizing'" @click="cancel">取消任务</button></div>
+          <div class="actions"><button class="btn btn-primary" :disabled="(catalog ? !total : !replaySource) || !targetBase || draftLocked || editing || selecting" @click="submit"><AppIcon name="play" />开始测试</button><button v-if="running" class="btn" :disabled="busy || run?.stage === 'summarizing'" @click="cancel">取消任务</button></div>
         </section>
       </template>
       <template #results>

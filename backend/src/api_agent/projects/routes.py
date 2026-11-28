@@ -11,9 +11,11 @@ from api_agent.projects.schemas import (
     EnvironmentCreate,
     EnvironmentHistoryResponse,
     EnvironmentResponse,
+    EnvironmentRollback,
     EnvironmentUpdate,
     ProjectCreate,
     ProjectResponse,
+    ProjectUpdate,
 )
 from api_agent.projects.service import ProjectService
 
@@ -56,6 +58,18 @@ async def get_project(project_id: str, session: Session):
     实现：直接透传给服务层；不存在时服务层抛 ``not_found``，由全局处理器渲染 404。
     """
     return await ProjectService(session).get_project(project_id)
+
+
+@router.put("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project(project_id: str, data: ProjectUpdate, session: Session):
+    """更新项目名称或说明；不存在返回 404，重名返回 409。"""
+    return await ProjectService(session).update_project(project_id, data)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+async def delete_project(project_id: str, session: Session):
+    """删除项目及其下属环境与历史版本；不存在返回 404。"""
+    await ProjectService(session).delete_project(project_id)
 
 
 @router.post(
@@ -115,3 +129,9 @@ async def update_environment(environment_id: str, data: EnvironmentUpdate, sessi
     版本不匹配或并发抢先时返回 409，前端需重新拉取最新版本再改。
     """
     return await ProjectService(session).update_environment(environment_id, data)
+
+
+@router.post("/environments/{environment_id}/rollback", response_model=EnvironmentResponse)
+async def rollback_environment(environment_id: str, data: EnvironmentRollback, session: Session):
+    """将环境配置回滚到指定历史版本（追加新版本并前移指针，不改写既有版本记录）。"""
+    return await ProjectService(session).rollback_environment(environment_id, data)

@@ -126,3 +126,68 @@ test('all 4 workbenches enable hide-history-on-narrow, wrap toolbars cleanly, an
   })
   assert.equal(engines.engineMeta('postman-cli').name, 'Postman CLI 引擎')
 })
+
+test('AppTopbar syncs version immediately from activeEngine cache before async status resolves', async () => {
+  const sfc = fs.readFileSync(path.join(__dirname, '../src/components/AppTopbar.vue'), 'utf8')
+  const script = sfc.split('<script setup lang="ts">')[1].split('</script>')[0]
+    .replace(/import[^\n]+from[^\n]+\r?\n/g, '')
+  const { outputText } = ts.transpileModule(script, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  })
+  const selected = vue.ref('native')
+  const engines = vue.ref([
+    { id: 'native', available: true, version: '1.1.0', engine: 'native' },
+    { id: 'postman', available: true, version: '1.82.0', engine: 'postman-cli' },
+  ])
+  const activeEngine = vue.computed(() => engines.value.find(item => item.id === selected.value) ?? null)
+  let resolveSlowProbe
+  const scope = vue.effectScope()
+  const env = {
+    ...vue,
+    getHealth: async () => ({ status: 'ok' }),
+    engineStatus: id => {
+      if (id === 'postman') {
+        return new Promise(resolve => {
+          resolveSlowProbe = resolve
+        })
+      }
+      return Promise.resolve({ available: true, version: '1.1.0', engine: 'native' })
+    },
+    engineMeta: id => ({ name: id === 'postman' ? 'Postman CLI 引擎' : '本地原生引擎' }),
+    useEngineSelection: () => ({ selected, activeEngine, refresh: async () => {} }),
+    onMounted: () => {},
+  }
+  const api = scope.run(() =>
+    new Function(...Object.keys(env), `${outputText}; return { engineLabel, refresh }`)(...Object.values(env)),
+  )
+  await api.refresh()
+  assert.equal(api.engineLabel.value, '本地原生引擎 v1.1.0')
+
+  // Switch to postman: even while slow CLI probe is still pending, cached activeEngine version renders immediately.
+  selected.value = 'postman'
+  await vue.nextTick()
+  assert.equal(api.engineLabel.value, 'Postman CLI 引擎 v1.82.0')
+
+  // Once async probe finishes with an updated version, topbar reflects it too.
+  resolveSlowProbe({ available: true, version: '1.83.0', engine: 'postman-cli' })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(api.engineLabel.value, 'Postman CLI 引擎 v1.83.0')
+  scope.stop()
+})
+
+test('ModelTestingView pins col-actions sticky right and RequestConsole/LongConnection wrap narrow toolbars', () => {
+  const mt = fs.readFileSync(path.join(__dirname, '../src/views/ModelTestingView.vue'), 'utf8')
+  assert.match(mt, /:editor-width="320"/)
+  assert.match(mt, /\.col-actions\s*\{[\s\S]*?position:\s*sticky;[\s\S]*?right:\s*0;/)
+
+  const req = fs.readFileSync(path.join(__dirname, '../src/views/RequestConsole.vue'), 'utf8')
+  assert.match(req, /\.request-head\s*\{[\s\S]*?flex-wrap:\s*wrap/)
+  assert.match(req, /\.url-bar\s*\{[\s\S]*?flex-wrap:\s*wrap/)
+  assert.match(req, /\.tabs\s*\{[\s\S]*?flex-wrap:\s*wrap/)
+
+  const lc = fs.readFileSync(path.join(__dirname, '../src/views/LongConnection.vue'), 'utf8')
+  assert.match(lc, /\.composer-foot\s*\{[\s\S]*?flex-wrap:\s*wrap/)
+  assert.match(lc, /\.actions\s*\{[\s\S]*?flex-wrap:\s*wrap/)
+  assert.match(lc, /\.stage-foot\s*\{[\s\S]*?flex-wrap:\s*wrap/)
+  assert.match(lc, /readonlyReplay\.notes/)
+})

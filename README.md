@@ -1,5 +1,7 @@
 # API-Agent：API 自动测试与异常分析智能体
 
+> 更新于 2026-11-28：完成全功能复测 5 项缺陷闭环与界面体验打磨——① WebSocket AI 子用例回放接口（`/api/streams/{id}/cases/{case_id}`）与工具快照统一返回持久化裁定状态、`result_code`、`notes` 及 `transport_status`，且有界观测窗口自然到期（`deadline_exceeded`）不再覆盖已有 `passed`/`failed` 断言结论（手动 `closed` 长连接仍保留 `504`）；② `infrastructure/privacy.py` 补入紧凑型 JWT 识别，`infrastructure/history.py` 新增 `sanitize_execution` 并在入库、读取及启动迁移边界对计划执行 `executions` 响应体做二次脱敏（同时消除 `history.py` 独立导入循环依赖）；③ `main.py` 引入 `_SpaRoute` 排除 `/api` 与 `/api/*` 使未知非 GET `/api/*` 准确返回 `404`（保留已知路由准确 `405`），并补齐 `PUT/DELETE /api/projects/{id}` 与追加式乐观锁 `POST /api/environments/{id}/rollback`；④ 顶栏切换引擎即时从共享列表同步版本号并放宽 Postman CLI 探测超时至 `15s`，大模型测试固定右侧操作列吸顶防止 `1440×900` 横向裁切，接口/长连接窄屏工具栏补齐换行并支持展示子用例 `notes`，同步优化小Y 机器人头像与智能群测历史重测文档保留；⑤ 为大任务总结与结构化模型调用补齐上游瞬时断流/空响应的有界单次重试。后端全量 **573 passed, 1 skipped**、前端 **161 passed**、`vue-tsc` + `vite build`、Ruff（177 文件）与 `uv lock`（109 包）全部通过。
+
 > 更新于 2026-11-27：全站四个测试工作台（`/request` 接口测试、`/long-connection` 长连接测试、`/testcases` 智能群测、`/model-testing` 大模型测试）统一接入四区 `TestWorkspace` 外壳与页面级隔离的 **小Y AI 工具测试助手**（`/api/assistant/*`），支持后台持久化多轮运行、冷却间隔（`cooldown_ms=500`）、单条 `AI 测试` 标注历史、可点击 `CaseLinkBlock` 子用例只读回放、切页不断连重连、原子对话分叉、向量知识库检索（`/api/knowledge/*`）及零明文密钥的大模型能力探测持久化（迁移 `20261127_0008`，共 12 张业务表）；同步完成 CRM 全量测试审核缺陷 A.1–A.7 修复（线性时间无 ReDoS 邮箱脱敏、Postman 单进程 `pm.execution.skipRequest()` 有状态依赖链与 `actual` 断言观测值双引擎一致、引擎 `id`/`engine` 对齐、WebSocket 子用例断言判定落库持久化、静态 Token 智能群测直接重测与 `runtime_headers`、四工作台窄屏防裁切与顶栏引擎版本响应式同步、SSE 观测时限取消隐式减半）。后端全量 **566 passed, 1 skipped**、前端 **157 passed**、`vue-tsc` + `vite build` 与 Ruff（177 文件）全部通过。
 
 > 更新于 2026-11-22：大模型服务默认开启（`LLM_MODE=openai`、`enabled=true`，未配置 `base_url` 时仍保持本地安全未就绪、不发起外网请求）；支持按用途分离「小Y 对话模型」与可选「接口文档与 test 生成模型」（迁移 `20261120_0007`）；「接口测试」左侧历史栏仅保留单条删除；AI 对话（小T / 小Y）支持 `Enter` 直接发送、`Shift + Enter` 换行，以及底部锚点自动跟进输出；前端校验错误提示附带脱敏后的 `details` 字段原因。
@@ -64,7 +66,7 @@
 
 | 能力 | 当前状态 |
 | --- | --- |
-| 项目/环境追加版本、SQLite 迁移 | 已实现；`/api` 管理 API |
+| 项目/环境追加版本、回滚与 SQLite 迁移 | 已实现；`/api/projects`（含 `PUT/DELETE`）、`/api/environments/{id}`（含追加式乐观锁 `POST .../rollback`） |
 | **项目源码与接口文档** | **已迁移**，智能测试的“生成接口文档”通过本机目录选择器临时分析源码，并将 OpenAPI JSON 写入所选项目 `./API/`；不再提供项目快照页 |
 | 独立测试命令、本地 stdio MCP | 已实现；`doctor`、`validate`、`run`（均支持 `--engine`） |
 | **执行驱动适配器（Driver / Adapter Pattern）** | **已实现可切换双引擎**；测试内容（`ExecutionPlan`）与执行技术解耦，`native` 与 `postman` 并列注册 |
@@ -356,7 +358,7 @@ frontend/
     views/                       # 接口测试 / 长连接测试 / 智能群测 / 大模型测试 / 执行结果 / 系统设置 / 404（含旧入口兼容重定向）
     styles/                      # 暗/亮双主题设计令牌（tokens.css）与基础样式（base.css）
     stores/                      # Pinia（consoleWorkbench / streamWorkbench / tasksWorkbench / modelTestingWorkbench / workbenchRuns / toasts）
-  tests/                         # Node 原生行为与回归测试（157 项）
+  tests/                         # Node 原生行为与回归测试（161 项）
   dist/                          # 生产构建产物（由 FastAPI 同源挂载，不入库）
 examples/crm/                    # 源码映射的非秘密测试计划与说明（含 docker-stateful-crud.json）
 examples/agent/                  # AI 闭环请求样例（register-run.json）
@@ -371,10 +373,10 @@ examples/stream_target.py        # 本地 SSE/WebSocket 测试目标（9100）
 
 ## 验证与限制
 
-最近复核基线（2026-11-27）：
-- 前端 `frontend/`：`npm test`（`node --test tests/*.test.cjs`）**157 项全部通过**，`npm run typecheck`（`vue-tsc --noEmit`）0 错误，`npm run build`（`vue-tsc --noEmit && vite build`）构建成功；
-- 后端 `backend/`：`pytest -q` **566 passed, 1 skipped**（1 项 `tests/projects/test_source.py:97` 因 Windows 符号链接 OS 权限跳过），`ruff check src tests migrations` 全部通过、`ruff format --check src tests migrations` **177 个文件**全部格式化就绪，`uv lock --check --offline`（109 个锁定包）通过；
-- 本轮已通过自动化回归覆盖 CRM 全量测试审核缺陷 A.1–A.7（`tests/test_crm_audit_regressions.py` + `frontend/tests/layout-topbar-regressions.test.cjs`）以及四工作台页面级小Y 工具测试与历史回放（含真实本地回环服务与真实 Postman CLI 1.82.0 单进程有状态依赖链执行）。
+最近复核基线（2026-11-28）：
+- 前端 `frontend/`：`npm test`（`node --test tests/*.test.cjs`）**161 项全部通过**，`npm run build`（`vue-tsc --noEmit && vite build`）0 错误构建成功；
+- 后端 `backend/`：`pytest -q` **573 passed, 1 skipped**（1 项 `tests/projects/test_source.py:97` 因 Windows 符号链接 OS 权限跳过），`ruff check src tests migrations` 全部通过、`ruff format --check src tests migrations` **177 个文件**全部格式化就绪，`uv lock --check --offline`（109 个锁定包）通过；
+- 本轮已通过自动化回归及本地 Uvicorn 实测覆盖复测 5 项缺陷修复（WebSocket 子用例回放裁定/`notes` 与 `deadline_exceeded` 结果分类、`executions` 响应体 JWT 二次脱敏与存量清洗、SPA `_SpaRoute` 排除 `/api/*` 避免 405 误报、项目 CRUD 与环境追加回滚、顶栏引擎版本即时同步与 `1440×900`/窄屏布局防裁切、大任务总结与结构化调用瞬时故障单次重试），详见[阶段步骤实现](阶段步骤实现.md)第 24 节。
 
 历史端到端实测基线（2026-11-22）：本地 `examples/stream_target.py` + 独立临时服务 + CLI/MCP 覆盖 `/health`、`/docs`、SPA 与 `/api` 404 JSON、HTTP/SSE、WebSocket、项目环境乐观锁、双引擎（`native` + `postman`）、大模型切换与智能群测，**20/20 项全部通过**。
 

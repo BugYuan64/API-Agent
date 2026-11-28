@@ -1935,7 +1935,8 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   flex: none;
   padding: 14px 20px 0;
 }
@@ -1943,6 +1944,7 @@ onMounted(() => {
 .request-head-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -2029,9 +2031,15 @@ onMounted(() => {
 .url-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 12px 20px 10px;
   flex: none;
+}
+
+.url-bar > :deep(.url-input) {
+  flex: 1 1 220px;
+  min-width: 0;
 }
 
 .method-select {
@@ -2106,7 +2114,8 @@ onMounted(() => {
 .tabs {
   display: flex;
   align-items: center;
-  gap: 2px;
+  flex-wrap: wrap;
+  gap: 2px 4px;
   padding: 0 20px;
   border-bottom: 1px solid var(--border-subtle);
   flex: none;

@@ -188,17 +188,27 @@ test('project logo uses continuous signal transmission animation and customizabl
 
   const storage = memoryStorage()
   const api = loadAppearance(storage)
-  assert.equal(api.DEFAULT_PALETTES.dark['assistant-color'], '#22c55e')
-  assert.equal(api.DEFAULT_PALETTES.light['assistant-color'], '#16a34a')
+  assert.equal(api.DEFAULT_PALETTES.dark['assistant-color'], '#3c82f6')
+  assert.equal(api.DEFAULT_PALETTES.light['assistant-color'], '#3c82f6')
+  assert.equal(api.DEFAULT_PALETTES.dark['assistant-eye-color'], '#ffffff')
+  assert.equal(api.DEFAULT_PALETTES.light['assistant-eye-color'], '#ffffff')
   assert.ok(api.COLOR_LABELS['logo-color'])
   assert.ok(api.COLOR_LABELS['assistant-color'])
+  assert.ok(api.COLOR_LABELS['assistant-eye-color'])
   api.document.documentElement.dataset.theme = 'dark'
-  api.savePalette('dark', { ...api.DEFAULT_PALETTES.dark, 'logo-color': '#FF6600', 'assistant-color': '#00AABB' })
+  api.savePalette('dark', {
+    ...api.DEFAULT_PALETTES.dark,
+    'logo-color': '#FF6600',
+    'assistant-color': '#00AABB',
+    'assistant-eye-color': '#112233',
+  })
   assert.equal(api.document.documentElement.style.getPropertyValue('--palette-logo-color'), '#FF6600')
   assert.equal(api.document.documentElement.style.getPropertyValue('--palette-assistant-color'), '#00AABB')
+  assert.equal(api.document.documentElement.style.getPropertyValue('--palette-assistant-eye-color'), '#112233')
   api.resetPalette('dark')
   assert.equal(api.document.documentElement.style.getPropertyValue('--palette-logo-color'), api.DEFAULT_PALETTES.dark['logo-color'])
   assert.equal(api.document.documentElement.style.getPropertyValue('--palette-assistant-color'), api.DEFAULT_PALETTES.dark['assistant-color'])
+  assert.equal(api.document.documentElement.style.getPropertyValue('--palette-assistant-eye-color'), api.DEFAULT_PALETTES.dark['assistant-eye-color'])
 })
 
 test('early head script restores the same theme default before stylesheet loading', () => {

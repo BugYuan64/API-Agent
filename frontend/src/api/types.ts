@@ -363,6 +363,8 @@ export type StreamStatus =
   | 'open'
   | 'closed'
   | 'completed'
+  | 'passed'
+  | 'failed'
   | 'error'
   | 'cancelled'
   | 'interrupted'
@@ -516,6 +518,7 @@ export interface StreamSubCaseSummary extends ResultMetadata {
   byte_count: number
   sent_count: number
   truncated_count: number
+  notes?: string[]
   opened_at: string | null
   closed_at: string | null
   created_at: string
@@ -537,6 +540,8 @@ export interface StreamSubCaseDetail {
   case_label: string | null
   label: string
   readonly: boolean
+  transport_status?: string | null
+  notes?: string[]
   inputs: StreamReplayInputs
   session: StreamSession
   events: StreamEvent[]

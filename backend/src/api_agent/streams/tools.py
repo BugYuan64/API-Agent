@@ -7,6 +7,7 @@ from typing import Any
 
 from api_agent.infrastructure.history import sanitize_stream
 from api_agent.infrastructure.orm import as_utc
+from api_agent.infrastructure.outcomes import outcome_for
 from api_agent.llm.schemas import FunctionDefinition, ToolDefinition
 from api_agent.streams.repository import StreamRepository
 from api_agent.streams.runner import DEFAULT_AI_BADGE, StreamSuiteRunner
@@ -15,6 +16,8 @@ from api_agent.streams.schemas import (
     StreamAiSuiteSpec,
     StreamEventResponse,
     StreamReplayInputs,
+    effective_sub_case_status,
+    sub_case_notes,
 )
 
 DEFAULT_COOLDOWN_MS = 500
@@ -392,6 +395,9 @@ async def read_websocket_sub_case(
     sanitize_stream(record)
     events = await repo.list_events(record.id, after=0, limit=500)
     label = record.case_label or f"第 {record.round_index} 轮 · 用例 {record.case_index + 1}"
+    effective_status = effective_sub_case_status(record)
+    notes = sub_case_notes(record)
+    outcome = outcome_for(effective_status, record.error_kind, stop_reason=record.stop_reason)
     inputs = StreamReplayInputs(
         url=record.url,
         request_headers=record.request_headers or {},
@@ -408,12 +414,20 @@ async def read_websocket_sub_case(
         "case_label": record.case_label,
         "label": label,
         "readonly": True,
+        "status": effective_status,
+        "transport_status": record.status,
+        "result_code": outcome.code,
+        "result_status": outcome.status,
+        "notes": notes,
         "inputs": inputs.model_dump(mode="json"),
         "session": {
             "id": record.id,
             "kind": record.kind,
             "url": record.url,
-            "status": record.status,
+            "status": effective_status,
+            "transport_status": record.status,
+            "result_code": outcome.code,
+            "result_status": outcome.status,
             "stop_reason": record.stop_reason,
             "error_kind": record.error_kind,
             "error_message": record.error_message,

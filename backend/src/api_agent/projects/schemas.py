@@ -24,6 +24,20 @@ class ProjectCreate(ApiInput):
     description: str = Field(default="", max_length=500)
 
 
+class ProjectUpdate(ApiInput):
+    """更新项目名称或说明；至少提供一个待修改字段，沿用未知字段拒绝规则。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    description: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def require_field(self):
+        """禁止空更新载荷，避免无意义的写操作。"""
+        if self.name is None and self.description is None:
+            raise ValueError("at least one of name or description must be provided")
+        return self
+
+
 class ProjectResponse(ApiModel):
     """项目公开元信息，不包含环境凭据或运行证据。"""
 
@@ -213,6 +227,13 @@ class EnvironmentCreate(EnvironmentInput):
 class EnvironmentUpdate(EnvironmentInput):
     """追加配置版本的输入；expected_version 用于乐观锁，拒绝并发覆盖。"""
 
+    expected_version: int = Field(ge=1)
+
+
+class EnvironmentRollback(ApiInput):
+    """回滚环境配置到指定历史版本（以追加新版本的方式保留完整审计轨迹）。"""
+
+    target_version: int = Field(ge=1)
     expected_version: int = Field(ge=1)
 
 

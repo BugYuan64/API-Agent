@@ -12,12 +12,12 @@
 
 import json
 import re
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from api_agent.assistant.models import AssistantMessageRecord
-from api_agent.assistant.thread_store import scrub_assistant_fields
 from api_agent.console.models import ConsoleRequestRecord, ConsoleSubCaseRecord
+from api_agent.execution.models import ExecutionRecord
 from api_agent.infrastructure.database import Database
 from api_agent.infrastructure.logging import (
     REDACTED,
@@ -29,6 +29,9 @@ from api_agent.infrastructure.privacy import Context, is_sensitive_pointer
 from api_agent.infrastructure.targets import redact_headers
 from api_agent.llm.models import ModelTestRunRecord
 from api_agent.streams.models import StreamSessionRecord
+
+if TYPE_CHECKING:
+    from api_agent.assistant.models import AssistantMessageRecord
 
 PREVIEW_LIMIT = 8 * 1024
 # 截断后的 JSON 文本里 ``"password": "value"`` 这样的键值对（含转义引号）。
@@ -478,8 +481,118 @@ def sanitize_model_test_run(record: ModelTestRunRecord) -> bool:
     return changed
 
 
-def sanitize_assistant_message(record: AssistantMessageRecord) -> bool:
+def _learn_execution_case(case: dict, context: Context) -> None:
+    """学习单条计划执行结果中的敏感响应头、响应体、提取变量与断言观察值。"""
+    context.learn(case)
+    _learn_nested_headers(case, context)
+    response = case.get("response")
+    if isinstance(response, dict):
+        body = response.get("body")
+        if isinstance(body, str) and body:
+            context.learn(_jsonable(body))
+            _learn_labelled_pairs(body, context)
+            context.body(body, "json")
+    for extracted in case.get("extracted") or ():
+        if not isinstance(extracted, dict):
+            continue
+        if extracted.get("sensitive") or is_sensitive_key(extracted.get("name", "")):
+            value = extracted.get("value")
+            if isinstance(value, str) and len(value) >= 4 and value not in _PLACEHOLDERS:
+                context.learn({"token": value})
+        _learn_labelled_pairs(extracted.get("message"), context)
+    for assertion in case.get("assertions") or ():
+        if not isinstance(assertion, dict):
+            continue
+        _learn_labelled_pairs(assertion.get("message"), context)
+        actual = assertion.get("actual")
+        if isinstance(actual, str):
+            _learn_labelled_pairs(actual, context)
+
+
+def _sanitize_execution_case(case: dict, context: Context) -> dict:
+    """按 CaseResult 契约清洗单条计划执行结果，抹除响应体/响应头/断言与提取记录中的凭据。"""
+    cleaned = dict(case)
+    response = case.get("response")
+    if isinstance(response, dict):
+        sanitized_resp = dict(response)
+        if isinstance(response.get("headers"), dict):
+            sanitized_resp["headers"] = _safe_headers(response.get("headers"), context=context)
+        body = response.get("body")
+        if isinstance(body, str):
+            if body == "":
+                sanitized_resp["body"] = ""
+            else:
+                scrubbed = _sanitize_body(body, "json", context)
+                sanitized_resp["body"] = scrubbed if scrubbed is not None else ""
+        cleaned["response"] = sanitized_resp
+    if isinstance(case.get("assertions"), list):
+        sanitized_assertions = []
+        for assertion in case["assertions"]:
+            if not isinstance(assertion, dict):
+                sanitized_assertions.append(_sanitize_json_payload(assertion, context))
+                continue
+            item = dict(assertion)
+            pointer = item.get("pointer")
+            if "actual" in item and item["actual"] is not None:
+                if is_sensitive_pointer(pointer):
+                    item["actual"] = REDACTED
+                else:
+                    item["actual"] = _sanitize_json_payload(item["actual"], context)
+            if isinstance(item.get("message"), str):
+                item["message"] = context.text(item["message"])
+            sanitized_assertions.append(item)
+        cleaned["assertions"] = sanitized_assertions
+    if isinstance(case.get("extracted"), list):
+        sanitized_extracted = []
+        for extracted in case["extracted"]:
+            if not isinstance(extracted, dict):
+                sanitized_extracted.append(_sanitize_json_payload(extracted, context))
+                continue
+            item = dict(extracted)
+            if item.get("value") is not None:
+                if item.get("sensitive") or is_sensitive_key(item.get("name", "")):
+                    item["value"] = REDACTED
+                else:
+                    item["value"] = _sanitize_json_payload(item["value"], context)
+            if isinstance(item.get("message"), str):
+                item["message"] = context.text(item["message"])
+            sanitized_extracted.append(item)
+        cleaned["extracted"] = sanitized_extracted
+    return cleaned
+
+
+def sanitize_execution(record: ExecutionRecord) -> bool:
+    """就地清洗一条计划执行记录的计划快照、标签与用例响应证据，保证入库/迁移/读取一致脱敏。"""
+    context = Context()
+    context.learn({"label": record.label, "plan": record.plan})
+    _learn_nested_headers(record.plan, context)
+    _learn_labelled_pairs(record.label, context)
+    raw_executions = record.executions if isinstance(record.executions, list) else []
+    for case in raw_executions:
+        if isinstance(case, dict):
+            _learn_execution_case(case, context)
+
+    label = context.text(record.label) if record.label else record.label
+    plan = context.clean(record.plan) if record.plan is not None else None
+    executions = [
+        _sanitize_execution_case(case, context)
+        if isinstance(case, dict)
+        else _sanitize_json_payload(case, context)
+        for case in raw_executions
+    ]
+
+    changed = False
+    for field, value in (("label", label), ("plan", plan), ("executions", executions)):
+        if getattr(record, field) != value:
+            setattr(record, field, value)
+            changed = True
+    return changed
+
+
+def sanitize_assistant_message(record: "AssistantMessageRecord") -> bool:
     """就地清洗 AI 助手消息正文与结构化块，保持与写库脱敏一致且严格幂等。"""
+    from api_agent.assistant.thread_store import scrub_assistant_fields
+
     cleaned_content, cleaned_blocks, _ = scrub_assistant_fields(
         record.content,
         record.blocks_json if isinstance(record.blocks_json, list) else [],
@@ -497,9 +610,11 @@ def sanitize_assistant_message(record: AssistantMessageRecord) -> bool:
 async def sanitize_history(database: Database) -> int:
     """启动时迁移：把库里仍在的历史行就地清洗一次，返回被改写的行数。
 
-    实现：分别扫描控制台历史、子用例快照、长连接会话、模型测试任务及助手消息表；
+    实现：分别扫描控制台历史、子用例快照、长连接会话、计划执行记录、模型测试任务及助手消息表；
     每行改动后统一提交。幂等性由内容比较保证——已清洗的行再次执行不会产生新改动，返回 0。
     """
+    from api_agent.assistant.models import AssistantMessageRecord
+
     changed = 0
     async with database.session() as session:
         for record in (await session.scalars(select(ConsoleRequestRecord))).all():
@@ -510,6 +625,9 @@ async def sanitize_history(database: Database) -> int:
                 changed += 1
         for stream in (await session.scalars(select(StreamSessionRecord))).all():
             if sanitize_stream(stream):
+                changed += 1
+        for execution in (await session.scalars(select(ExecutionRecord))).all():
+            if sanitize_execution(execution):
                 changed += 1
         for run in (await session.scalars(select(ModelTestRunRecord))).all():
             if sanitize_model_test_run(run):
@@ -528,6 +646,7 @@ __all__ = [
     "sanitize_assistant_message",
     "sanitize_console",
     "sanitize_console_sub_case",
+    "sanitize_execution",
     "sanitize_history",
     "sanitize_model_test_run",
     "sanitize_stream",

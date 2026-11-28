@@ -781,3 +781,200 @@ test('TestCasesView cross-page unmount never cancels running task and remount au
   assert.equal(cancelCalls, 0)
   second.unmount()
 })
+
+test('TestCasesView preserves test document across selectHistory, testAgain, removeOperation, route switch, and submit, and keeps primary 开始测试 button clickable with label 开始测试', async context => {
+  const sharedPinia = pinia.createPinia()
+  const docText = JSON.stringify({
+    openapi: '3.0.3',
+    info: { title: '客户服务' },
+    paths: {
+      '/health': { get: { responses: { '200': { description: 'ok' } } } },
+      '/orders': { post: { responses: { '201': { description: 'created' } } } },
+    },
+  })
+  const docTask = (id, overrides = {}) => makeMultiRoundTask(id, {
+    title: '客户服务',
+    source: 'manual',
+    badge: null,
+    total_rounds: 1,
+    current_round: 1,
+    results: makeMultiRoundTask().results.slice(0, 2),
+    snapshot: {
+      ...makeMultiRoundTask().snapshot,
+      document: { filename: 'customer-api.json' },
+    },
+    ...overrides,
+  })
+
+  const startPayloads = []
+  const rerunPayloads = []
+  const docReads = []
+  let createdSeq = 0
+
+  const mocks = {
+    pinia: sharedPinia,
+    listTasks: async () => ({ items: [docTask('hist-doc-1')] }),
+    readTask: async id => docTask(id),
+    readTaskDocument: async id => {
+      docReads.push(id)
+      return docText
+    },
+    startTask: async payload => {
+      startPayloads.push(payload)
+      const id = `started-doc-${++createdSeq}`
+      return docTask(id, {
+        snapshot: {
+          ...docTask(id).snapshot,
+          ...(payload.document ? { document: { filename: payload.document.filename } } : { document: undefined }),
+        },
+      })
+    },
+    rerunTask: async (id, payload) => {
+      rerunPayloads.push({ id, ...payload })
+      return docTask(`rerun-doc-${++createdSeq}`)
+    },
+  }
+
+  const page = loadSfc('src/views/TestCasesView.vue', {}, mocks)
+  context.after(page.unmount)
+
+  // 1. Selecting a history item with a document preserves filename, download link, and keeps primary button as clickable "开始测试"
+  await page.state.selectHistory('hist-doc-1')
+  await settle()
+
+  assert.equal(page.state.displayedFilename.value, 'customer-api.json')
+  assert.equal(page.state.documentDownloadId.value, 'hist-doc-1')
+  assert.equal(page.state.hasDocument.value, true)
+  assert.equal(page.state.origin.value, 'http://127.0.0.1:9100')
+  assert.equal(page.state.draftLocked.value, false)
+
+  const historyHtml = await page.render()
+  assert.match(historyHtml, /href="\/api\/tasks\/hist-doc-1\/document"[^>]*download[^>]*>customer-api\.json<\/a>/)
+  assert.match(historyHtml, /<div class="actions"><button class="btn btn-primary"><div data-stub="AppIcon" name="play"><\/div>开始测试<\/button>/)
+  assert.doesNotMatch(historyHtml, /<div class="actions"><button[^>]*>(?:(?!<\/button>)[\s\S])*再次测试<\/button>/)
+  assert.doesNotMatch(historyHtml, /<div class="actions"><button class="btn btn-primary" disabled/)
+
+  // 2. Clicking submit on history triggers rerunTask (not startTask) and keeps button label "开始测试"
+  await page.state.submit()
+  await settle()
+  assert.equal(rerunPayloads.length, 1)
+  assert.equal(rerunPayloads[0].id, 'hist-doc-1')
+  assert.equal(page.state.displayedFilename.value, 'customer-api.json')
+  const postRerunHtml = await page.render()
+  assert.match(postRerunHtml, /<div class="actions"><button class="btn btn-primary">[\s\S]*开始测试<\/button>/)
+
+  // 3. Clicking testAgain ("再次测试" in banner/header) unlocks catalog while retaining document filename, documentInput & download link
+  page.state.testAgain()
+  assert.equal(page.state.replaySource.value, null)
+  assert.ok(page.state.catalog.value)
+  assert.equal(page.state.displayedFilename.value, 'customer-api.json')
+  assert.equal(page.state.filename.value, 'customer-api.json')
+  assert.equal(page.state.hasDocument.value, true)
+  assert.equal(page.state.draftLocked.value, false)
+
+  // 4. Removing an operation, editing a case, and switching away/back via tasksWorkbench store preserves document
+  page.state.removeOperation(0)
+  assert.equal(page.state.catalog.value.endpoints.length, 1)
+  page.unmount()
+
+  const remounted = loadSfc('src/views/TestCasesView.vue', {}, mocks)
+  context.after(remounted.unmount)
+  assert.equal(remounted.state.displayedFilename.value, 'customer-api.json')
+  assert.equal(remounted.state.hasDocument.value, true)
+  assert.equal(remounted.state.catalog.value.endpoints.length, 1)
+
+  const unlockedHtml = await remounted.render()
+  assert.match(unlockedHtml, /<div class="actions"><button class="btn btn-primary">[\s\S]*开始测试<\/button>/)
+  assert.doesNotMatch(unlockedHtml, /<div class="actions"><button class="btn btn-primary" disabled/)
+
+  await remounted.state.submit()
+  await settle()
+  assert.equal(startPayloads.length, 1)
+  assert.deepEqual(startPayloads[0].document, { filename: 'customer-api.json', text: docText })
+  assert.equal(remounted.state.displayedFilename.value, 'customer-api.json')
+
+  // 5. Even if testAgain runs BEFORE prefetch finishes (e.g. cold documentInput), sourceDocument still loads from documentSourceId
+  const coldStartPayloads = []
+  const coldPage = loadSfc('src/views/TestCasesView.vue', {}, {
+    listTasks: async () => ({ items: [docTask('cold-1')] }),
+    readTask: async id => docTask(id),
+    readTaskDocument: async () => docText,
+    startTask: async payload => {
+      coldStartPayloads.push(payload)
+      return docTask('cold-started')
+    },
+  })
+  context.after(coldPage.unmount)
+  await coldPage.state.selectHistory('cold-1')
+  coldPage.state.documentInput.value = null
+  coldPage.state.testAgain()
+  assert.equal(coldPage.state.displayedFilename.value, 'customer-api.json')
+  assert.equal(coldPage.state.hasDocument.value, true)
+  await coldPage.state.submit()
+  assert.equal(coldStartPayloads.length, 1)
+  assert.deepEqual(coldStartPayloads[0].document, { filename: 'customer-api.json', text: docText })
+  assert.ok(docReads.length >= 1)
+})
+
+test('TestCasesView handles AI-triggered tasks without a document cleanly and all 4 workbenches keep primary submit button labels stable', async context => {
+  const aiNoDoc = makeMultiRoundTask('ai-no-doc-1', {
+    status: 'completed',
+    stage: 'finished',
+  })
+  const rerunPayloads = []
+  const startPayloads = []
+
+  const page = loadSfc('src/views/TestCasesView.vue', {}, {
+    listTasks: async () => ({ items: [aiNoDoc] }),
+    readTask: async () => aiNoDoc,
+    rerunTask: async (id, payload) => {
+      rerunPayloads.push({ id, ...payload })
+      return makeMultiRoundTask('ai-no-doc-rerun')
+    },
+    startTask: async payload => {
+      startPayloads.push(payload)
+      return makeMultiRoundTask('ai-no-doc-start')
+    },
+  })
+  context.after(page.unmount)
+
+  await page.state.handleRunBound({
+    scope: 'tasks',
+    history_id: 'ai-no-doc-1',
+    previous_history_id: null,
+    badge: 'AI 测试',
+    title: 'AI 多轮订单压测',
+    forked: true,
+    run_id: 'asst-no-doc',
+  })
+  await settle()
+
+  assert.equal(page.state.displayedFilename.value, '')
+  assert.equal(page.state.hasDocument.value, false)
+  assert.equal(page.state.draftLocked.value, false)
+
+  const html = await page.render()
+  assert.match(html, /未上传接口文档/)
+  assert.match(html, /<div class="actions"><button class="btn btn-primary">[\s\S]*开始测试<\/button>/)
+  assert.doesNotMatch(html, /<div class="actions"><button class="btn btn-primary" disabled/)
+
+  await page.state.submit()
+  assert.equal(rerunPayloads.length, 1)
+  assert.equal(rerunPayloads[0].id, 'ai-no-doc-1')
+
+  page.state.testAgain()
+  await page.state.submit()
+  assert.equal(startPayloads.length, 1)
+  assert.equal('document' in startPayloads[0], false)
+
+  // Guard all 4 primary action buttons against switching into "再次测试"
+  const tasksSfc = fs.readFileSync(path.join(__dirname, '../src/views/TestCasesView.vue'), 'utf8')
+  const modelSfc = fs.readFileSync(path.join(__dirname, '../src/views/ModelTestingView.vue'), 'utf8')
+  const consoleSfc = fs.readFileSync(path.join(__dirname, '../src/views/RequestConsole.vue'), 'utf8')
+  const streamSfc = fs.readFileSync(path.join(__dirname, '../src/views/LongConnection.vue'), 'utf8')
+  assert.match(tasksSfc, /<div class="actions"><button class="btn btn-primary"[^>]*><AppIcon name="play" \/>开始测试<\/button>/)
+  assert.doesNotMatch(tasksSfc, /replaySource\s*\?\s*'再次测试'\s*:\s*'开始测试'/)
+  assert.match(modelSfc, /`开始探测（\$\{selectedIds\.length\}）`/)
+  assert.match(consoleSfc, /<span>\{\{ sending \? '发送中' : '发送' \}\}<\/span>/)
+  assert.match(streamSfc, /\{\{ connecting \? '连接中' : '开始连接' \}\}/)
+})

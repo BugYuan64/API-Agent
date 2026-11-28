@@ -33,6 +33,7 @@
   --action-fill-hover: var(--palette-action-fill-hover);
   --logo-color: var(--palette-logo-color);
   --assistant-color: var(--palette-assistant-color);
+  --assistant-eye-color: var(--palette-assistant-eye-color);
   --brand-fill: linear-gradient(145deg, var(--palette-brand-start), var(--palette-brand-highlight) 75%);
   --focus-ring: color-mix(in srgb, var(--palette-accent) 23%, transparent);
   --modal-backdrop: color-mix(in srgb, var(--palette-modal-backdrop) 65%, transparent);
@@ -118,6 +119,7 @@
   --action-fill-hover: var(--palette-action-fill-hover);
   --logo-color: var(--palette-logo-color);
   --assistant-color: var(--palette-assistant-color);
+  --assistant-eye-color: var(--palette-assistant-eye-color);
   --brand-fill: linear-gradient(145deg, var(--palette-brand-start), var(--palette-brand-highlight) 80%);
   --focus-ring: color-mix(in srgb, var(--palette-accent) 20%, transparent);
   --modal-backdrop: color-mix(in srgb, var(--palette-modal-backdrop) 42%, transparent);

@@ -16,12 +16,13 @@ const loading = ref(false)
 let engineProbeSeq = 0
 
 /** 顶栏显示“当前选中的引擎”及其状态，而不是写死某一个引擎名称。 */
-const { selected: selectedEngine, refresh: refreshEngineList } = useEngineSelection()
+const { selected: selectedEngine, activeEngine, refresh: refreshEngineList } = useEngineSelection()
 
-/** 仅按当前选中引擎重新探测状态与版本号，并用单调序号屏蔽乱序返回。 */
+/** 仅按当前选中引擎重新探测状态与版本号，先同步已拉取的列表快照避免切换时版本号停滞或闪烁，并用单调序号屏蔽乱序返回。 */
 async function refreshSelectedEngine(target: string = selectedEngine.value) {
   const seq = ++engineProbeSeq
-  engine.value = null
+  const cached = activeEngine?.value?.id === target ? activeEngine.value : null
+  engine.value = cached
   try {
     const result = await engineStatus(target)
     if (seq === engineProbeSeq && selectedEngine.value === target) {
@@ -29,19 +30,27 @@ async function refreshSelectedEngine(target: string = selectedEngine.value) {
     }
   } catch {
     if (seq === engineProbeSeq && selectedEngine.value === target) {
-      engine.value = null
+      engine.value = cached
     }
   }
 }
 
-/** 刷新引擎列表后并行探测管理后端和所选引擎；探测失败各自映射为异常或未知。列表初始化错误向上传播，但始终解除 loading。 */
+/** 刷新引擎列表后并行探测管理后端和所选引擎；探测失败各自映射为异常或未知。始终同步列表并解除 loading。 */
 async function refresh() {
   loading.value = true
   try {
-    // 首次显示时先确保引擎列表（含服务端默认值）已就绪，再按选中项探活，
-    // 否则顶栏会一直停在本地默认值上。
-    if (!engine.value) await refreshEngineList()
+    // 每次主动刷新或首次挂载都先同步引擎列表（含服务端默认值与最新版本号），
+    // 再按当前选中项实时探活，确保切换引擎或重测后顶栏版本号保持一致。
+    try {
+      await refreshEngineList()
+    } catch {
+      // 引擎列表刷新失败时仍继续探测健康检查与单引擎状态，避免阻塞顶栏。
+    }
     const target = selectedEngine.value
+    const cached = activeEngine?.value?.id === target ? activeEngine.value : null
+    if (cached) {
+      engine.value = cached
+    }
     const seq = ++engineProbeSeq
     const [healthResult, engineResult] = await Promise.allSettled([
       getHealth(),
@@ -49,7 +58,7 @@ async function refresh() {
     ])
     healthError.value = healthResult.status === 'rejected'
     if (seq === engineProbeSeq && selectedEngine.value === target) {
-      engine.value = engineResult.status === 'fulfilled' ? engineResult.value : null
+      engine.value = engineResult.status === 'fulfilled' ? engineResult.value : cached
     }
   } finally {
     loading.value = false
@@ -61,6 +70,14 @@ watch(selectedEngine, (next, prev) => {
     void refreshSelectedEngine(next)
   }
 })
+
+if (activeEngine) {
+  watch(activeEngine, (next) => {
+    if (next && next.id === selectedEngine.value) {
+      engine.value = next
+    }
+  })
+}
 
 /** 结合当前引擎元信息与探测结果生成名称、不可用或未知标签；只在已有版本时追加版本号。 */
 const engineLabel = computed(() => {

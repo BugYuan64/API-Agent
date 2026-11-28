@@ -19,6 +19,7 @@ SCHEMA_METADATA = {"type", "$ref", "$schema", "$id", "required", "format", "patt
 ASSERTION_VALUES = {"expected", "actual", "value"}
 PHONE = re.compile(r"(?<![\d])1[3-9]\d{9}(?![\d])")
 KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{10,}\b")
 EMAIL = re.compile(
     r"(?<![A-Za-z0-9_.+-])[A-Za-z0-9_.+-]{1,64}@(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,24}(?![A-Za-z0-9-])"
 )
@@ -55,6 +56,8 @@ class Context:
         value = self.redactor.redact_text(value)
         if "sk-" in value:
             value = KEY.sub(REDACTED, value)
+        if "eyJ" in value:
+            value = JWT.sub(REDACTED, value)
         value = PHONE.sub("[PHONE]", value)
         if "@" in value:
             value = EMAIL.sub("[EMAIL]", value)

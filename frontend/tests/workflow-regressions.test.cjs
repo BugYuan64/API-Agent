@@ -1851,24 +1851,35 @@ test('RequestConsole scope notice reflects unrestricted valid targets with optio
   assert.match(source, /跨源重定向自动剥离认证头/)
 })
 
-test('AssistantAvatar renders green robot expressions and randomly switches expressions on timer', async context => {
+test('AssistantAvatar renders blue squircle eyes-only expressions and auto-switches on timer', async context => {
   const avatar = load('AssistantAvatar', ['expression', 'nextRandomExpression', 'EXPRESSIONS'], {
-    defineProps: () => ({ size: 24, state: 'idle', minIntervalMs: 1000, maxIntervalMs: 1000 }),
+    defineProps: () => ({ size: 30, state: 'idle', minIntervalMs: 1000, maxIntervalMs: 1000 }),
+    onMounted: fn => fn(),
   }, 'components')
   context.after(avatar.dispose)
 
-  assert.ok(avatar.EXPRESSIONS.length >= 8)
+  assert.ok(avatar.EXPRESSIONS.length >= 10)
+  assert.equal(avatar.expression.value, 'peek')
+  assert.equal(avatar.timerCount(), 1)
   const initial = avatar.expression.value
   const switched = avatar.nextRandomExpression()
   assert.notEqual(switched, initial)
   assert.equal(avatar.expression.value, switched)
 
+  // 自动定时器触发也会切换到与当前不同的新表情并继续调度下一次切换
+  const beforeTick = avatar.expression.value
+  avatar.tick()
+  assert.notEqual(avatar.expression.value, beforeTick)
+  assert.equal(avatar.timerCount(), 1)
+
   const html = await avatar.render()
   assert.match(html, /class="assistant-avatar/)
-  assert.match(html, new RegExp(`data-expression="${switched}"`))
+  assert.match(html, new RegExp(`data-expression="${avatar.expression.value}"`))
+  assert.match(html, /class="avatar-body"/)
 
   const avatarSource = fs.readFileSync(path.join(__dirname, '..', 'src/components/AssistantAvatar.vue'), 'utf8')
-  assert.match(avatarSource, /var\(--assistant-color,\s*#22c55e\)/)
+  assert.match(avatarSource, /var\(--assistant-color,\s*#3c82f6\)/)
+  assert.match(avatarSource, /var\(--assistant-eye-color,\s*#ffffff\)/)
 })
 
 test('TaskChat displays animated thinking/reading ellipsis cycle and forwards current test context', async context => {
@@ -1989,14 +2000,21 @@ test('KnowledgeBaseSettings loads prepared corpus, saves embedding config and tr
   assert.equal(kb.status.value.retrieval_mode, 'vector')
 })
 
-test('AssistantAvatar renders compact 30px robotic LED eyes-and-mouth expressions without head outline', () => {
+test('AssistantAvatar renders compact 30px rounded-squircle white eyes without any mouth and animates every expression', () => {
   const avatarSfc = fs.readFileSync(path.join(__dirname, '../src/components/AssistantAvatar.vue'), 'utf8')
   const chatSfc = fs.readFileSync(path.join(__dirname, '../src/components/TaskChat.vue'), 'utf8')
   assert.match(avatarSfc, /size:\s*30/)
   assert.match(avatarSfc, /viewBox="0 0 36 36"/)
-  assert.match(avatarSfc, /face-led-eye/)
-  assert.match(avatarSfc, /face-eq-bar/)
-  assert.doesNotMatch(avatarSfc, /robot-head|robot-visor|robot-ear|robot-antenna/)
+  assert.match(avatarSfc, /class="avatar-body"/)
+  assert.match(avatarSfc, /--eye-color:\s*var\(--assistant-eye-color,\s*#ffffff\)/)
+  assert.doesNotMatch(avatarSfc, /face-mouth|face-eq-bar|mouth/i)
+  for (const kf of [
+    'peek-blink', 'happy-bounce', 'wink-squeeze', 'look-scan',
+    'double-blink', 'sparkle-twinkle', 'curious-widen', 'focused-scan',
+    'surprised-pop', 'sleepy-breathe', 'love-beat',
+  ]) {
+    assert.match(avatarSfc, new RegExp(`@keyframes\\s+${kf}\\b`), `missing animation @keyframes ${kf}`)
+  }
   assert.match(chatSfc, /<AssistantAvatar\s+:size="30"\s+:state="avatarState"\s*\/>/)
 })
 

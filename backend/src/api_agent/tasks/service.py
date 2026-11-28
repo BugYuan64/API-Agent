@@ -20,6 +20,8 @@ from api_agent.tasks.schemas import Case, TaskRunMetadata
 
 DEFAULT_AI_BADGE = "AI 测试"
 COOLDOWN_SLICE_SECONDS = 0.1
+SUMMARY_RETRY_DELAY_SECONDS = 0.4
+_TRANSIENT_SUMMARY_ERRORS = frozenset({"model_connection_failed", "model_response_error"})
 
 
 class TaskActiveError(RuntimeError):
@@ -145,6 +147,19 @@ def report(record):
     return "\n".join(lines) + "\n"
 
 
+async def _run_summary_with_retry(fn, *, max_attempts: int = 2):
+    """对上游瞬时断流或空响应做有界单次重试，减少大任务总结因短暂抖动降级为 partial。"""
+    for attempt in range(max_attempts):
+        try:
+            return await fn()
+        except AgentError as error:
+            if str(error) in _TRANSIENT_SUMMARY_ERRORS and attempt + 1 < max_attempts:
+                if SUMMARY_RETRY_DELAY_SECONDS > 0:
+                    await asyncio.sleep(SUMMARY_RETRY_DELAY_SECONDS)
+                continue
+            raise
+
+
 async def summarize_results(agent, results, warnings, publish=None):
     """Summarize all results in bounded chunks, then combine every chunk's commentary."""
     chunks = []
@@ -163,24 +178,31 @@ async def summarize_results(agent, results, warnings, publish=None):
     if batch:
         chunks.append(batch)
     if publish and len(chunks) <= 1:
-        return await agent.stream_task_summary({"results": batch, "warnings": warnings}, publish)
+        return await _run_summary_with_retry(
+            lambda: agent.stream_task_summary({"results": batch, "warnings": warnings}, publish)
+        )
     budget = CallBudget(limit=2 * (2 * len(chunks) + 4))
     parts = []
     for chunk in chunks:
-        commentary = await agent.report({"results": chunk, "warnings": warnings}, budget)
+        commentary = await _run_summary_with_retry(
+            lambda c=chunk: agent.report({"results": c, "warnings": warnings}, budget)
+        )
         parts.append(commentary.model_dump())
     if len(parts) == 1:
         return commentary
     while len(parts) > 5:
         reduced = []
         for offset in range(0, len(parts), 5):
-            summary = await agent.report({"batch_summaries": parts[offset : offset + 5]}, budget)
+            slice_parts = parts[offset : offset + 5]
+            summary = await _run_summary_with_retry(
+                lambda s=slice_parts: agent.report({"batch_summaries": s}, budget)
+            )
             reduced.append(summary.model_dump())
         parts = reduced
     combined = {"batch_summaries": parts, "total_results": len(results)}
     if publish:
-        return await agent.stream_task_summary(combined, publish)
-    return await agent.report(combined, budget)
+        return await _run_summary_with_retry(lambda: agent.stream_task_summary(combined, publish))
+    return await _run_summary_with_retry(lambda: agent.report(combined, budget))
 
 
 class LiveTask:
@@ -387,7 +409,7 @@ class TaskManager:
             snapshot.get("operations", []),
             snapshot.get("warnings", []),
             source.get("title"),
-            snapshot.get("document"),
+            deepcopy(snapshot.get("document")),
             merged_vars,
             metadata=effective_metadata,
         )

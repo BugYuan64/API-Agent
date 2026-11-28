@@ -1619,3 +1619,107 @@ async def test_project_document_generate_openapi_for_directory_decoupled(app, tm
     assert result["partial"] is False
     assert "/ping" in json.loads(result["text"])["paths"]
     assert (project / "API" / result["filename"]).is_file()
+
+
+async def test_chained_reruns_preserve_test_document_and_ai_task_without_document_reruns_cleanly(
+    client, target
+):
+    """Ensure documents survive chained reruns with edits and docless tasks rerun cleanly."""
+    doc = {
+        "filename": "service-spec.json",
+        "text": json.dumps(
+            {
+                "openapi": "3.0.3",
+                "info": {"title": "服务规范", "version": "1.0.0"},
+                "paths": {"/json": {"get": {"responses": {"200": {"description": "ok"}}}}},
+            }
+        ),
+    }
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "origin": target.base_url,
+            "catalog": catalog().model_dump(),
+            "document": doc,
+        },
+    )
+    assert created.status_code == 202, created.text
+    first = await terminal(client, created.json()["id"])
+    assert first["snapshot"]["document"] == {"filename": "service-spec.json"}
+
+    rerun_one = await client.post(
+        f"/api/tasks/{first['id']}/rerun",
+        json={"origin": target.base_url},
+    )
+    assert rerun_one.status_code == 202, rerun_one.text
+    second = await terminal(client, rerun_one.json()["id"])
+    assert second["snapshot"]["document"] == {"filename": "service-spec.json"}
+
+    edited_case = {**second["snapshot"]["cases"][0], "name": "二轮编辑用例"}
+    rerun_two = await client.post(
+        f"/api/tasks/{second['id']}/rerun",
+        json={"origin": target.base_url, "case_edits": {"0": edited_case}},
+    )
+    assert rerun_two.status_code == 202, rerun_two.text
+    third = await terminal(client, rerun_two.json()["id"])
+    assert third["snapshot"]["document"] == {"filename": "service-spec.json"}
+
+    for task_id in (first["id"], second["id"], third["id"]):
+        attachment = await client.get(f"/api/tasks/{task_id}/document")
+        assert attachment.status_code == 200
+        assert attachment.content == doc["text"].encode()
+
+    # AI-triggered task without an uploaded document works and reruns cleanly.
+    no_doc_created = await client.post(
+        "/api/tasks",
+        json={
+            "origin": target.base_url,
+            "catalog": catalog().model_dump(),
+            "source": "ai",
+            "badge": "AI 测试",
+        },
+    )
+    assert no_doc_created.status_code == 202, no_doc_created.text
+    no_doc_first = await terminal(client, no_doc_created.json()["id"])
+    assert "document" not in no_doc_first["snapshot"]
+    assert (await client.get(f"/api/tasks/{no_doc_first['id']}/document")).status_code == 404
+
+    no_doc_rerun = await client.post(
+        f"/api/tasks/{no_doc_first['id']}/rerun",
+        json={"origin": target.base_url},
+    )
+    assert no_doc_rerun.status_code == 202, no_doc_rerun.text
+    no_doc_second = await terminal(client, no_doc_rerun.json()["id"])
+    assert "document" not in no_doc_second["snapshot"]
+
+
+async def test_summarize_results_retries_once_on_transient_stream_error(monkeypatch):
+    """大任务总结遇到上游单次瞬时断流或空响应时自动重试一次并成功产出 Markdown。"""
+    import api_agent.tasks.service as task_service
+    from api_agent.agent.service import AgentError
+
+    monkeypatch.setattr(task_service, "SUMMARY_RETRY_DELAY_SECONDS", 0)
+    calls = {"stream": 0}
+
+    class FlakySummaryAgent:
+        async def stream_task_summary(self, data, publish):
+            calls["stream"] += 1
+            if calls["stream"] == 1:
+                raise AgentError("model_connection_failed")
+            await publish("## 结果概览\n全部通过")
+            return "## 结果概览\n全部通过"
+
+    published: list[str] = []
+
+    async def publish(text: str):
+        published.append(text)
+
+    summary = await task_service.summarize_results(
+        FlakySummaryAgent(),
+        [{"name": "ok", "status": "passed", "assertions": []}],
+        [],
+        publish=publish,
+    )
+    assert calls["stream"] == 2
+    assert "全部通过" in summary
+    assert published == ["## 结果概览\n全部通过"]

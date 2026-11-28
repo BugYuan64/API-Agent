@@ -21,6 +21,7 @@ from api_agent.infrastructure.api import (
     paginate,
 )
 from api_agent.infrastructure.database import session_for
+from api_agent.infrastructure.history import sanitize_execution
 from api_agent.infrastructure.privacy import Context
 from api_agent.projects.models import Project
 
@@ -92,6 +93,7 @@ async def run_plan(
         plan=frozen_plan,
         plan_sha256=plan_digest,
     )
+    sanitize_execution(record)
     session.add(record)
     await session.commit()
     response.headers["Location"] = f"/api/executions/{record.id}"
@@ -117,6 +119,8 @@ async def list_executions(
             .offset(offset)
         )
     ).all()
+    for item in items:
+        sanitize_execution(item)
     total = await session.scalar(select(func.count()).select_from(ExecutionRecord)) or 0
     return paginate(ExecutionHistoryResponse, items, limit, offset, total)
 
@@ -160,6 +164,7 @@ async def get_execution(execution_id: str, session: Session):
     record = await session.get(ExecutionRecord, execution_id)
     if record is None:
         raise not_found("Execution")
+    sanitize_execution(record)
     return ExecutionHistoryResponse.model_validate(record)
 
 

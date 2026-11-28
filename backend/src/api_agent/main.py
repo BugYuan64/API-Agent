@@ -6,8 +6,10 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.routing import Match
 
 from api_agent import __version__
 from api_agent.agent.manager import AgentManager
@@ -39,6 +41,16 @@ from api_agent.tasks.routes import router as tasks_router
 from api_agent.tasks.service import TaskManager
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+class _SpaRoute(APIRoute):
+    """SPA history 回落路由：拒绝匹配 `/api` 与 `/api/*`，避免未知非 GET 接口被转为 405。"""
+
+    def matches(self, scope):
+        path = scope.get("path", "")
+        if path == "/api" or path.startswith("/api/"):
+            return Match.NONE, {}
+        return super().matches(scope)
 
 
 class HealthResponse(BaseModel):
@@ -190,13 +202,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if assets.is_dir():
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
-        @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str, request: Request):
             """为前端 history 路由提供入口页回落。
 
-            实现：``/api`` 前缀一律不回落——未知的管理接口必须仍是
-            ``{"error": {...}}`` 的 404，而不是一个 200 的 HTML 页面，
-            否则前端会把“接口路径写错”误读成“后端返回了奇怪的数据”。
+            实现：路由匹配层（``_SpaRoute``）直接排除 ``/api`` 与 ``/api/*``，
+            使未知的 GET/POST/PUT/DELETE 管理接口统一返回 404 JSON，不再因仅注册 GET
+            兜底路由而被 Starlette 误报 405；同时已注册的 API 路由仍保留准确 405。
             其余路径先尝试命中构建目录里的真实文件（favicon、robots.txt），
             命中就直出，否则返回 index.html。
             """
@@ -206,6 +217,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if path and candidate.is_file() and frontend in candidate.parents:
                 return FileResponse(candidate)
             return FileResponse(frontend / "index.html")
+
+        app.router.add_api_route(
+            "/{path:path}",
+            spa,
+            methods=["GET"],
+            include_in_schema=False,
+            route_class_override=_SpaRoute,
+        )
 
     logger.info("Application configured", extra={"context": {"llm_mode": settings.llm_mode}})
     return app

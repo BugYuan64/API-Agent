@@ -203,7 +203,7 @@ class PostmanRunner:
                     start_new_session=os.name != "nt",
                 )
                 job = process_job(process.pid)
-                output, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+                output, _ = await asyncio.wait_for(process.communicate(), timeout=15)
                 version = re.search(rb"\b\d+\.\d+\.\d+\b", output[:1024])
                 if process.returncode == 0 and version:
                     return {

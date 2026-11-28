@@ -251,6 +251,25 @@ class StreamAiSuiteSpec(ApiInput):
         return StreamStart.valid_subprotocols(values)
 
 
+SUB_CASE_VERDICT_STATUSES = frozenset({"passed", "failed", "error", "cancelled", "interrupted"})
+
+
+def effective_sub_case_status(record) -> str:
+    """返回子用例对外一致的裁定状态，优先读取持久化在 settings 中的 case_status。"""
+    stored_status = (getattr(record, "settings", None) or {}).get("case_status")
+    if isinstance(stored_status, str) and stored_status in SUB_CASE_VERDICT_STATUSES:
+        return stored_status
+    return str(getattr(record, "status", "closed") or "closed")
+
+
+def sub_case_notes(record) -> list[str]:
+    """提取子用例持久化在 settings 中的断言说明列表，忽略空项。"""
+    raw = (getattr(record, "settings", None) or {}).get("case_notes")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if str(item).strip()]
+
+
 class StreamSubCaseSummary(ApiModel, OutcomeFields):
     """归属于一条 AI WebSocket 历史记录的单个子用例摘要。"""
 
@@ -273,6 +292,7 @@ class StreamSubCaseSummary(ApiModel, OutcomeFields):
     byte_count: int = 0
     sent_count: int = 0
     truncated_count: int = 0
+    notes: list[str] = Field(default_factory=list)
     opened_at: UtcDatetime | None = None
     closed_at: UtcDatetime | None = None
     created_at: UtcDatetime
@@ -296,6 +316,8 @@ class StreamSubCaseReplayResponse(ApiModel):
     case_label: str | None = None
     label: str
     readonly: bool = True
+    transport_status: str | None = None
+    notes: list[str] = Field(default_factory=list)
     inputs: StreamReplayInputs
     session: StreamSessionResponse
     events: list[StreamEventResponse] = Field(default_factory=list)

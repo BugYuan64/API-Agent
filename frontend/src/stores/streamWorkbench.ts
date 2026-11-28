@@ -20,6 +20,7 @@ export interface StreamReadonlyReplayMeta {
   label: string
   status: string
   tone?: string
+  notes?: string[]
 }
 
 export interface StreamWorkbenchSnapshot {

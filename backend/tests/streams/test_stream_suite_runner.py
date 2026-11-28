@@ -395,3 +395,79 @@ async def test_websocket_tools_run_suite_and_read_sub_case(app, target):
         },
     )
     assert default_cd["cooldown_ms"] == 500
+
+
+async def test_sub_case_replay_and_tool_preserve_verdict_notes_on_deadline_window(
+    app, client, target
+):
+    """自然到期窗口（deadline_exceeded）在 /cases、/cases/{id} 与工具快照保持一致裁定与 notes。"""
+    runner = StreamSuiteRunner(app.state.streams)
+    app.state.stream_suites = runner
+    spec = StreamAiSuiteSpec(
+        url=f"{target.ws_url}/ws",
+        title="自然到期观测窗口一致性验证",
+        rounds=1,
+        cooldown_ms=0,
+        cases=[
+            StreamAiCaseSpec(
+                label="窗口到期仍通过",
+                send=["hello-ok"],
+                send_interval_ms=0,
+                max_events=50,
+                max_duration_ms=1_000,
+                expect_contains="echo:hello-ok",
+            ),
+            StreamAiCaseSpec(
+                label="窗口到期断言失败",
+                send=["hello-miss"],
+                send_interval_ms=0,
+                max_events=50,
+                max_duration_ms=1_000,
+                expect_contains="never-matched-token",
+            ),
+        ],
+    )
+    started = await runner.start_ai_suite(spec)
+    suite_id = started["id"]
+    final = await runner.wait_for_completion(suite_id)
+    assert final["passed_cases"] == 1
+    assert final["failed_cases"] == 1
+
+    cases_resp = await client.get(f"/api/streams/{suite_id}/cases")
+    assert cases_resp.status_code == 200
+    items = cases_resp.json()["items"]
+    assert len(items) == 2
+
+    passed_item, failed_item = items[0], items[1]
+    assert passed_item["stop_reason"] == "deadline_exceeded"
+    assert passed_item["status"] == "passed"
+    assert passed_item["result_code"] == "PASSED"
+    assert passed_item["result_status"] == 200
+
+    assert failed_item["stop_reason"] == "deadline_exceeded"
+    assert failed_item["status"] == "failed"
+    assert failed_item["result_code"] == "ASSERTION_FAILED"
+    assert failed_item["result_status"] == 422
+    assert failed_item["notes"]
+    assert any("never-matched-token" in note for note in failed_item["notes"])
+
+    replay_resp = await client.get(f"/api/streams/{suite_id}/cases/{failed_item['id']}")
+    assert replay_resp.status_code == 200
+    replay = replay_resp.json()
+    assert replay["transport_status"] == "closed"
+    assert replay["session"]["status"] == "failed"
+    assert replay["session"]["result_code"] == "ASSERTION_FAILED"
+    assert replay["session"]["result_status"] == 422
+    assert replay["notes"] == failed_item["notes"]
+
+    tool_snapshot = await read_websocket_sub_case(
+        app.state.streams.repo, suite_id, failed_item["id"]
+    )
+    assert tool_snapshot["found"] is True
+    assert tool_snapshot["status"] == "failed"
+    assert tool_snapshot["transport_status"] == "closed"
+    assert tool_snapshot["result_code"] == "ASSERTION_FAILED"
+    assert tool_snapshot["result_status"] == 422
+    assert tool_snapshot["notes"] == failed_item["notes"]
+    assert tool_snapshot["session"]["status"] == "failed"
+    assert tool_snapshot["session"]["result_code"] == "ASSERTION_FAILED"

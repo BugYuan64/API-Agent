@@ -199,7 +199,8 @@ const statusTone = computed(() => {
   if (isSuiteRunning.value) return 'info'
   if (!session.value) return 'neutral'
   if (session.value.finished) {
-    if (session.value.status === 'error') return 'danger'
+    if (session.value.status === 'error' || session.value.status === 'failed') return 'danger'
+    if (session.value.status === 'passed') return 'success'
     return 'neutral'
   }
   return 'success'
@@ -219,6 +220,8 @@ const statusLabel = computed(() => {
     open: '已连接',
     closed: '已关闭',
     completed: '已完成',
+    passed: '通过',
+    failed: '断言失败',
     error: '出错',
     cancelled: '已停止',
     interrupted: '已中断',
@@ -881,8 +884,9 @@ async function inspectSubCase(
       round: detail.round_index ?? meta?.round ?? 1,
       caseIndex: detail.case_index,
       label: detail.label || meta?.label || caseId,
-      status: meta?.status || detail.session.status,
+      status: detail.session.status || meta?.status || 'closed',
       tone: meta?.tone,
+      notes: detail.notes ?? [],
     }
     readonlyReplay.value = replayMeta
     workbenchRuns?.setActiveHistory('websocket', historyId)
@@ -1479,6 +1483,9 @@ onBeforeUnmount(() => {
           <span class="readonly-status">{{ subCaseStatusLabel(readonlyReplay.status) }}</span>
         </div>
         <p class="readonly-label" :title="readonlyReplay.label">{{ readonlyReplay.label }}</p>
+        <ul v-if="readonlyReplay.notes?.length" class="readonly-notes">
+          <li v-for="(note, idx) in readonlyReplay.notes" :key="idx">{{ note }}</li>
+        </ul>
         <p class="readonly-hint">正在查看 AI 子用例执行快照，所有连接参数已锁定，不可编辑。</p>
         <button type="button" class="btn btn-accent btn-sm retest-btn" @click="retest">
           <RotateCcw :size="13" aria-hidden="true" />
@@ -1937,6 +1944,17 @@ onBeforeUnmount(() => {
   line-height: 1.45;
 }
 
+.readonly-notes {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--danger);
+  line-height: 1.45;
+}
+
 .retest-btn {
   align-self: flex-start;
 }
@@ -2019,6 +2037,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -2127,6 +2146,7 @@ onBeforeUnmount(() => {
 
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 7px;
   margin-top: 2px;
 }
@@ -2660,10 +2680,11 @@ onBeforeUnmount(() => {
 .stage-foot {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 4px 12px;
   flex: none;
-  height: 30px;
-  padding: 0 16px;
+  min-height: 30px;
+  padding: 4px 16px;
   border-top: 1px solid var(--border-subtle);
   background: var(--bg-surface);
   font-size: 10.5px;

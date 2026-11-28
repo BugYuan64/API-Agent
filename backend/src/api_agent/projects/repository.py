@@ -109,6 +109,16 @@ class ProjectRepository:
             )
         return list(environments), by_environment, total
 
+    async def list_project_environment_ids(self, project_id: str) -> list[str]:
+        """列出某项目下的全部环境 ID，供级联删除前清理子版本使用。"""
+        return list(
+            (
+                await self.session.scalars(
+                    select(Environment.id).where(Environment.project_id == project_id)
+                )
+            ).all()
+        )
+
     async def list_versions(self, environment_id: str) -> list[EnvironmentVersion]:
         """按版本号升序列出某环境的全部历史版本。
 

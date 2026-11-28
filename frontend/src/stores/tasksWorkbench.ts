@@ -10,6 +10,7 @@ export const useTasksWorkbenchStore = defineStore('tasksWorkbench', () => {
   const catalog = ref<Catalog | null>(null)
   const document = ref<TaskDocument | null>(null)
   const filename = ref('')
+  const documentSourceId = ref<string | null>(null)
   const run = ref<TaskRecord | null>(null)
   const activeTaskId = ref<string | null>(null)
   const replaySource = ref<TaskRecord | null>(null)
@@ -51,6 +52,7 @@ export const useTasksWorkbenchStore = defineStore('tasksWorkbench', () => {
     catalog.value = null
     document.value = null
     filename.value = ''
+    documentSourceId.value = null
     run.value = null
     activeTaskId.value = null
     replaySource.value = null
@@ -68,6 +70,7 @@ export const useTasksWorkbenchStore = defineStore('tasksWorkbench', () => {
     catalog,
     document,
     filename,
+    documentSourceId,
     run,
     activeTaskId,
     replaySource,

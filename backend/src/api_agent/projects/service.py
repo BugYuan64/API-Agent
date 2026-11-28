@@ -1,6 +1,8 @@
 """Transactional use cases for project and environment management."""
 
-from sqlalchemy import update
+from copy import deepcopy
+
+from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,10 +14,12 @@ from api_agent.projects.schemas import (
     EnvironmentCreate,
     EnvironmentHistoryResponse,
     EnvironmentResponse,
+    EnvironmentRollback,
     EnvironmentUpdate,
     EnvironmentVersionResponse,
     ProjectCreate,
     ProjectResponse,
+    ProjectUpdate,
 )
 
 
@@ -70,6 +74,37 @@ class ProjectService:
         实现：直接透传给仓储，不做额外包装；由路由层负责包成 ``Page`` 响应。
         """
         return await self.repository.list_projects(limit, offset)
+
+    async def update_project(self, project_id: str, data: ProjectUpdate) -> ProjectResponse:
+        """更新项目名称或说明；缺失返回 404，重名返回 409。"""
+        project = await self.repository.get_project(project_id)
+        if project is None:
+            raise not_found("Project")
+        if data.name is not None:
+            project.name = data.name
+        if data.description is not None:
+            project.description = data.description
+        try:
+            await self.session.commit()
+        except IntegrityError:
+            await self.session.rollback()
+            raise conflict("project_exists", "A project with this name already exists") from None
+        await self.session.refresh(project)
+        return ProjectResponse.model_validate(project)
+
+    async def delete_project(self, project_id: str) -> None:
+        """删除项目及其下属环境与环境版本（历史执行/控制台/长连接记录外键自动置空）。"""
+        project = await self.repository.get_project(project_id)
+        if project is None:
+            raise not_found("Project")
+        env_ids = await self.repository.list_project_environment_ids(project_id)
+        if env_ids:
+            await self.session.execute(
+                delete(EnvironmentVersion).where(EnvironmentVersion.environment_id.in_(env_ids))
+            )
+            await self.session.execute(delete(Environment).where(Environment.id.in_(env_ids)))
+        await self.session.delete(project)
+        await self.session.commit()
 
     async def create_environment(self, project_id: str, data: EnvironmentCreate):
         """在指定项目下创建环境，并同时写入它的第 1 版配置。
@@ -139,6 +174,52 @@ class ProjectService:
             version=next_version,
             created_at=utc_now(),
             **data.model_dump(exclude={"expected_version"}),
+        )
+        self.session.add(version)
+        await self.session.commit()
+        await self.session.refresh(environment)
+        return self.environment_response(environment, version)
+
+    async def rollback_environment(
+        self, environment_id: str, data: EnvironmentRollback
+    ) -> EnvironmentResponse:
+        """将环境配置回滚到指定历史版本：以追加新版本的方式复制历史快照，保留审计历史。"""
+        environment = await self.repository.get_environment(environment_id)
+        if environment is None:
+            raise not_found("Environment")
+        if environment.current_version != data.expected_version:
+            raise conflict(
+                "environment_version_conflict",
+                f"Expected environment version {data.expected_version}, "
+                f"current version is {environment.current_version}",
+            )
+        target = await self.repository.get_version(environment_id, data.target_version)
+        if target is None:
+            raise not_found("Environment version")
+        next_version = environment.current_version + 1
+        result = await self.session.execute(
+            update(Environment)
+            .where(
+                Environment.id == environment_id,
+                Environment.current_version == data.expected_version,
+            )
+            .values(current_version=next_version)
+        )
+        if result.rowcount != 1:
+            await self.session.rollback()
+            raise conflict(
+                "environment_version_conflict", "Environment version changed concurrently"
+            )
+        version = EnvironmentVersion(
+            environment_id=environment_id,
+            version=next_version,
+            origin=target.origin,
+            allowed_methods=list(target.allowed_methods),
+            path_templates=list(target.path_templates),
+            auth_ref=deepcopy(target.auth_ref),
+            replay_policy=deepcopy(target.replay_policy),
+            sensitive_field_rules=list(target.sensitive_field_rules),
+            created_at=utc_now(),
         )
         self.session.add(version)
         await self.session.commit()

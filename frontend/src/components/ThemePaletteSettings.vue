@@ -2,6 +2,7 @@
 /** Live editor for the active light/dark palette; edits are scoped to that theme. */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Check, RotateCcw } from 'lucide-vue-next'
+import AssistantAvatar from './AssistantAvatar.vue'
 import { COLOR_GROUPS, COLOR_LABELS, DEFAULT_PALETTES, getPalette, resetPalette, savePalette, type PaletteTheme } from '@/lib/palette'
 
 const theme = ref<PaletteTheme>('dark')
@@ -61,7 +62,20 @@ onBeforeUnmount(() => { themeObserver?.disconnect(); themeObserver = null })
       </select>
     </label>
     <div v-for="group in COLOR_GROUPS" :key="group.label" class="color-group">
-      <h3>{{ group.label }}</h3>
+      <div class="color-group-head">
+        <h3>{{ group.label }}</h3>
+        <div
+          v-if="(group.tokens as readonly string[]).includes('assistant-color')"
+          class="assistant-preview"
+          :style="{
+            '--assistant-color': palette['assistant-color'],
+            '--assistant-eye-color': palette['assistant-eye-color'],
+          }"
+        >
+          <AssistantAvatar :size="26" />
+          <span>小Y 头像实时预览（点击切换表情）</span>
+        </div>
+      </div>
       <div class="color-grid">
         <label v-for="token in group.tokens" :key="token" class="color-field">
           <span>{{ COLOR_LABELS[token] }}</span>
@@ -83,7 +97,9 @@ onBeforeUnmount(() => { themeObserver?.disconnect(); themeObserver = null })
 .saved-state { display: inline-flex; align-items: center; gap: 4px; color: var(--success); font-size: 11px; }
 .theme-select { display: grid; grid-template-columns: 120px minmax(140px, 240px); align-items: center; gap: 8px; color: var(--text-secondary); }
 .color-group { display: grid; gap: 7px; }
+.color-group-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
 .color-group h3 { margin: 0; color: var(--text-secondary); font-size: 12px; font-weight: 600; }
+.assistant-preview { display: inline-flex; align-items: center; gap: 7px; padding: 3px 9px 3px 6px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: var(--bg-subtle); color: var(--text-secondary); font-size: 11px; }
 .color-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
 .color-field { display: grid; grid-template-columns: minmax(0, 1fr) 32px 60px; align-items: center; gap: 8px; min-width: 0; min-height: 34px; padding: 4px 7px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); }
 .color-field span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -1893,7 +1893,7 @@ onBeforeUnmount(() => {
       history-key="api-agent.layout.model-testing.history"
       editor-key="api-agent.layout.model-testing.config"
       assistant-key="api-agent.layout.model-testing.chat"
-      :editor-width="360"
+      :editor-width="320"
       :results-max="1400"
       hide-history-on-narrow
     >
@@ -3191,7 +3191,7 @@ onBeforeUnmount(() => {
 
 .model-table th,
 .model-table td {
-  padding: 9px 12px;
+  padding: 8px 8px;
   text-align: left;
   border-bottom: 1px solid var(--border-subtle);
   vertical-align: middle;
@@ -3222,16 +3222,41 @@ onBeforeUnmount(() => {
 }
 
 .col-check {
-  width: 34px;
+  width: 32px;
   text-align: center;
 }
 
 .col-actions {
-  width: 84px;
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  width: 72px;
   text-align: right;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-subtle);
+}
+
+.model-table th.col-actions {
+  z-index: 3;
+  background: var(--bg-subtle);
+}
+
+.model-table tbody tr:hover td.col-actions {
+  background: var(--bg-hover);
+}
+
+.model-table tbody tr.row-active td.col-actions {
+  background: var(--bg-active);
+}
+
+.row-probe-btn {
+  min-width: 54px;
+  padding: 0 9px;
+  white-space: nowrap;
 }
 
 .model-id {
+  max-width: 190px;
   font-weight: 600;
   color: var(--text-primary);
   word-break: break-all;

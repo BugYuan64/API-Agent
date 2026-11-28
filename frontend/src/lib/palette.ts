@@ -9,7 +9,7 @@ export const COLOR_GROUPS = [
   { label: '强调色', tokens: ['accent', 'accent-hover', 'accent-soft', 'accent-border', 'action-fill', 'action-fill-hover'] },
   { label: '状态色', tokens: ['success', 'success-soft', 'success-border', 'warning', 'warning-soft', 'warning-border', 'danger', 'danger-soft', 'danger-border', 'info', 'info-soft', 'info-border'] },
   { label: '请求方法', tokens: ['method-get', 'method-post', 'method-put', 'method-patch', 'method-delete'] },
-  { label: '品牌、图标与阴影', tokens: ['logo-color', 'assistant-color', 'brand-highlight', 'brand-start', 'shadow-color'] },
+  { label: '品牌、图标与阴影', tokens: ['logo-color', 'assistant-color', 'assistant-eye-color', 'brand-highlight', 'brand-start', 'shadow-color'] },
 ] as const
 
 export const COLOR_LABELS: Record<string, string> = {
@@ -26,7 +26,7 @@ export const COLOR_LABELS: Record<string, string> = {
   info: '信息文字', 'info-soft': '信息浅底', 'info-border': '信息边框',
   'method-get': 'GET', 'method-post': 'POST', 'method-put': 'PUT', 'method-patch': 'PATCH', 'method-delete': 'DELETE',
   'shadow-color': '阴影', 'border-highlight': '高亮边框',
-  'logo-color': '项目 Logo 配色', 'assistant-color': 'AI 助手图标配色',
+  'logo-color': '项目 Logo 配色', 'assistant-color': 'AI 助手脸部底色', 'assistant-eye-color': 'AI 助手表情眼色',
   'brand-highlight': '品牌高光', 'brand-start': '品牌渐变起点', 'switch-thumb': '开关滑块', 'modal-backdrop': '弹窗遮罩',
 }
 
@@ -44,7 +44,7 @@ export const DEFAULT_PALETTES: Record<PaletteTheme, Record<string, string>> = {
     'info-soft': '#203447', 'info-border': '#38546e', 'method-get': '#83d5a8', 'method-post': '#e7c17b',
     'method-put': '#9bc9f2', 'method-patch': '#c5afe8', 'method-delete': '#f09a9a',
     'shadow-color': '#000000', 'border-highlight': '#8374e3', 'brand-highlight': '#5b50b9',
-    'brand-start': '#b5a9f5', 'logo-color': '#7c6cf6', 'assistant-color': '#22c55e', 'modal-backdrop': '#000000',
+    'brand-start': '#b5a9f5', 'logo-color': '#7c6cf6', 'assistant-color': '#3c82f6', 'assistant-eye-color': '#ffffff', 'modal-backdrop': '#000000',
   },
   light: {
     'bg-app': '#f1f1f4', 'bg-canvas': '#fafafd', 'bg-sidebar': '#f1f1f4', 'bg-surface': '#ffffff',
@@ -59,7 +59,7 @@ export const DEFAULT_PALETTES: Record<PaletteTheme, Record<string, string>> = {
     'info-soft': '#edf4ff', 'info-border': '#ccdef5', 'method-get': '#18734f', 'method-post': '#94601e',
     'method-put': '#2867ac', 'method-patch': '#7954ae', 'method-delete': '#bd3945',
     'shadow-color': '#1e1a34', 'border-highlight': '#7465d6', 'brand-highlight': '#5749bb',
-    'brand-start': '#b6acf0', 'logo-color': '#5749bb', 'assistant-color': '#16a34a', 'modal-backdrop': '#181526',
+    'brand-start': '#b6acf0', 'logo-color': '#5749bb', 'assistant-color': '#3c82f6', 'assistant-eye-color': '#ffffff', 'modal-backdrop': '#181526',
   },
 }
 

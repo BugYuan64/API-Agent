@@ -453,3 +453,18 @@ async def test_stream_transport_failures_have_fixed_safe_outcomes(
     assert page["session"]["result_status"] == number
     assert page["session"]["http_status"] is None
     assert "PRIVATE" not in json.dumps(page)
+
+
+def test_evaluated_sub_case_verdict_not_overridden_by_bounded_window_stop_reason():
+    """AI 子用例已有明确 passed/failed 断言裁定且无 error_kind 时，自然到期窗口不被误判为 504。"""
+    from api_agent.infrastructure.outcomes import outcome_for
+
+    passed = outcome_for("passed", None, stop_reason="deadline_exceeded")
+    failed = outcome_for("failed", None, stop_reason="deadline_exceeded")
+    manual_closed = outcome_for("closed", None, stop_reason="deadline_exceeded")
+    errored = outcome_for("passed", "connect_failed", stop_reason="deadline_exceeded")
+
+    assert (passed.code, passed.status) == ("PASSED", 200)
+    assert (failed.code, failed.status) == ("ASSERTION_FAILED", 422)
+    assert (manual_closed.code, manual_closed.status) == ("EXECUTION_TIMEOUT", 504)
+    assert (errored.code, errored.status) == ("CONNECTION_FAILED", 502)

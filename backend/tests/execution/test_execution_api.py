@@ -253,3 +253,86 @@ async def test_execution_history_can_be_deleted(cli_client, target):
     assert all(item["id"] != execution_id for item in listing["items"])
 
     assert (await cli_client.delete(f"/api/executions/{execution_id}")).status_code == 404
+
+
+async def test_execution_redacts_response_jwt_on_persist_and_history_migration(tmp_path, target):
+    """计划执行响应体中的明文令牌/JWT 在写入前脱敏，且 sanitize_history 可幂等清洗历史旧行。"""
+    from api_agent.execution.models import ExecutionRecord
+    from api_agent.infrastructure.history import sanitize_history
+
+    raw_jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NSIsIm5hbWUiOiJhZG1pbiJ9."
+        "sigValueSecret999"
+    )
+    settings = load_settings(
+        env_file=None,
+        project_root=tmp_path,
+        target_allowed_origins=[target.base_url],
+        omit_response_payload=False,
+    )
+    application = create_app(settings)
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            plan = {
+                "origin": target.base_url,
+                "allowed_methods": ["POST"],
+                "path_templates": ["/echo"],
+                "requests": [
+                    {
+                        "id": "login-echo",
+                        "method": "POST",
+                        "path": "/echo",
+                        "body": {"token": raw_jwt, "raw_note": f"jwt={raw_jwt}"},
+                        "assertions": [{"kind": "status", "expected": 200}],
+                    }
+                ],
+            }
+            created = await client.post(
+                "/api/executions",
+                json={"plan": plan, "label": "jwt-redaction-check", "engine": "native"},
+            )
+            assert created.status_code == 201, created.text
+            payload = created.json()
+            assert raw_jwt not in json.dumps(payload, ensure_ascii=False)
+            assert "[REDACTED]" in (payload["executions"][0]["response"]["body"] or "")
+
+            # 验证数据库中持久化记录也不含明文 JWT。
+            async with application.state.database.session() as session:
+                saved = await session.get(ExecutionRecord, payload["id"])
+                assert saved is not None
+                assert raw_jwt not in json.dumps(saved.executions, ensure_ascii=False)
+
+                # 模拟旧版本遗留的未脱敏行，验证 sanitize_history 清洗且幂等。
+                legacy = ExecutionRecord(
+                    label="legacy-login",
+                    engine="native",
+                    status="passed",
+                    executions=[
+                        {
+                            "id": "legacy-step",
+                            "status": "passed",
+                            "response": {
+                                "headers": {"set-cookie": ["session=supersecret"]},
+                                "body": json.dumps({"data": {"token": raw_jwt}}),
+                            },
+                            "assertions": [],
+                            "extracted": [],
+                        }
+                    ],
+                )
+                session.add(legacy)
+                await session.commit()
+                legacy_id = legacy.id
+
+            changed_first = await sanitize_history(application.state.database)
+            assert changed_first >= 1
+            changed_second = await sanitize_history(application.state.database)
+            assert changed_second == 0
+
+            async with application.state.database.session() as session:
+                scrubbed = await session.get(ExecutionRecord, legacy_id)
+                assert scrubbed is not None
+                assert raw_jwt not in json.dumps(scrubbed.executions, ensure_ascii=False)
+                assert "supersecret" not in json.dumps(scrubbed.executions, ensure_ascii=False)

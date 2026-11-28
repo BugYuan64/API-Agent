@@ -121,3 +121,96 @@ async def test_missing_project_and_stable_pagination(client):
         == 0
     )
     assert (await client.get("/api/projects?limit=201")).status_code == 422
+
+
+async def test_project_update_delete_and_environment_rollback(client):
+    """验证项目更新/级联删除与环境追加式版本回滚的完整 CRUD 与乐观锁语义。"""
+    p1 = await create_project(client, "Alpha")
+    p2 = await create_project(client, "Beta")
+
+    # 更新项目名称与说明，重名拒绝 409，空载荷拒绝 422。
+    updated = await client.put(
+        f"/api/projects/{p1}", json={"name": "Alpha Renamed", "description": "updated"}
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Alpha Renamed"
+    assert updated.json()["description"] == "updated"
+
+    conflict_name = await client.put(f"/api/projects/{p1}", json={"name": "Beta"})
+    assert conflict_name.status_code == 409
+    assert conflict_name.json()["error"]["code"] == "project_exists"
+
+    empty_update = await client.put(f"/api/projects/{p1}", json={})
+    assert empty_update.status_code == 422
+
+    # 创建环境 -> 更新到 v2 -> 回滚到 v1（追加生成 v3）。
+    created_env = await client.post(f"/api/projects/{p1}/environments", json=environment_data())
+    assert created_env.status_code == 201
+    env_id = created_env.json()["id"]
+
+    v2_body = environment_data(origin="http://127.0.0.1:9002", expected_version=1)
+    v2_body.pop("name")
+    v2 = await client.put(f"/api/environments/{env_id}", json=v2_body)
+    assert v2.status_code == 200
+    assert v2.json()["current_version"] == 2
+
+    bad_lock = await client.post(
+        f"/api/environments/{env_id}/rollback", json={"target_version": 1, "expected_version": 1}
+    )
+    assert bad_lock.status_code == 409
+    assert bad_lock.json()["error"]["code"] == "environment_version_conflict"
+
+    missing_target = await client.post(
+        f"/api/environments/{env_id}/rollback", json={"target_version": 9, "expected_version": 2}
+    )
+    assert missing_target.status_code == 404
+
+    rolled = await client.post(
+        f"/api/environments/{env_id}/rollback", json={"target_version": 1, "expected_version": 2}
+    )
+    assert rolled.status_code == 200
+    assert rolled.json()["current_version"] == 3
+    assert rolled.json()["config"]["version"] == 3
+    assert rolled.json()["config"]["origin"] == "http://127.0.0.1:9000"
+
+    versions = (await client.get(f"/api/environments/{env_id}/versions")).json()["versions"]
+    assert [item["version"] for item in versions] == [1, 2, 3]
+
+    # 删除带环境与版本的项目应级联清理并返回 204；重复删除返回 404。
+    deleted = await client.delete(f"/api/projects/{p1}")
+    assert deleted.status_code == 204
+    assert (await client.get(f"/api/projects/{p1}")).status_code == 404
+    assert (await client.get(f"/api/environments/{env_id}")).status_code == 404
+    assert (await client.delete(f"/api/projects/{p1}")).status_code == 404
+    assert (await client.get(f"/api/projects/{p2}")).status_code == 200
+
+
+async def test_spa_fallback_does_not_turn_unknown_non_get_api_into_405(tmp_path):
+    """挂载前端 SPA 回落时，未知 /api/* 的 POST/PUT/DELETE 返回 404 而非 405，已知路由仍保 405。"""
+    from api_agent.infrastructure.config import load_settings
+    from api_agent.main import create_app
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text(
+        "<!doctype html><html><body>spa</body></html>", encoding="utf-8"
+    )
+    settings = load_settings(env_file=None, project_root=tmp_path, frontend_dist=dist)
+    assert settings.frontend_root == dist
+    application = create_app(settings)
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            for method in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+                resp = await client.request(method, "/api/does-not-exist/subpath")
+                assert resp.status_code == 404, (method, resp.status_code, resp.text)
+                assert resp.json()["error"]["code"] == "http_error"
+
+            # 已存在的 API 路由收到不支持方法仍应返回 405。
+            method_not_allowed = await client.patch("/api/projects")
+            assert method_not_allowed.status_code == 405
+
+            # 非 /api 的前端 history 路由正常回落到 index.html。
+            spa_page = await client.get("/model-testing")
+            assert spa_page.status_code == 200
+            assert "spa" in spa_page.text

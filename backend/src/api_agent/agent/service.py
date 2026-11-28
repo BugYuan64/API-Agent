@@ -4,6 +4,7 @@
 掌握范围、预算、证据引用与变异权限，不在此自动执行目标请求。
 """
 
+import asyncio
 import json
 import os
 import time
@@ -43,6 +44,9 @@ from api_agent.llm.client import (
     LLMTimeoutError,
 )
 from api_agent.llm.schemas import ChatCompletionRequest, ChatMessage
+
+TRANSIENT_LLM_ERRORS = frozenset({"model_connection_failed", "model_response_error"})
+TRANSIENT_RETRY_DELAY_SECONDS = 0.25
 
 
 class AgentError(ValueError):
@@ -232,7 +236,7 @@ class AgentService:
         )
         repair = ""
         max_tokens = 16000 if stage in {"recognize", "document_source"} else 6000
-        for _ in range(2):
+        for attempt in range(2):
             if budget.remaining <= 0:
                 raise AgentError("model_budget_exhausted")
             call = ModelCall(stage=stage, model=getattr(self.client, "model", "unknown"))
@@ -240,6 +244,7 @@ class AgentService:
             budget.reserved += 1
             await budget.notify()  # Durable reservation precedes actual transport.
             started = time.monotonic()
+            retry_transient = False
             try:
                 response = await self.client.chat_completion(
                     ChatCompletionRequest(
@@ -260,11 +265,17 @@ class AgentService:
                 code = self._model_error(error)
                 call.error_kind = code
                 call.status = "error"
-                raise AgentError(code) from None
+                if attempt == 0 and code in TRANSIENT_LLM_ERRORS and (budget.remaining) > 0:
+                    retry_transient = True
+                else:
+                    raise AgentError(code) from None
             except (ValidationError, TypeError, ValueError, AttributeError):
                 call.error_kind = "model_response_error"
                 call.status = "error"
-                raise AgentError("model_response_error") from None
+                if attempt == 0 and budget.remaining > 0:
+                    retry_transient = True
+                else:
+                    raise AgentError("model_response_error") from None
             finally:
                 call.duration_ms = round((time.monotonic() - started) * 1000, 3)
                 budget.reserved -= 1
@@ -272,6 +283,10 @@ class AgentService:
                 if call.status == "dispatching":
                     call.status = "unknown"
                 await budget.notify()
+            if retry_transient:
+                if TRANSIENT_RETRY_DELAY_SECONDS > 0:
+                    await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                continue
             try:
                 if response.finish_reason == "length":
                     max_tokens = min(max_tokens * 2, 32000)

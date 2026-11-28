@@ -101,6 +101,23 @@ ERROR_CODES = {
 }
 
 
+def _reason_outcome(reason: str | None) -> Outcome | None:
+    """将稳定错误码或停止原因映射为对应业务结果；未命中时返回 None。"""
+    if reason in ERROR_CODES:
+        return OUTCOMES[ERROR_CODES[reason]]
+    if reason and (
+        reason.endswith("_not_allowed")
+        or reason
+        in {
+            "target_not_loopback",
+            "target_url_invalid",
+            "target_credentials_not_allowed",
+        }
+    ):
+        return OUTCOMES["POLICY_REJECTED"]
+    return None
+
+
 def outcome_for(
     status: str | None = None,
     error_kind: str | None = None,
@@ -111,7 +128,9 @@ def outcome_for(
     """由既有生命周期和稳定错误码派生结果，未知错误保守归为执行错误。
 
     运行中、取消及未知终态优先；控制台 ok=True 只代表收到响应，不判断目标
-    HTTP 是否成功。错误/停止原因按显式表匹配，不分析异常自然语言。
+    HTTP 是否成功。当用例已有明确断言裁定（passed/failed）且无 error_kind 时，
+    有界观测窗口的自然到期（如 deadline_exceeded/limits_exceeded）不覆盖断言结果；
+    手动长连接（status=closed）仍按 stop_reason 映射为对应超时或上限状态。
     """
     if status in {"queued", "running", "connecting", "open"}:
         return OUTCOMES["RUNNING"]
@@ -123,19 +142,15 @@ def outcome_for(
         return OUTCOMES["UNKNOWN_RESULT"]
     if ok is True:
         return OUTCOMES["HTTP_RESPONSE"]
-    for reason in (error_kind, stop_reason):
-        if reason in ERROR_CODES:
-            return OUTCOMES[ERROR_CODES[reason]]
-        if reason and (
-            reason.endswith("_not_allowed")
-            or reason
-            in {
-                "target_not_loopback",
-                "target_url_invalid",
-                "target_credentials_not_allowed",
-            }
-        ):
-            return OUTCOMES["POLICY_REJECTED"]
+    if matched := _reason_outcome(error_kind):
+        return matched
+    if not error_kind:
+        if status == "passed":
+            return OUTCOMES["PASSED"]
+        if status == "failed":
+            return OUTCOMES["ASSERTION_FAILED"]
+    if matched := _reason_outcome(stop_reason):
+        return matched
     if status == "timed_out":
         return OUTCOMES["EXECUTION_TIMEOUT"]
     if status == "failed":
